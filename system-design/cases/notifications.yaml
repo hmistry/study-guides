@@ -1,0 +1,186 @@
+id: notifications
+name: Notification System
+prompt: Design a platform that sends notifications (mobile push, SMS, email, in-app) on behalf of many internal product teams, covering both urgent transactional messages (one-time passcodes, receipts) and marketing campaigns to tens of millions of users.
+blocks: [queues, reliability, rate-limits-ids, apis, datastores, estimation]
+
+steps:
+  - id: requirements
+    title: Requirements
+    min: 5
+    ask: |
+      - What do callers send, and what does the platform decide for them?
+      - Which messages are urgent, and how do you keep campaigns from delaying them?
+      - What user controls and legal constraints apply?
+    answer: |
+      **Functional**
+      - Send to a user, a list, or a segment, by template and category; channels: push (APNs / FCM), SMS, email, in-app inbox.
+      - User preferences per category and channel, unsubscribe, quiet hours by time zone; scheduled sends.
+      - Templates with localization and variables; delivery tracking (sent, delivered, opened, bounced).
+
+      **Non-functional**
+      - **Priorities:** OTPs and security alerts delivered within seconds even during a 100M-user campaign.
+      - **No duplicates** to users (a double OTP or double marketing email is a visible bug), no loss for transactional messages.
+      - Survive provider outages and respect provider rate limits; compliance (CAN-SPAM, TCPA, GDPR consent).
+
+      **Scale (assumed)**
+      - 1B notifications/day on average; campaigns of 100M users delivered within an hour.
+
+  - id: estimation
+    title: Estimation
+    min: 5
+    ask: |
+      1B notifications per day; a 100M-user campaign spread over 1 hour; a notification log record of ~500 bytes; an SMS provider account limit of ~1K messages/s.
+    given: {daily: "1e9", campaign: "100e6", hour: 3600, rec: 500, sms_limit: 1000}
+    calc:
+      - {ask: Average send rate, unit: /s, expr: "daily / 86400", show: "≈ 12K/s"}
+      - {ask: Campaign send rate, unit: /s, expr: "campaign / hour", show: "≈ 28K/s"}
+      - {ask: Notification log per day, unit: GB, expr: "daily * rec / 1e9", show: "500 GB"}
+      - {ask: Hours to send 10M SMS at the provider limit, unit: h, expr: "10e6 / sms_limit / 3600", show: "≈ 2.8 h"}
+    answer: |
+      - **Campaigns more than double the average rate**, so the pipeline must absorb bursts (queues) and isolate priorities.
+      - **500 GB/day of logs**: a time-partitioned store with TTL (e.g. 90 days hot), aggregates kept longer.
+      - **Providers are the real bottleneck**: at 1K SMS/s, 10M SMS take ~3 hours. Multiple accounts / providers and per-provider rate limiting are part of the design, not an afterthought.
+
+  - id: api
+    title: API
+    min: 4
+    ask: Define the send API, including idempotency, priority and scheduling.
+    answer: |
+      ```
+      POST /v1/notifications
+      Idempotency-Key: order-981:receipt
+      {
+        "recipients": { "user_ids": [123] }            # or { "segment_id": "..." }
+        "category": "order_updates",                    # drives preferences + priority
+        "template": "order_shipped", "vars": { "order": "981" },
+        "channels": ["push", "email"],                  # or "auto" by preference
+        "priority": "transactional" | "marketing",
+        "send_at": "2026-10-16T09:00:00", "respect_quiet_hours": true
+      }
+      → 202 { "notification_id": "...", "status": "accepted" }
+
+      GET /v1/notifications/{id}          → per-recipient, per-channel status
+      ```
+      - **202 Accepted**: sending is asynchronous. The idempotency key makes retries from callers safe.
+      - Segment sends return a campaign ID with progress counters instead of per-recipient results.
+
+  - id: data-model
+    title: Data model
+    min: 5
+    ask: |
+      - What does the platform store about users, templates and each send?
+      - How do you dedupe at the per-recipient level?
+    answer: |
+      ```
+      templates      (template_id, version, locale) → channel bodies, variables schema
+      preferences    user_id → { category → { channel → on/off } }, quiet hours, time zone   (KV, cached)
+      devices        user_id → [push tokens, platform, last_seen]                           (KV)
+      requests       idempotency_key → notification_id, status                              (TTL ~7 d)
+      deliveries     PK (user_id, day)  CK notification_id, channel
+                     status · provider_message_id · attempts · timestamps                   (wide-column, TTL)
+      ```
+      - **Per-recipient dedup key:** `(notification_id, user_id, channel)`, written with a conditional insert before handing to a provider, so retries and replays don't double-send.
+      - Preferences and device tokens are read on every send: cache them, and invalidate on change.
+
+  - id: high-level
+    title: High-level design
+    min: 8
+    ask: Draw the pipeline from the API to the providers, and show priority isolation and provider failure.
+    diagram:
+      type: arch
+      caption: staged pipeline with per-priority and per-channel queues
+      nodes:
+        caller: {label: Product team, at: [0, 1], kind: client}
+        api: {label: Notify API, sub: validate · dedup, at: [1, 1]}
+        hi: {label: Urgent, sub: queue, at: [2, 0], kind: queue}
+        lo: {label: Bulk, sub: queue, at: [2, 2], kind: queue}
+        router: {label: Router, sub: prefs · render, at: [3, 1]}
+        chq: {label: Per channel, sub: queues, at: [4, 0], kind: queue}
+        prov: {label: Providers, sub: APNs · Twilio, at: [4, 2]}
+      edges: [[caller, api], [api, hi], [api, lo], [hi, router], [lo, router], [router, chq], [chq, prov]]
+      frames:
+        - title: Transactional
+          flow: [[caller, api, OTP], [api, hi, enqueue], [hi, router, first], [router, chq, push · SMS], [chq, prov, send]]
+          hit: [prov]
+          win: [hi, router]
+          note: "Urgent messages have their own topic and reserved router and channel workers, so they never wait behind a campaign."
+        - title: Campaign
+          flow: [[caller, api, segment], [api, lo, batches], [lo, router, throttled], [router, chq], [chq, prov, send]]
+          win: [lo, router, chq]
+          note: "A segment expands in batches of ~10K users into the bulk queue; the router applies preferences, quiet hours and per-user frequency caps, renders templates, then fans out per channel at a controlled rate."
+        - title: Provider down
+          flow: [[chq, prov, breaker open]]
+          win: [chq]
+          note: "Errors from one provider open a circuit breaker; channel workers fail over to a secondary provider (another SMS vendor) or hold messages with backoff. Callbacks from providers update delivery status."
+    answer: |
+      - **API:** validate, authorize the calling team, dedupe on the idempotency key, enqueue by priority, return 202.
+      - **Router workers:** expand recipients, apply preferences / opt-outs / quiet hours / frequency caps, render the localized template, choose channels, enqueue per channel.
+      - **Channel workers:** per-provider rate limits and retries, per-recipient dedup, provider failover; record provider IDs.
+      - **Feedback:** provider webhooks (delivered, bounced, invalid token) update delivery status and clean up bad tokens and addresses.
+
+  - id: deep-dives
+    title: Deep dives
+    min: 15
+    ask: Pick 2–3. Answer each before revealing it.
+    items:
+      - id: priority
+        q: A 100M-user campaign starts and OTP messages slow to minutes. How do you prevent that?
+        answer: |
+          - **Separate queues and worker pools per priority** (bulkheads): urgent traffic can't queue behind bulk. Separate provider accounts or reserved provider capacity for transactional sends.
+          - **Throttle campaigns** at expansion time to a configured rate, leaving headroom in provider limits for urgent traffic.
+          - Monitor urgent-queue latency as an SLO (e.g. 99% of OTPs handed to providers within 2 s) and pause campaigns automatically when it's at risk.
+
+      - id: dedup
+        q: Where can duplicates come from, and how do you stop each?
+        answer: |
+          - **Caller retries** → idempotency key at the API.
+          - **Queue redelivery** (at-least-once) → per-recipient dedup key `(notification_id, user, channel)` inserted conditionally before the provider call.
+          - **Provider timeouts** (sent but no response) → pass our ID as the provider's idempotency key where supported; otherwise accept a rare duplicate rather than risk loss for transactional messages, and say so.
+          - **Overlapping campaigns** → per-user frequency caps per category per day.
+
+      - id: preferences
+        q: How do you enforce preferences, quiet hours and legal requirements correctly?
+        answer: |
+          - Resolve at **send time** in the router, not when the request is accepted, so an unsubscribe a minute ago is honored.
+          - **Categories:** transactional (receipts, security) can bypass marketing opt-outs; marketing requires consent where the law says so; every marketing email gets a one-click unsubscribe.
+          - **Quiet hours by the user's time zone:** delay non-urgent sends to the next allowed window (a scheduled queue), never drop them silently.
+          - Keep an audit trail of consent and of what was sent, for compliance.
+
+      - id: providers
+        q: Providers have rate limits and outages. How do you handle them?
+        answer: |
+          - **Token bucket per provider account** shared across channel workers, sized to contracted limits.
+          - **Retries with exponential backoff and jitter** for transient errors; permanent errors (invalid number, uninstalled app) are not retried and clean up the token.
+          - **Circuit breaker + failover** to a secondary provider for SMS and email; push has no alternative to APNs / FCM, so queue and retry.
+          - DLQ for messages that exhaust retries, with alerting and replay tooling.
+
+      - id: campaigns
+        q: How do you deliver a campaign to 100M users at 9 AM in each user's local time?
+        answer: |
+          - Expand the segment ahead of time into batches keyed by time zone; schedule each batch for its local 9 AM in a delay queue (or time-bucketed scheduler).
+          - Spread each zone's batch over a window (e.g. 9:00–9:30) to smooth load on our pipeline, providers and the product's own servers (which users open after the push).
+          - Track progress per batch; support pausing and cancelling a running campaign.
+
+  - id: wrap-up
+    title: Wrap-up
+    min: 3
+    ask: |
+      - What breaks first at 10×?
+      - What do you monitor?
+      - What makes this a staff-level answer?
+    answer: |
+      **At 10×:** provider capacity and cost (SMS especially), then preference and token lookups. Negotiate limits, add providers, cache preferences closer to routers.
+
+      **Monitor:** time-to-provider by priority, provider error rates and latency, queue lag per stage, dedup hits, bounce and complaint rates (email reputation), invalid-token rate, opt-out rate per campaign.
+
+      **Staff-level signals**
+      - Isolates urgent traffic end to end, including provider capacity.
+      - Lists every duplicate source and the specific dedup for each.
+      - Treats providers as unreliable, rate-limited dependencies with failover.
+      - Brings up compliance and user trust (frequency caps, quiet hours, consent).
+
+      **Common mistakes**
+      - One queue for everything.
+      - Checking preferences only at request time.
+      - Retrying permanent provider errors.
+      - Ignoring time zones and send pacing for campaigns.

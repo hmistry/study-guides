@@ -1,0 +1,183 @@
+id: video-streaming
+name: Video Streaming
+prompt: Design a video platform like YouTube. Creators upload videos; the platform processes them; hundreds of millions of viewers watch with quick start-up and smooth playback on any network.
+blocks: [cdn-blob, queues, datastores, caching, reliability, estimation]
+
+steps:
+  - id: requirements
+    title: Requirements
+    min: 5
+    ask: |
+      - Which flows are core: upload, processing, playback, and what else?
+      - What quality-of-experience targets matter for playback?
+      - What scale on both the upload and viewing sides?
+    answer: |
+      **Functional**
+      - Upload videos (up to many GB, resumable), with title, description and visibility.
+      - Process: transcode into multiple resolutions and codecs, generate thumbnails, run content checks.
+      - Play back with **adaptive bitrate** on web, mobile and TV; seek; resume where you left off.
+      - View counts, likes and comments (brief); search and recommendations out of scope.
+
+      **Non-functional**
+      - **Playback:** start in < 2 s, rebuffering as rare as possible, quality adapts to bandwidth.
+      - Uploads may take minutes to process; popular videos should be ready at high quality quickly.
+      - Highly available and global; cost-efficient storage and egress are first-order concerns.
+
+      **Scale (assumed)**
+      - 500 hours of video uploaded per minute; 1B hours watched per day; ~3 GB stored per hour of video across all renditions; 3 Mbps average stream.
+
+  - id: estimation
+    title: Estimation
+    min: 5
+    ask: |
+      500 hours uploaded per minute, ~3 GB per hour across renditions, 1B hours watched per day, 3 Mbps average bitrate.
+    given: {up_per_min: 500, gb_per_hour: 3, watched: "1e9", mbps: 3}
+    calc:
+      - {name: hours, ask: Hours uploaded per day, unit: h, expr: "up_per_min * 60 * 24", show: "720K"}
+      - {ask: New storage per day, unit: PB, expr: "hours * gb_per_hour / 1e6", show: "≈ 2.2 PB"}
+      - {name: viewers, ask: Average concurrent viewers, unit: "", expr: "watched / 24", show: "≈ 42M"}
+      - {ask: Average egress, unit: Tbps, expr: "viewers * mbps / 1e6", show: "≈ 125 Tbps"}
+    answer: |
+      - **~2 PB of new storage a day** (~800 PB a year): storage tiering, deleting unused renditions and efficient codecs are cost decisions worth real money.
+      - **~125 Tbps average egress** (peaks far higher) is impossible from origin. Delivery is a CDN problem, including caches inside ISPs.
+      - **720K hours a day to transcode** means a large, elastic, chunk-parallel encoding fleet, with priorities.
+
+  - id: api
+    title: API
+    min: 4
+    ask: Define upload (including resumability) and playback.
+    answer: |
+      ```
+      POST /v1/videos                          { title, description, visibility, size, content_type }
+      → 201 { video_id, upload: { session_url, part_size } }     # resumable / multipart, presigned
+
+      PUT  <session_url>?part=N                (client → object storage directly)
+      POST /v1/videos/{id}/complete            → 202 { status: "processing" }
+
+      GET  /v1/videos/{id}                     → { title, status, duration, thumbnails,
+                                                   manifest_url (signed, CDN), resume_position }
+      GET  <cdn>/v/{id}/master.m3u8            → HLS/DASH manifest listing renditions
+      GET  <cdn>/v/{id}/720p/seg_00042.m4s     → 2–6 s media segments
+      POST /v1/videos/{id}/events              { type: start | heartbeat | end, position, quality }
+      ```
+      - Uploads never pass through API servers. Playback is plain HTTP GETs of small segments from the CDN.
+      - Playback heartbeats feed view counts, resume positions and QoE metrics.
+
+  - id: data-model
+    title: Data model
+    min: 5
+    ask: What metadata and blobs do you store, and where?
+    answer: |
+      ```
+      videos       video_id PK · owner · title · status (uploading → processing → ready)
+                   · duration · renditions [ {res, codec, bitrate, path} ] · created_at    → sharded SQL / KV
+      originals    s3://originals/{video_id}            → cold / infrequent-access tier after processing
+      renditions   s3://media/{video_id}/{rendition}/seg_N.m4s + manifests                → standard tier, CDN origin
+      thumbnails   s3://thumbs/{video_id}/{n}.jpg
+      views        counters per video (approximate, aggregated)  · watch history per user (wide-column)
+      ```
+      - **Metadata is small and relational-ish; media is huge and immutable.** Keep them in different systems.
+      - Segment paths are immutable and content-specific, so CDN caching is simple (cache forever).
+
+  - id: high-level
+    title: High-level design
+    min: 8
+    ask: Draw the upload → processing pipeline and the playback path.
+    diagram:
+      type: arch
+      caption: upload once, encode in parallel, serve from the edge
+      nodes:
+        creator: {label: Creator, at: [0, 0], kind: client}
+        orig: {label: Originals, sub: object store, at: [1, 0], kind: db}
+        dag: {label: Transcode DAG, sub: chunk workers, at: [2, 0]}
+        media: {label: Renditions, sub: segments, at: [3, 0], kind: db}
+        viewer: {label: Viewer, sub: ABR player, at: [0, 2], kind: client}
+        api: {label: Video API, sub: metadata, at: [1, 1]}
+        cdn: {label: CDN edge, sub: ISP caches, at: [2, 2]}
+        shield: {label: Origin shield, at: [3, 1]}
+      edges: [[creator, orig], [orig, dag], [dag, media], [viewer, api], [viewer, cdn], [cdn, shield], [shield, media], [dag, api]]
+      frames:
+        - title: Upload
+          flow: [[creator, orig, resumable PUT], [orig, dag, uploaded], [dag, media, segments], [dag, api, ready]]
+          hit: [media]
+          win: [orig, dag]
+          note: "The original goes straight to object storage. The pipeline splits it into chunks, encodes chunks in parallel per rendition, packages HLS/DASH segments and manifests, then marks the video ready."
+        - title: Playback
+          flow: [[viewer, api, metadata], [viewer, cdn, segments], [cdn, shield, miss], [shield, media, miss]]
+          hit: [cdn]
+          win: [api, shield]
+          note: "The player fetches metadata and a signed manifest, then segments from the nearest edge. Popular segments are served from edge or ISP caches; misses go through a shield, so origin sees few requests."
+    answer: |
+      - **Upload:** resumable multipart upload directly to object storage; an event starts processing.
+      - **Processing DAG:** validate → split into chunks → parallel encode per rendition and codec → package (HLS/DASH, segments + manifests) → thumbnails, content checks → mark ready.
+      - **Playback:** API for metadata and signed manifest; all media bytes from CDN edges (and ISP-embedded caches), with an origin shield in front of storage.
+      - **Events:** playback heartbeats → stream processing → view counts, resume positions, QoE dashboards.
+
+  - id: deep-dives
+    title: Deep dives
+    min: 15
+    ask: Pick 2–3. Answer each before revealing it.
+    items:
+      - id: transcoding
+        q: How do you transcode 720K hours a day quickly and economically?
+        answer: |
+          - **Chunk-parallel encoding:** split at keyframes into ~10–60 s chunks, encode chunks on many workers at once, then stitch. A 2-hour video finishes in minutes instead of hours.
+          - **DAG orchestration** (workflow engine) with retries per task, idempotent outputs keyed by (video, rendition, chunk), and priorities: creators with large audiences and fast-rising videos first.
+          - **Codec ladder by popularity:** everything gets H.264 (universal); popular videos also get VP9 / AV1 (30–50% smaller at equal quality, much more expensive to encode). Encoding cost is paid once, egress savings on every view.
+          - **Per-title encoding:** choose bitrates per video based on its complexity; cartoons need far fewer bits than sports.
+
+      - id: abr
+        q: How does adaptive bitrate streaming work, and how do you get fast start-up?
+        answer: |
+          - The video is encoded at several bitrates (a **ladder**, e.g. 240p–4K) and cut into aligned 2–6 s segments; a manifest lists them.
+          - The **player** measures throughput and buffer level and picks each next segment's quality: buffer-based algorithms (BOLA) avoid rebuffering, throughput-based ones react faster.
+          - **Fast start:** start at a low-to-medium rendition, short first segments, preconnect to the CDN, preload the first segment for likely-next videos, and keep manifests cached at the edge.
+          - Trade-offs: shorter segments adapt faster but add request overhead; low-latency live uses chunked CMAF parts.
+
+      - id: cdn
+        q: How do you serve ~125 Tbps globally and keep origin load small?
+        answer: |
+          - **Tiered caching:** ISP-embedded caches (Netflix Open Connect / Google Global Cache) → regional edges → origin shield → object storage.
+          - **Popularity is skewed:** the head is served from edges at > 95% hit rates; the long tail misses more but is a small share of bytes.
+          - **Pre-positioning:** push new releases and predicted-popular videos to edges off-peak.
+          - **Routing:** DNS / anycast steer users to a healthy, nearby, non-overloaded edge; the player fails over to another CDN host if a segment request is slow.
+
+      - id: views
+        q: How do you count views at this scale, accurately enough and resistant to fraud?
+        answer: |
+          - Players send events (start, heartbeats); a view counts after a threshold (e.g. ~30 s watched).
+          - **Stream processing** aggregates per video per minute; counters are approximate and eventually consistent (displayed counts lag by seconds to minutes).
+          - **Dedup and fraud filtering** (same user/device repeatedly, bot patterns) happen in the pipeline, sometimes later in batch, which is why public counts can be revised.
+          - Never increment a counter row per view synchronously: a viral video becomes a hot key.
+
+      - id: cost
+        q: Storage grows by ~800 PB a year. How do you control cost?
+        answer: |
+          - **Tier by access:** originals to archive after processing (kept for re-encoding); renditions of cold videos to infrequent-access storage.
+          - **Delete or skip unused renditions:** if nobody watches a video in 4K, don't keep (or don't create) 4K; regenerate on demand from the original if needed.
+          - **Better codecs for the head:** AV1 for popular videos cuts the dominant cost, egress.
+          - Measure cost per hour watched as a business metric next to latency and rebuffering.
+
+  - id: wrap-up
+    title: Wrap-up
+    min: 3
+    ask: |
+      - What breaks first at 10×?
+      - What do you monitor?
+      - What makes this a staff-level answer?
+    answer: |
+      **At 10×:** egress and edge capacity, then encoding fleet cost and storage. Push more into ISP caches, more efficient codecs, smarter rendition retention.
+
+      **Monitor:** QoE: start-up time, rebuffering ratio, average bitrate, playback failures (by region, ISP, device); CDN hit ratio and origin egress; processing latency and failure rate; upload success rate.
+
+      **Staff-level signals**
+      - Separates metadata from media and never routes bytes through application servers.
+      - Explains ABR and tiered CDN caching concretely.
+      - Makes encoding a prioritized, chunk-parallel DAG and ties codec choice to popularity and cost.
+      - Measures user-perceived quality (QoE), not just server health.
+
+      **Common mistakes**
+      - Streaming whole files instead of segments.
+      - Serving video from origin servers.
+      - Synchronous view counters.
+      - Encoding every video in every codec regardless of popularity.

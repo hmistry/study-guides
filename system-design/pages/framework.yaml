@@ -1,0 +1,101 @@
+# Interview Framework: the same 7 steps every case uses, with time budgets for a 45-minute interview.
+intro: >-
+  A system design interview checks how you reach a design as much as the design itself: clarifying scope, using numbers to make decisions, choosing deliberately between options, and going deep where it matters.
+  Use the same structure every time so your attention goes to the problem, not to what comes next.
+steps:
+  - id: requirements
+    title: Requirements
+    min: 5
+    goal: Agree on what to build and which qualities matter, then stop asking.
+    do:
+      - "Split **functional** (features) from **non-functional** (latency, availability, consistency, durability, cost)."
+      - "Name what's **out of scope** explicitly, and confirm it."
+      - "State scale assumptions as numbers (DAU, read:write ratio, data size) instead of asking for every one."
+    staff:
+      - "Identify the **one or two properties that shape the design** (\"redirects must never break\", \"never double-sell\")."
+      - "Ask about the business context: who the users are, what failure costs, what exists already."
+    avoid:
+      - "Ten minutes of questions with no design."
+      - "Accepting \"make it scalable and available\" without saying which part, how much."
+  - id: estimation
+    title: Estimation
+    min: 5
+    goal: Turn the scale into the few numbers that decide the architecture.
+    do:
+      - "Compute QPS (average and peak), storage over the retention period, bandwidth, and the hot working set."
+      - "Round hard and say assumptions out loud; 1 day ≈ 10⁵ s."
+    staff:
+      - "End every number with a conclusion: \"40 writes/s, so one primary is plenty; the read path is the hard part.\""
+      - "Estimate the skew too: the hottest key, the biggest tenant, the celebrity."
+    avoid:
+      - "Precise arithmetic that changes nothing."
+      - "Skipping estimation and then sharding something that fits on one box."
+  - id: api
+    title: API
+    min: 4
+    goal: Pin down the contract between clients and the system.
+    do:
+      - "List the core endpoints or messages with inputs, outputs and status codes."
+      - "Choose the transport (REST, gRPC, WebSocket / SSE) for each client relationship."
+    staff:
+      - "Make mutating calls safe to retry (idempotency keys) and pagination stable (cursors)."
+      - "Note which calls are synchronous and which are accepted for async processing (202)."
+    avoid:
+      - "Designing every endpoint; three or four core ones are enough."
+  - id: data-model
+    title: Data model
+    min: 5
+    goal: Decide what is stored, how it's keyed, and where it lives.
+    do:
+      - "Sketch entities and their key fields, driven by the access patterns."
+      - "Choose store types and the **partition key** for each large dataset."
+    staff:
+      - "Name the source of truth for each entity and which stores are derived (caches, indexes, feeds)."
+      - "Check the partition key against both load spread and the main queries."
+    avoid:
+      - "Picking a database by brand without reasons."
+      - "A full normalized schema with every column."
+  - id: high-level
+    title: High-level design
+    min: 8
+    goal: A complete, simple design that meets the requirements end to end.
+    do:
+      - "Draw the components and walk through each core flow (read path, write path) step by step."
+      - "Keep it simple first; complexity is added in deep dives where the numbers demand it."
+    staff:
+      - "Separate paths with different requirements (hot read path vs async analytics) so they scale and fail independently."
+      - "Say where state lives and what's stateless."
+    avoid:
+      - "Boxes labelled with product names and no data flow."
+      - "Introducing microservices, Kafka and Kubernetes before there's a reason."
+  - id: deep-dives
+    title: Deep dives
+    min: 15
+    goal: Go deep on the 2–3 hardest parts, the ones the requirements and numbers point to.
+    do:
+      - "Compare at least two options for each, pick one, and say what it costs."
+      - "Cover failure modes: what happens when this component is slow, down or overloaded."
+    staff:
+      - "Choose the deep dives yourself if the interviewer doesn't, and explain why those are the risky parts."
+      - "Quantify trade-offs (collision probability, over-admission, RPO) instead of just naming them."
+    avoid:
+      - "Surveying every option without deciding."
+      - "Going deep on something easy (CRUD endpoints, auth boilerplate)."
+  - id: wrap-up
+    title: Wrap-up
+    min: 3
+    goal: Show you can operate and evolve what you designed.
+    do:
+      - "Say what breaks first at 10× and how you'd respond."
+      - "Name the key metrics and alerts."
+    staff:
+      - "Summarize the design's main trade-offs and the alternatives you'd revisit if requirements changed."
+    avoid:
+      - "Running out of time before any summary; keep an eye on the clock."
+throughout:
+  - "**Think out loud** and narrate decisions as \"X because Y, at the cost of Z\"."
+  - "**Check in at transitions** (\"I'd like to go deeper on ID generation next, unless you'd prefer another area\")."
+  - "**Treat hints as data:** if the interviewer pushes on something, that's where they want depth."
+  - "**Stay on one diagram** and evolve it; label arrows with what flows."
+  - "**Prefer boring technology** and explain when you'd reach for something more complex."
+  - "**Name failure modes unprompted:** retries, duplicates, hot keys, region loss, cold caches."

@@ -1,0 +1,76 @@
+id: dist-transactions
+name: Distributed Transactions
+signal: ["one action updates several services or databases", "order → payment → inventory → shipping", "\"what if step 3 fails?\"", "money must not be lost or doubled", "DB write + message publish"]
+idea: >-
+  Once data lives in several services, there is no single ACID transaction to lean on.
+  Two-phase commit gives atomicity but blocks on coordinator failure and couples availability; sagas break the work into local transactions with compensating actions, accepting temporary inconsistency.
+  Most production systems use sagas + outbox + idempotency, and reserve 2PC for inside one database or tightly coupled stores.
+
+diagram:
+  type: arch
+  caption: an orchestrated saga for placing an order
+  nodes:
+    orch: {label: Order saga, sub: orchestrator, at: [0, 1]}
+    pay: {label: Payments, at: [1, 0]}
+    inv: {label: Inventory, at: [1, 1]}
+    ship: {label: Shipping, at: [1, 2]}
+    log: {label: Saga log, at: [2, 1], kind: db}
+  edges: [[orch, pay], [orch, inv], [orch, ship], [orch, log]]
+  frames:
+    - title: Happy path
+      flow: [[orch, inv, 1 reserve], [orch, pay, 2 charge], [orch, ship, 3 create]]
+      hit: [inv, pay, ship]
+      note: "Each step is a local transaction in its own service, invoked with an idempotency key. The orchestrator persists its state after each step so it can resume after a crash."
+    - title: Failure · compensate
+      flow: [[orch, ship, 3 create ✗], [orch, pay, 4 refund], [orch, inv, 5 release]]
+      win: [pay, inv]
+      note: "Shipping fails permanently, so the orchestrator runs compensations in reverse: refund, release stock. Compensations are semantic undos (a refund, not a deleted charge) and must also be idempotent."
+
+numbers:
+  - {k: 2PC round trips, v: "2 (prepare, commit) + log fsyncs"}
+  - {k: Typical saga steps, v: "3–8 local transactions"}
+  - {k: Idempotency key retention, v: "≥ max retry window (~24 h–7 d)"}
+
+tables:
+  - title: Approaches
+    cols: [Approach, How, Strengths, Weaknesses]
+    rows:
+      - ["**2PC / XA**", "Coordinator asks all to prepare (lock + log), then commits or aborts all", "Atomic; isolated", "Blocking if the coordinator dies after prepare; locks held across network calls; every participant must support it"]
+      - ["**Saga (orchestrated)**", "A central workflow calls each step and its compensation", "Clear flow, state and timeouts in one place; easier to reason about", "Orchestrator is a component to run; risk of a god service"]
+      - ["**Saga (choreographed)**", "Services react to each other's events", "Loose coupling; no central component", "Flow is implicit and spread out; hard to trace, change and debug"]
+      - ["**Outbox + CDC**", "Local transaction writes data + event; relay publishes", "Removes the DB/broker dual write", "At-least-once: consumers must dedupe"]
+      - ["**Single DB / NewSQL**", "Keep data that must change atomically in one transactional store", "Real ACID, simplest correctness", "Couples services; Spanner-class stores add commit latency"]
+
+pitfalls:
+  - "**Compensations that can't undo.** You can't unsend an email or unship a parcel. Order steps so irreversible ones come last, after the risky ones (reserve, then charge, then ship)."
+  - "**Non-idempotent steps.** Sagas retry. Every step and compensation needs an idempotency key, or a retry double-charges."
+  - "**Missing isolation.** Between steps, other requests see intermediate state (stock reserved, payment pending). Use semantic locks (`PENDING` states), and design reads to tolerate them."
+  - "**Distributed transactions for everything.** If two entities must always change together, they probably belong in the same service and database. Fix the boundary before adding coordination."
+  - "**No timeouts or stuck-saga handling.** A saga waiting on a lost reply hangs forever. Persist deadlines, retry, and escalate to compensation or manual review."
+
+depth:
+  - "**Workflow engines (Temporal, Step Functions, Cadence):** durable execution of saga code with persisted state, retries, timers and history; the orchestrator becomes ordinary code that survives crashes."
+  - "**Pivot transaction:** the step after which the saga can only go forward (e.g. capture payment). Steps before it are compensatable, steps after must be retryable until they succeed."
+  - "**Reservation pattern (TCC: try-confirm-cancel):** each participant first places a time-limited hold, then confirms or cancels. Holds expire on their own, which bounds the damage of a lost coordinator."
+  - "**Exactly-once effects across a boundary:** idempotency keys in the downstream API (Stripe-style), dedup tables keyed by message id, and upserts. 'Exactly once' is always 'at least once + idempotent'."
+  - "**Reconciliation:** even with sagas, run periodic jobs that compare ledgers across services (orders vs payments vs shipments) and flag or repair mismatches. Auditors and finance will ask for it."
+
+checks:
+  - q: "Order flow: reserve inventory, charge card, create shipment. Shipment creation fails permanently. What happens in a saga, and in what order should steps be?"
+    a: >-
+      The orchestrator runs compensations in reverse: refund (or void the authorization), then release the reservation, and marks the order failed.
+      Order steps so cheap, reversible ones go first (reserve) and irreversible ones last; better still, authorize the card early and capture only after the shipment is created, making the capture the pivot.
+  - q: Why is 2PC rarely used across microservices?
+    a: >-
+      Participants hold locks from prepare until commit, across network calls, so latency and contention grow; if the coordinator fails after prepare, participants block holding locks until it recovers.
+      Availability becomes the product of every participant's availability, and many stores (queues, third-party APIs) can't participate at all.
+  - q: "A saga has 4 steps, each with 99.9% success per attempt and up to 3 attempts. What fraction of sagas reach compensation?"
+    given: {p: 0.999, attempts: 3, steps: 4}
+    calc:
+      - {name: fail_step, ask: Chance one step fails all attempts, unit: "", expr: "(1 - p) ** attempts", show: "1e-9"}
+      - {ask: Chance any step fails (≈ steps × that), unit: "", expr: "1 - (1 - fail_step) ** steps", show: "4e-9"}
+    a: "Retries make transient failures vanish (if failures are independent, which outages aren't). Compensation is for permanent failures: declined cards, out of stock, validation errors, so design for those, not for the network."
+  - q: How do you make sure a charge happens at most once when the orchestrator crashes and retries the 'charge' step?
+    a: >-
+      Pass a stable idempotency key per saga step (e.g. `order-123:charge`) to the payment service, which stores key → result and returns the stored result on retries.
+      The orchestrator persists that it issued the step before calling, and on recovery replays the same key rather than generating a new one.

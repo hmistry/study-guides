@@ -1,0 +1,88 @@
+id: partitioning
+name: Partitioning
+signal: ["data or writes beyond one machine", "\"how would you shard this?\"", "hot users / celebrities / viral items", "multi-tenant SaaS", "adding capacity without downtime"]
+idea: >-
+  Split data so each node owns a subset; it's how writes and storage scale past one machine.
+  The partition key decides everything: it must spread load evenly and keep each common query on one partition.
+  Hash partitioning spreads load but kills range scans; range partitioning keeps order but invites hot spots. Plan resharding from day one.
+
+diagram:
+  type: arch
+  caption: consistent hashing with virtual nodes
+  nodes:
+    client: {label: Router, sub: hash(key) → ring, at: [0, 1], kind: client}
+    a: {label: Node A, sub: vnodes 0–99, at: [1, 0], kind: db}
+    b: {label: Node B, sub: vnodes 100–199, at: [2, 0], kind: db}
+    c: {label: Node C, sub: vnodes 200–299, at: [3, 0], kind: db}
+    d: {label: Node D (new), sub: takes ~1/4, at: [2, 2], kind: db}
+  edges: [[client, a], [client, b], [client, c]]
+  frames:
+    - title: Route
+      flow: [[client, b, "user:42 → vnode 137"]]
+      hit: [b]
+      note: "The key is hashed onto a ring of many virtual nodes; each physical node owns many small arcs, so load evens out and a slow node's share is small."
+    - title: Add a node
+      flow: [[a, d], [b, d, ~1/4 of vnodes], [c, d]]
+      hit: [d]
+      win: [a, b, c]
+      note: "A new node takes a few vnodes from every existing node: only ~1/n of keys move, spread across the cluster. With `hash mod N`, nearly every key would move."
+
+numbers:
+  - {k: Keys moved adding 1 of n nodes, v: "≈ 1/(n+1) with consistent hashing"}
+  - {k: "Keys moved with hash mod N", v: "≈ all of them (N/(N+1))"}
+  - {k: Typical shard size target, v: "~10–100 GB (fast to move/restore)"}
+  - {k: Redis Cluster, v: "16,384 hash slots"}
+  - {k: DynamoDB partition, v: "~1K WCU / 3K RCU / 10 GB each"}
+
+tables:
+  - title: Strategies
+    cols: [Strategy, How, Strengths, Weaknesses]
+    rows:
+      - ["**Hash**", "hash(key) mod N, or a hash ring", "Even spread; no hot ranges from sequential keys", "No range scans across keys; resharding moves data"]
+      - ["**Range**", "Contiguous key ranges per shard (Bigtable, HBase, CockroachDB)", "Range scans and ordered reads; splits as ranges grow", "Sequential keys (timestamps, auto-increment) all hit the last range"]
+      - ["**Directory / lookup**", "A mapping service: key → shard", "Arbitrary placement; move a tenant at will", "Directory is a critical dependency; must be cached and highly available"]
+      - ["**Geo / tenant**", "Shard by region or customer", "Data locality and residency; tenant isolation", "Uneven sizes: one tenant can outgrow a shard"]
+  - title: Choosing a key
+    cols: [Workload, Good key, Bad key]
+    rows:
+      - ["Chat messages", "`(conversation_id, time_bucket)`", "`message_id` (scatters a conversation)"]
+      - ["User profiles", "`user_id` (hashed)", "`country` (hot shards, uneven)"]
+      - ["Time-series metrics", "`(metric, host, day)`", "`timestamp` alone (one hot shard)"]
+      - ["Multi-tenant SaaS", "`tenant_id` (+ sub-key for big tenants)", "Random IDs that scatter one tenant's queries"]
+      - ["Orders by customer", "`customer_id`", "`order_date`"]
+
+pitfalls:
+  - "**Hash mod N.** Changing N remaps almost every key. Use consistent hashing, a fixed large number of logical shards (e.g. 4,096) mapped onto nodes, or range splits."
+  - "**Monotonic keys in range partitioning.** Timestamps or auto-increment IDs send every insert to the newest range. Prefix with a hash or bucket, or use hash partitioning."
+  - "**Scatter-gather queries.** A query not keyed by the partition key fans out to every shard; p99 becomes the slowest shard's. Model the second access pattern as its own table or a global secondary index."
+  - "**Cross-shard transactions.** Joins and atomic updates across shards are slow and complex. Choose keys so the things updated together live together (a customer's orders with the customer)."
+  - "**Celebrity / tenant hot spots.** Hashing spreads keys, not load: one key with 1000× the traffic still lands on one shard. Split hot keys (salt with N suffixes) or give big tenants dedicated shards."
+
+depth:
+  - "**Logical vs physical shards:** pre-split into many logical shards (more than you need) and map them to physical nodes. Rebalancing moves whole logical shards; no rehashing of keys."
+  - "**Secondary indexes:** local (each shard indexes its own rows: writes cheap, reads scatter) vs global (index partitioned by the indexed value: reads targeted, writes cross shards and are usually async)."
+  - "**Resharding online:** double-write or log-tail to the new layout, backfill, verify with checksums, flip reads, then flip writes. Rehearse it; it's the riskiest routine operation in a sharded system."
+  - "**Bounded-load consistent hashing and rendezvous hashing:** cap each node's share at (1 + ε) × average, or pick the highest-scoring node per key; both keep movement small while avoiding overload."
+  - "**Shard-aware request routing:** clients or a proxy cache the shard map and handle `moved` responses (Redis Cluster MOVED/ASK, Vitess VTGate), so the map can change while traffic flows."
+
+checks:
+  - q: A chat app partitions messages by `message_id` (hashed). Loading a conversation is slow. Why, and what key instead?
+    a: >-
+      Each conversation's messages are scattered across every shard, so loading the latest 50 is a scatter-gather sorted merge.
+      Partition by `conversation_id` (bucketed by time for very long or very active conversations) with messages clustered by time inside the partition: one shard, one ordered read.
+  - q: You grow a cache cluster from 10 to 11 nodes. Roughly what fraction of keys move with `hash mod N`, and with consistent hashing?
+    given: {n: 10}
+    calc:
+      - {ask: "Fraction moved with mod N", unit: "", expr: "n / (n + 1)", show: "≈ 0.91"}
+      - {ask: Fraction moved with consistent hashing, unit: "", expr: "1 / (n + 1)", show: "≈ 0.09"}
+    a: "With mod N about 91% of keys change owner: effectively a cold cache and a stampede on the database. Consistent hashing moves only the ~9% the new node takes over."
+  - q: A multi-tenant SaaS shards by `tenant_id`. One enterprise tenant now has 40% of all traffic. What do you do?
+    a: >-
+      Give the big tenant dedicated shards via a directory (tenant → shard set), then partition that tenant internally by a sub-key (e.g. `(tenant_id, project_id)`).
+      Keep small tenants packed together. A directory layer makes moving and isolating tenants an operational task instead of a re-architecture.
+  - q: Postgres at 8 TB and 40K writes/s needs to grow 5×. How many shards would you plan, assuming ~1 TB and ~10K writes/s per shard comfortably?
+    given: {tb: 8, wps: 40000, growth: 5, tb_per: 1, wps_per: 10000}
+    calc:
+      - {ask: Shards needed for storage, unit: "", expr: "tb * growth / tb_per", show: "40"}
+      - {ask: Shards needed for writes, unit: "", expr: "wps * growth / wps_per", show: "20"}
+    a: "Storage dominates: ~40 shards. Pre-split into e.g. 256 or 1,024 logical shards mapped onto ~40 physical nodes, so later growth is moving logical shards, not re-keying."

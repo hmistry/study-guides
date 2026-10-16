@@ -1,0 +1,95 @@
+id: apis
+name: APIs & Protocols
+signal: ["\"define the API\"", "clients on mobile / web / partners", "real-time updates (chat, live scores)", "retries after timeouts", "service-to-service calls"]
+idea: >-
+  The API is the contract that outlives the implementation, so design it around resources and access patterns, not around today's tables.
+  Pick the transport per relationship: REST for public and cacheable, gRPC for internal and typed, GraphQL when many clients need different shapes,
+  and a push channel (SSE / WebSocket) only when the server must initiate. Every mutating call must be safe to retry.
+
+diagram:
+  type: arch
+  caption: how the server reaches the client, from cheapest to most stateful
+  nodes:
+    client: {label: Client, at: [0, 1], kind: client}
+    lb: {label: LB, sub: "L7 · sticky?", at: [1, 1]}
+    api: {label: API server, at: [2, 1]}
+    bus: {label: Pub/sub, sub: Redis · Kafka, at: [3, 1], kind: queue}
+  edges: [[client, lb], [lb, api], [api, bus]]
+  frames:
+    - title: Short polling
+      flow: [[client, lb, GET every 5 s], [lb, api]]
+      win: [api]
+      note: "Simple and stateless, but most requests return nothing, and latency = the poll interval. Fine for dashboards that tolerate seconds of lag."
+    - title: Long polling
+      flow: [[client, lb, GET (held)], [lb, api], [bus, api, event], [api, lb, response]]
+      win: [api, bus]
+      note: "The server holds the request until there's data or a timeout (~30 s), then the client re-polls. Works through every proxy; one request per message."
+    - title: SSE
+      flow: [[client, lb, GET stream], [lb, api], [bus, api, events], [api, lb, stream]]
+      hit: [api]
+      win: [bus]
+      note: "One long-lived HTTP response, server → client only. Auto-reconnect with `Last-Event-ID`. Good for feeds, notifications, LLM token streams."
+    - title: WebSocket
+      flow: [[client, lb, WS upgrade], [lb, api, frames], [api, lb, frames], [bus, api, fan-out]]
+      hit: [api]
+      win: [lb, bus]
+      note: "Full duplex over one TCP connection. Each server holds connection state, so you need a pub/sub layer to reach a user connected to another server, and LBs must allow long-lived connections."
+
+numbers:
+  - {k: Idle WebSocket per server, v: "~100K–1M connections (memory-bound)"}
+  - {k: Memory per idle connection, v: "~10–50 KB (buffers, TLS)"}
+  - {k: TLS 1.3 handshake, v: "+1 RTT (0-RTT on resume)"}
+  - {k: gRPC vs JSON payload, v: "protobuf ~3–10× smaller, faster to parse"}
+  - {k: Long-poll timeout, v: "~30 s (under proxy idle limits)"}
+
+tables:
+  - title: Choosing an API style
+    cols: [Style, Strengths, Weaknesses, Use for]
+    rows:
+      - ["**REST / JSON**", "Universal; HTTP caching, status codes and tooling for free; easy to debug", "Over- and under-fetching; chatty for nested data; loose contracts unless you add OpenAPI", "Public APIs, CRUD resources, anything a CDN should cache"]
+      - ["**gRPC / protobuf**", "Typed contracts and codegen; HTTP/2 multiplexing; streaming both ways; small payloads", "Browsers need a proxy (gRPC-Web); not human-readable; no HTTP caching", "Internal service-to-service, high-QPS or streaming RPC"]
+      - ["**GraphQL**", "Client picks the shape; one round trip for nested data; schema introspection", "Caching is hard (POST, one URL); N+1 resolvers; query-cost limits needed", "Many client types over a rich graph (mobile + web + partners)"]
+      - ["**Async / events**", "Decouples producer and consumer in time; absorbs bursts", "No immediate answer; ordering and duplicates to handle", "Work that can finish later: emails, encoding, fan-out"]
+  - title: Pagination
+    cols: [Method, How, Breaks when]
+    rows:
+      - ["**Offset**", "`?offset=200&limit=50`", "Deep pages are O(offset) scans; inserts shift pages, so items repeat or vanish"]
+      - ["**Cursor (keyset)**", "`?after=<opaque cursor>`, encoding the last sort key, e.g. `(created_at, id)`", "Can't jump to page N; needs a stable, unique sort key"]
+      - ["**Snapshot / token**", "Server stores a result-set snapshot behind a token", "Server-side state and expiry; only worth it for expensive searches"]
+
+pitfalls:
+  - "**Non-idempotent creates.** A client times out and retries `POST /payments`, and the customer pays twice. Accept an `Idempotency-Key`, store key → result, and replay the stored result on a retry."
+  - "**Offset pagination on big or live tables.** Use cursors keyed on an indexed, unique sort: `(created_at, id)`, never `created_at` alone."
+  - "**Leaking storage into the contract.** Exposing auto-increment IDs or table shapes locks you in and leaks volume. Expose opaque IDs and resource shapes."
+  - "**Breaking changes without versioning.** Removing or renaming a field breaks old mobile clients for years. Only add, version the path or header for breaking changes, and track client versions."
+  - "**WebSockets where SSE would do.** If only the server pushes, SSE is plain HTTP: easier through proxies, with auto-reconnect and simpler scaling."
+  - "**Unbounded responses.** Every list endpoint needs a max page size; every request needs a size limit and a timeout."
+
+depth:
+  - "**Idempotency keys done right:** store (key, request hash, response) with a TTL of ~24 h; a reused key with a different body returns 422; process key + side effect in one transaction, or record the key first in a 'pending' state so concurrent duplicates wait."
+  - "**Connection-oriented scaling:** with millions of WebSockets, deploys become reconnect storms. Drain gradually, add jittered client backoff, and keep a connection-registry (user → gateway) in a fast store so any service can route to the right gateway."
+  - "**Backward compatibility in protobuf:** never reuse field numbers, add fields as optional, and treat unknown fields as ignorable. That gives rolling deploys where old and new versions coexist."
+  - "**Rate limits and quotas are part of the API:** return `429` with `Retry-After`, document limits per key, and make them visible in headers (`RateLimit-Remaining`)."
+  - "**HTTP/2 and HTTP/3:** multiplexing removes head-of-line blocking at HTTP level; HTTP/3 (QUIC) removes it at the transport level and survives network changes on mobile, which matters for flaky clients."
+
+checks:
+  - q: A mobile client sends `POST /orders`, the request times out, and the client retries. How do you guarantee one order?
+    a: >-
+      The client generates an `Idempotency-Key` per logical operation and sends it on every retry.
+      The server records the key atomically (unique constraint) before or with the side effect and stores the response; a repeat returns the stored response.
+      A concurrent duplicate sees the key 'in progress' and waits or gets 409. Keys expire after a window (~24 h).
+  - q: Users scroll an infinite feed that gets new posts every second. Offset pagination shows duplicates. Why, and what do you use instead?
+    a: >-
+      New posts at the top shift every offset, so page 2 repeats the end of page 1. Deep offsets are also O(n) scans.
+      Use a cursor: the opaque encoding of the last item's sort key, e.g. `(created_at, id)`, and query `WHERE (created_at, id) < cursor ORDER BY … LIMIT n` on an index.
+  - q: A live sports app must push score updates to 2M concurrent viewers; clients never send data back. Which transport, and how many servers at ~200K connections each?
+    given: {viewers: "2e6", per_server: "200e3"}
+    calc:
+      - {ask: Push servers needed (no headroom), unit: "", expr: "viewers / per_server", show: "10"}
+    a: >-
+      SSE: server → client only, plain HTTP, built-in reconnect with `Last-Event-ID`. Run ~15 servers with headroom (N+50% to absorb a server failure's reconnect storm),
+      fed by a pub/sub topic per game so every server gets every update and fans it out locally.
+  - q: Why might you pick gRPC internally but REST externally?
+    a: >-
+      Internally you control both ends, so typed contracts, codegen, small payloads and streaming win, and nobody needs a browser or a CDN.
+      Externally, REST works with every client and tool, is cacheable at the edge, and is easy for partners to debug. A gateway translates between them.

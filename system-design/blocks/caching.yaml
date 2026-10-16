@@ -1,0 +1,100 @@
+id: caching
+name: Caching
+signal: [read-heavy (10:1 and up), the same data read again and again, latency budget below what the DB gives, expensive computed results, a few very hot keys]
+idea: >-
+  Keep copies of hot data closer to the reader, trading freshness and complexity for latency and backend offload.
+  Hit rate is everything: effective latency = h · t_cache + (1 − h) · t_db, and DB load is proportional to the miss rate.
+  The real decisions are **where** to cache, **how writes reach it**, **how it gets invalidated**, and **what happens when it's cold or gone**.
+
+diagram:
+  type: arch
+  caption: cache-aside, the default for read-heavy data
+  nodes:
+    client: {label: Client, at: [0, 1], kind: client}
+    app: {label: App server, at: [1, 1]}
+    cache: {label: Cache, sub: Redis, at: [2, 0], kind: cache}
+    db: {label: Database, at: [2, 2], kind: db}
+  edges: [[client, app], [app, cache], [app, db]]
+  frames:
+    - title: Read · hit
+      flow: [[client, app, GET], [app, cache, 1 get k], [cache, app, 2 value]]
+      hit: [cache]
+      note: "Hit: ~0.5 ms, and the database is untouched."
+    - title: Read · miss
+      flow: [[app, cache, "1 get · 4 set k, TTL"], [cache, app, 2 miss], [app, db, 3 query]]
+      hit: [db]
+      win: [cache]
+      note: "Miss: read the DB, then fill the cache with a TTL. The first reader after expiry pays the full cost (and 10K simultaneous readers make a stampede)."
+    - title: Write
+      flow: [[client, app, PUT], [app, db, 1 commit], [app, cache, 2 delete k]]
+      hit: [db]
+      win: [cache]
+      note: "Write the DB, then **delete** the key; never update it in place. The next read reloads the committed value."
+
+numbers:
+  - {k: Remote cache GET, v: "0.2–1 ms (network-bound)"}
+  - {k: In-process cache GET, v: "~100 ns"}
+  - {k: One Redis instance, v: "~100K ops/s"}
+  - {k: Redis per-key overhead, v: "~50–100 B on top of the value"}
+  - {k: Hit 95% → 99%, v: "misses 5% → 1% = 5× less DB load"}
+
+tables:
+  - title: Write strategies
+    cols: [Strategy, How, Wins, Costs, Use when]
+    rows:
+      - ["**Cache-aside**", "App reads the cache; on a miss it reads the DB and fills. Writes go to the DB, then delete the key.", "Caches only what's read; a cache outage degrades instead of breaking", "Stale window; first read misses; the app owns the logic", "The default for read-heavy data"]
+      - ["**Read-through**", "The cache library loads from the source on a miss", "One place to coalesce misses; simpler callers", "The cache must know the data source", "Cache-aside behind a library (Caffeine loader, DAX)"]
+      - ["**Write-through**", "Each write updates the cache and the DB synchronously", "Written keys are always warm and fresh", "Every write pays both latencies; caches data nobody reads", "Read-after-write heavy, small working set"]
+      - ["**Write-behind**", "Write to the cache; flush to the DB asynchronously in batches", "Lowest write latency; absorbs bursts; coalesces repeat writes", "Data loss if the cache dies before flushing; ordering and replay are hard", "Loss-tolerant high-rate writes: counters, likes, metrics"]
+      - ["**Write-around**", "Writes skip the cache; it fills on reads", "Write-once data doesn't pollute the cache", "Recent writes always miss first", "Uploads and logs that are rarely re-read"]
+  - title: Where to cache
+    cols: [Layer, Examples, Latency, Watch out for]
+    rows:
+      - [Client / browser, "`Cache-Control`, `ETag`", "0", "You can't invalidate it: use versioned URLs (`app.3f9c.js`)"]
+      - [CDN / edge, "CloudFront, Fastly, Cloudflare", "~10–30 ms from user", "Purge latency (seconds); cache keys must exclude per-user data"]
+      - [In-process, "Caffeine, an LRU dict", "~100 ns", "N hosts hold N copies that drift apart; size-limited; lost on deploy"]
+      - [Distributed, "Redis, Memcached", "0.2–1 ms", "A network hop; capacity planning; becomes load-bearing"]
+      - [Inside the DB, "buffer pool, materialized views", "—", "Free: tune and add RAM before adding a tier"]
+
+pitfalls:
+  - "**Updating the cache on write instead of deleting.** Two writers can commit A then B to the DB, but set the cache B then A, leaving the old value cached until the TTL. Deleting is order-insensitive."
+  - "**Stampede on expiry.** A hot key expires and thousands of requests hit the DB at once. Fix with request coalescing (single-flight), a lock or lease per key, stale-while-revalidate, or probabilistic early refresh."
+  - "**Synchronized expiry.** Keys loaded together (a warm-up, a deploy) expire together. Add ±10–20% TTL jitter."
+  - "**Cache penetration.** Lookups for keys that don't exist (bugs, scanners) miss every time and go straight to the DB. Cache negative results briefly, or put a Bloom filter of existing keys in front."
+  - "**The cache became the database.** Once the DB can't survive a cold cache, losing a cache node at peak is an outage. Plan for it: replicas, rate-limited warm-up, load shedding on the miss path."
+  - "**Caching what shouldn't be cached.** Low-reuse, write-heavy or strongly consistent data (balances, inventory counts at checkout) gains little and adds staleness bugs."
+
+depth:
+  - "**Residual race in cache-aside.** A slow reader loads the old row, the writer commits and deletes, then the reader sets the stale value. Bound it with a TTL, or use leases or version checks (Meta's memcache leases; `SET` only if the version is newer)."
+  - "**CDC-driven invalidation.** Tail the DB's change log (Debezium → Kafka) and invalidate from it. Writers stop knowing about caches, and multi-region invalidation becomes a consumer per region. Meta's mcsqueal does this from the MySQL binlog."
+  - "**Read-your-writes on top of eventual consistency:** after a user writes, bypass the cache for that user for a few seconds, or write-through that user's own entries."
+  - "**Eviction choice matters at scale.** LRU is the default. LFU or W-TinyLFU (Caffeine) resists one-off scans and keeps a stable hot set, often for several points more hit rate at the same memory."
+  - "**Distributed cache topology:** consistent hashing (Redis Cluster uses 16,384 hash slots) so resizing moves ~1/n of the keys; replicas for availability, not for capacity; client-side hot-key detection."
+  - "**What to measure:** hit ratio per key class, p99 latency, eviction rate, memory fragmentation, and DB QPS when the cache is cold. Run a game day that kills a cache node."
+
+checks:
+  - q: Why delete the cache key on a write instead of writing the new value into the cache?
+    a: >-
+      Concurrent writers can commit to the DB in one order but update the cache in the other, and the cache then holds an old value until the TTL.
+      A delete is idempotent and order-insensitive: the next read loads whatever is committed.
+      A smaller race remains (a slow reader sets a stale value after the delete). A TTL bounds it; leases or version checks close it.
+  - q: The cache hit rate rises from 95% to 99%. At 95% the DB served 50K reads/s.
+    given: {db: 50000, h1: 0.95, h2: 0.99}
+    calc:
+      - {name: total, ask: Total read rate, unit: /s, expr: "db / (1 - h1)", show: "1M/s"}
+      - {ask: DB reads at 99%, unit: /s, expr: "total * (1 - h2)", show: "10K/s"}
+    a: "Misses drop from 5% to 1%, so a 4-point hit-rate gain is a 5× cut in DB load. The last few percent of hit rate matter most."
+  - q: One celebrity profile key takes 500K reads/s. A Redis node serves ~100K ops/s. What do you do?
+    a: >-
+      Sharding doesn't help, because one key lives on one shard.
+      (1) Put an in-process cache in front with a short TTL (1–5 s), so most reads never leave the host.
+      (2) Replicate the key under N suffixes (`user:42#0..7`): read a random copy, and delete all copies on write.
+      (3) Add read replicas for that shard.
+      Detect hot keys (client-side sampling, Redis `--hotkeys`) instead of guessing which ones are hot.
+  - q: At peak, the Redis cluster fails and the DB sees 20× its normal read load. What should have been designed in?
+    a: >-
+      The cache was load-bearing with no plan for losing it.
+      Replicate the cache with automatic failover.
+      Put a circuit breaker and load shedding on the miss path so the DB degrades but survives.
+      Serve stale data from an in-process cache, and warm up with rate limits after recovery.
+      Then prove it with a game day: kill a cache node and watch DB load.

@@ -1,0 +1,86 @@
+id: estimation
+name: Estimation
+signal: ["\"design it for 100M users\"", "one machine or many?", "does the hot set fit in RAM?", "how many shards / servers?", "read- or write-heavy?"]
+idea: >-
+  An estimate exists to make a decision: one box or a fleet, does it fit in memory, shard or not, CDN or not.
+  Round hard (1 day ≈ 10⁵ s), carry powers of ten, say each assumption out loud, and end every number with **"so…"**.
+  Size for peak, not average, and multiply raw storage by replication, overhead and years of growth.
+
+numbers:
+  - {k: 1 day, v: "86,400 s ≈ 10⁵ s"}
+  - {k: 1M / day, v: "≈ 12 / s"}
+  - {k: 1B / day, v: "≈ 12K / s"}
+  - {k: 1 month · 1 year, v: "≈ 2.6M s · ≈ 3 × 10⁷ s"}
+  - {k: Peak ÷ average, v: "2–10× (say 3× unless told)"}
+  - {k: 2¹⁰, v: "≈ 10³: KB → MB → GB → TB → PB"}
+  - {k: Read:write, v: "social ~100:1 · logging / IoT ≪ 1:1"}
+
+tables:
+  - title: Latency (round numbers, current hardware)
+    cols: [Operation, Time, So…]
+    rows:
+      - [L1 cache / main memory reference, "1 ns / 100 ns", "RAM is ~1000× faster than an SSD random read"]
+      - [Redis / Memcached GET (same AZ), "0.2–1 ms", "dominated by the network hop, not the lookup"]
+      - [NVMe SSD random 4 KB read, "~100 µs", "an index miss to disk costs ~1000 RAM lookups"]
+      - [Read 1 MB sequentially (RAM / NVMe / HDD), "~0.1 ms / ~0.5 ms / ~5 ms", "sequential HDD is fine for logs, terrible for random"]
+      - [HDD seek, "~10 ms", "~100 random IOPS per spindle"]
+      - [Round trip same AZ / cross-AZ, "~0.3 ms / ~1–2 ms", "synchronous replication across AZs is affordable"]
+      - [Round trip US coast ↔ coast / US ↔ EU / US ↔ Asia, "~70 / ~90 / ~150+ ms", "synchronous cross-region writes cost a user-visible RTT"]
+  - title: Throughput per node (order of magnitude; workload-dependent)
+    cols: [Component, Ballpark, Notes]
+    rows:
+      - [Stateless app server, "1K–10K req/s", "CPU- or I/O-bound depending on work per request"]
+      - ["Relational primary (Postgres / MySQL)", "~10K writes/s · 50K+ indexed reads/s", "reads scale with replicas; writes need sharding past one primary"]
+      - [Redis instance, "~100K ops/s (more pipelined)", "single-threaded per shard: one hot key caps here"]
+      - ["LSM store node (Cassandra / Scylla)", "10K–100K writes/s", "scales roughly linearly by adding nodes"]
+      - [Kafka partition / broker, "~10 MB/s+ / 100s of MB/s", "partition count bounds consumer parallelism"]
+      - [NIC, "10–25 Gbit/s ≈ 1–3 GB/s", "bits on the wire, bytes on disk: ÷ 8"]
+      - [Server RAM / disk, "256 GB–1 TB+ / 10s of TB", "a lot fits on one box — check before sharding"]
+  - title: Availability
+    cols: [Target, Downtime / year, Downtime / month]
+    rows:
+      - ["99.9%", "8.8 h", "43 min"]
+      - ["99.95%", "4.4 h", "22 min"]
+      - ["99.99%", "53 min", "4.3 min"]
+      - ["99.999%", "5.3 min", "26 s"]
+
+pitfalls:
+  - "**Sizing for the average.** Traffic is diurnal and bursty, and retries after an outage spike far above the normal peak. State a peak factor and size for it."
+  - "**Bits vs bytes.** Network is quoted in bits (10 Gbps ≈ 1.25 GB/s). Mixing them up is a silent 8× error."
+  - "**Raw ≠ provisioned storage.** Multiply by replication (×3), indexes and overhead (~1.5–2×), and headroom (disks degrade past ~70–80% full), then by years of growth."
+  - "**False precision.** 11,574/s is no better than \"~10K/s\" and burns interview minutes. One significant figure, powers of ten."
+  - "**Averages hide skew.** The top 1% of keys or users can carry most of the traffic. Estimate the hottest key and the biggest tenant, not only the mean."
+  - "**A number with no conclusion.** \"40 writes/s\" is useless until it becomes \"so one primary is plenty, and the hard part is the read path\"."
+
+depth:
+  - "**Little's law:** in-flight requests = throughput × latency. 20K req/s at 50 ms means 1,000 concurrent requests. This sizes thread and connection pools, and shows why a latency spike exhausts them."
+  - "**Fan-out amplifies the tail.** If 1% of calls are slow, a request fanning out to 100 backends sees at least one slow call 1 − 0.99¹⁰⁰ ≈ 63% of the time. Mitigations: hedged requests, fewer hops, partial results."
+  - "**Availability composes.** Serial dependencies multiply (three 99.9% hops ≈ 99.7%). Redundant copies in parallel give 1 − (1 − a)ⁿ, as long as their failures are independent."
+  - "**Headroom is part of the estimate.** Run nodes at ~50–70% at peak so losing a node or an AZ (N+1, N+2) doesn't cascade. Queueing delay explodes as utilization approaches 100%."
+  - "**Cost is an estimate too.** For media-heavy designs, egress and storage dollars often decide the architecture (CDN, tiered storage, compression) more than QPS does."
+
+checks:
+  - q: A social app has 500M DAU. Each user creates 2 posts and reads 100 posts a day. Peak is 3× the average.
+    given: {dau: "500e6", posts: 2, reads: 100, peak: 3}
+    calc:
+      - {name: w, ask: Average write QPS, unit: /s, expr: "dau * posts / 86400", show: "≈ 12K/s"}
+      - {ask: Peak read QPS, unit: /s, expr: "dau * reads / 86400 * peak", show: "≈ 1.7M/s"}
+    a: "With 1 day ≈ 10⁵ s it's mental math: 10⁹ writes / 10⁵ s = 10⁴/s. Reads are 50× writes **so** the design is read-optimized: caching, replicas, precomputed feeds."
+  - q: A link service stores 100M new URLs a month, ~500 bytes each, keeps them 5 years, and replicates 3×.
+    given: {per_month: "100e6", bytes: 500, years: 5, rf: 3}
+    calc:
+      - {name: raw, ask: Raw storage after 5 years, unit: TB, expr: "per_month * 12 * years * bytes / 1e12", show: "3 TB"}
+      - {ask: With replication, unit: TB, expr: "raw * rf", show: "9 TB"}
+    a: "A handful of nodes holds this, **so** storage doesn't force sharding here. Throughput or availability might."
+  - q: A service handles 20K req/s at 50 ms average latency. A dependency degrades and latency rises to 1 s.
+    given: {qps: 20000, lat: 0.05, slow: 1}
+    calc:
+      - {ask: Requests in flight normally, unit: "", expr: "qps * lat", show: "1K"}
+      - {ask: Requests in flight when slow, unit: "", expr: "qps * slow", show: "20K"}
+    a: "Same traffic, 20× the concurrency: pools and memory run out and the service falls over. **So** use timeouts shorter than the caller's budget, bounded queues and load shedding."
+  - q: 1M concurrent viewers each stream video at 5 Mbps. One edge server pushes ~40 Gbps.
+    given: {viewers: "1e6", mbps: 5, server_gbps: 40}
+    calc:
+      - {name: tbps, ask: Total egress, unit: Tbps, expr: "viewers * mbps / 1e6", show: "5 Tbps"}
+      - {ask: Edge servers needed (no headroom), unit: "", expr: "tbps * 1000 / server_gbps", show: "≈ 125"}
+    a: "No origin serves that. **So** you need a CDN with edge caches, and the origin sees only cache misses. Egress cost decides bitrate ladders and codec choices."

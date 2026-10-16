@@ -1,0 +1,187 @@
+id: kv-store
+name: Key-Value Store
+prompt: Design a distributed key-value store like DynamoDB or Cassandra. It supports get, put and delete, stays writable through node failures, offers tunable consistency, and scales to petabytes.
+blocks: [partitioning, replication, consistency, storage-engines, consensus, estimation]
+
+steps:
+  - id: requirements
+    title: Requirements
+    min: 5
+    ask: |
+      - What operations and value sizes?
+      - Availability vs consistency: which do you favor, and is it tunable?
+      - Scale and latency targets?
+    answer: |
+      **Functional**
+      - `get(key)`, `put(key, value)`, `delete(key)`; values up to ~1 MB; optional TTL.
+      - Per-request consistency level (one, quorum, all).
+      - Out of scope: secondary indexes, multi-key transactions, range queries across keys (mention as extensions).
+
+      **Non-functional**
+      - **Always writable** (AP-leaning, Dynamo-style) with eventual consistency by default; quorum reads/writes when the caller asks.
+      - p99 < 10 ms for single-key operations within a region.
+      - Durable across node and AZ failures; scale horizontally by adding nodes without downtime.
+
+      **Scale (assumed)**
+      - 1 PB of data, 5M ops/s, replication factor 3 across 3 AZs.
+
+  - id: estimation
+    title: Estimation
+    min: 5
+    ask: |
+      1 PB logical data, RF = 3, ~10 TB usable per node (leaving disk headroom), 5M ops/s total.
+    given: {pb: 1, rf: 3, node_tb: 10, qps: "5e6"}
+    calc:
+      - {name: raw, ask: Stored with replication, unit: PB, expr: "pb * rf", show: "3 PB"}
+      - {name: nodes, ask: Nodes for storage, unit: "", expr: "raw * 1000 / node_tb", show: "300"}
+      - {ask: Replica operations per node per second (every op touches RF replicas), unit: /s, expr: "qps * rf / nodes", show: "50K/s"}
+    answer: |
+      - **~300 nodes** for storage alone, so membership changes and failures are constant: one node fails somewhere most days. Automation and self-healing are requirements.
+      - **~50K replica ops/s per node** is within reach of an LSM engine on NVMe, so storage, not CPU, drives the node count.
+      - At this size, **rebalancing traffic** (moving TBs when nodes join or leave) must be throttled so it doesn't hurt latency.
+
+  - id: api
+    title: API
+    min: 4
+    ask: |
+      - Define get / put / delete, including how versions and consistency levels appear.
+      - How does a client handle concurrent writes?
+    answer: |
+      ```
+      get(key, consistency = ONE | QUORUM | ALL)
+        → { values: [ {value, version} ], context }     # >1 value = concurrent siblings
+
+      put(key, value, context?, consistency = …, ttl?)
+        → { version }                                   # context from a prior get
+
+      delete(key, context?)                             # writes a tombstone
+      ```
+      - **`context`** carries the version (vector clock) the client last saw, so the store can tell an update from a concurrent write.
+      - Simpler alternative used by Cassandra: last-write-wins by timestamp, no siblings; easier API, but concurrent writes silently lose one.
+
+  - id: data-model
+    title: Data model
+    min: 5
+    ask: |
+      - How is data partitioned and placed on nodes?
+      - What does each node store per key, and on what storage engine?
+    answer: |
+      - **Partitioning:** consistent hashing of the key onto a ring with many virtual nodes per physical node (e.g. 256), so load evens out and adding a node takes small slices from everyone.
+      - **Placement:** each key is stored on the next N = 3 distinct nodes clockwise, chosen to be in different AZs (rack-aware placement).
+      - **Per key:** value, version (vector clock or timestamp), optional TTL, tombstone flag.
+      - **Engine:** LSM tree per node (commit log + memtable + SSTables with Bloom filters): write-optimized, sequential I/O, compaction in the background.
+      - **Metadata:** ring membership and token ownership, spread by gossip; no central master on the data path.
+
+  - id: high-level
+    title: High-level design
+    min: 8
+    ask: Walk through a quorum write, a quorum read, and a write while one replica is down.
+    diagram:
+      type: arch
+      caption: leaderless replication, N = 3, W = 2, R = 2
+      nodes:
+        client: {label: Client, at: [0, 1], kind: client}
+        coord: {label: Coordinator, sub: any node, at: [1, 1]}
+        a: {label: Replica A, sub: AZ 1, at: [2, 0], kind: db}
+        b: {label: Replica B, sub: AZ 2, at: [2, 1], kind: db}
+        c: {label: Replica C, sub: AZ 3, at: [2, 2], kind: db}
+        h: {label: Node D, sub: holds hints, at: [3, 2], kind: db}
+      edges: [[client, coord], [coord, a], [coord, b], [coord, c], [coord, h]]
+      frames:
+        - title: Write (W=2)
+          flow: [[client, coord, put], [coord, a, write], [coord, b, write], [coord, c, write]]
+          hit: [a, b]
+          win: [c]
+          note: "The coordinator sends the write to all 3 replicas and acknowledges after 2 succeed. The third catches up when its write lands, or through repair."
+        - title: Read (R=2)
+          flow: [[client, coord, get], [coord, a, read], [coord, b, read], [coord, c, repair]]
+          hit: [a, b]
+          win: [c]
+          note: "Read from 2; R + W > N means at least one has the latest version. If they differ, return the newest (or siblings) and write it back to stale replicas: read repair."
+        - title: Replica down
+          flow: [[coord, a, write], [coord, b, write], [coord, h, hint for C]]
+          hit: [a, b]
+          win: [h]
+          note: "C is down. The write still reaches W = 2; a stand-in node keeps a hint for C and hands it off when C returns (hinted handoff). Merkle-tree anti-entropy repairs anything hints miss."
+    answer: |
+      - **Smart clients or any node as coordinator**: hash the key, find the N replicas from the ring, fan out.
+      - **Quorums:** W + R > N for read-your-latest-write behavior in the normal case; ONE for lowest latency.
+      - **Three repair mechanisms:** read repair (on reads), hinted handoff (short outages), anti-entropy with Merkle trees (long outages, missed hints).
+      - **Gossip** for membership and failure detection; no single master on the data path.
+
+  - id: deep-dives
+    title: Deep dives
+    min: 15
+    ask: Pick 2–3. Answer each before revealing it.
+    items:
+      - id: conflicts
+        q: Two clients write the same key concurrently on different replicas. How do you resolve the conflict?
+        answer: |
+          | Approach | How | Cost |
+          |---|---|---|
+          | Last-write-wins | Highest timestamp wins | Simple; clock skew silently drops writes |
+          | Vector clocks + siblings | Detect concurrency; return all siblings; the client merges and writes back | Correct; complex clients; vector growth |
+          | CRDTs | Values are mergeable types (counters, sets, maps) | Automatic merges; limited to those types |
+
+          Default to **LWW** for overwrite-style data (profiles, sessions) where losing a concurrent write is acceptable, and offer **CRDT types** (counters, sets) for data that must merge.
+          Say clearly that quorum + LWW is not linearizable.
+
+      - id: membership
+        q: How do nodes know who's in the cluster and who's down?
+        answer: |
+          - **Gossip:** every second each node exchanges membership state (heartbeat counters, token ownership) with a few random peers; information spreads in O(log n) rounds.
+          - **Failure detection:** phi-accrual detector on heartbeat arrival times outputs a suspicion level rather than a binary; a node is marked down when phi crosses a threshold.
+          - **Temporary vs permanent:** a down node triggers hinted handoff, not data movement. Only an operator (or a long timeout) removes a node and triggers re-replication, which avoids moving TBs for a reboot.
+          - Seed nodes help new nodes bootstrap; config changes like adding a DC can go through a small consensus store.
+
+      - id: anti-entropy
+        q: A replica was down for 6 hours and hints expired. How does it catch up without comparing every key?
+        answer: |
+          - Each node builds a **Merkle tree** per token range: leaves hash key ranges, parents hash children.
+          - Two replicas exchange roots; if they match, the range is identical. Otherwise, descend only into differing subtrees, and transfer just the differing key ranges.
+          - Run repair continuously in the background (incremental repair), throttled, and always within the tombstone grace period, or deleted data can come back.
+
+      - id: deletes
+        q: Why can't a delete just remove the key, and what are tombstones' costs?
+        answer: |
+          - If one replica missed the delete, removing the key would let repair copy the old value back: **zombie data**.
+          - So a delete writes a **tombstone** with a timestamp, which replicates like a write and is dropped only after `gc_grace` (e.g. 10 days) once all replicas have it.
+          - Costs: tombstones take space and slow reads (scanning past them). Queue-like workloads with many deletes, or wide partitions with many deleted cells, cause read timeouts. Prefer TTLs and time-bucketed partitions so whole SSTables expire together.
+
+      - id: scaling
+        q: You add 30 nodes to a 300-node cluster. What happens, and what can go wrong?
+        answer: |
+          - Each new node takes a set of vnodes (token ranges) from many existing nodes; ~1/11 of data streams to the new nodes from across the cluster, in parallel.
+          - Data streaming is **throttled** so foreground latency holds; the new node serves reads for a range only after it has fully streamed it.
+          - Risks: adding many nodes at once (overlapping range moves, consistency gaps), disk space on donors during compaction, and hot partitions that adding nodes doesn't fix (one hot key stays on its N replicas).
+
+      - id: consistency-levels
+        q: A team uses W = 1, R = 1 for speed and complains about stale reads. Explain and offer options.
+        answer: |
+          - With W + R ≤ N, a read can hit a replica the write hasn't reached yet: staleness is expected, typically ms but unbounded during failures.
+          - Options: W = QUORUM, R = QUORUM for read-your-latest-write in the normal case; or keep W = 1 but route a session's reads to the coordinator/replica it wrote to; or LOCAL_QUORUM to stay within a region.
+          - True linearizability needs more than quorums (e.g. Paxos-based lightweight transactions for compare-and-set), at extra round trips.
+
+  - id: wrap-up
+    title: Wrap-up
+    min: 3
+    ask: |
+      - What breaks first at 10×?
+      - What do you monitor?
+      - What makes this a staff-level answer?
+    answer: |
+      **At 10×:** operational load: node failures are continuous, repair and streaming traffic compete with user traffic, and gossip state grows. Hot partitions become visible.
+
+      **Monitor:** p99 per operation and consistency level, hinted-handoff backlog, repair progress and Merkle mismatches, pending compactions, tombstones scanned per read, disk usage per node, dropped mutations.
+
+      **Staff-level signals**
+      - Explains the quorum math and states plainly that it isn't linearizable.
+      - Chooses a conflict strategy per data type and names the data-loss behavior of LWW.
+      - Separates temporary failure (hints) from permanent failure (re-replication).
+      - Talks about tombstones, repair windows and throttled rebalancing: the operational reality.
+
+      **Common mistakes**
+      - A central master on the data path.
+      - `hash mod N` placement.
+      - Ignoring deletes and zombie data.
+      - Claiming strong consistency from W + R > N alone.

@@ -1,0 +1,63 @@
+id: consistency
+name: Consistency Models
+signal: ["\"what happens during a network partition?\"", "money, inventory, uniqueness", "users seeing stale or out-of-order data", "multi-region writes", "concurrent edits to the same thing"]
+idea: >-
+  Consistency is a contract about what reads may return while data is replicated. Strong (linearizable) behaves like one copy but costs coordination latency and availability during partitions;
+  eventual consistency is fast and always available but lets readers see stale or reordered data.
+  Senior answers pick the weakest model each operation can tolerate and name the anomalies the users will see.
+
+numbers:
+  - {k: Linearizable write, v: "≥ 1 quorum RTT (cross-region: ~100+ ms)"}
+  - {k: Eventual convergence, v: "typically ms–seconds"}
+  - {k: Clock skew (NTP), v: "~1–10 ms; worse during incidents"}
+  - {k: Spanner commit wait, v: "~TrueTime ε (a few ms)"}
+
+tables:
+  - title: Models, strongest to weakest
+    cols: [Model, Guarantee, Typical cost, Example uses]
+    rows:
+      - ["**Linearizable**", "Every read sees the latest completed write; one global order", "Consensus / quorum per op; unavailable on the minority side of a partition", "Leader election, locks, unique usernames, balances"]
+      - ["**Sequential / serializable**", "One order consistent with each client's order (serializable: transactions as if one at a time)", "Coordination, though not necessarily real-time order", "Database transactions"]
+      - ["**Causal**", "Effects never appear before their causes (a reply never before its post)", "Track dependencies (version vectors); available under partition", "Comments, chat, collaborative apps"]
+      - ["**Read-your-writes / monotonic reads**", "Session guarantees: you see your own writes; time never goes backwards for you", "Session stickiness or version tracking", "Profiles, settings, carts"]
+      - ["**Eventual**", "If writes stop, replicas converge", "Cheapest; always available", "Like counts, view counts, feeds, caches, DNS"]
+  - title: "CAP and PACELC in one line each"
+    cols: [Choice, "During a partition (P)", "Else, normally (E)"]
+    rows:
+      - ["**PC/EC** (Spanner, etcd, ZooKeeper)", "Consistent: minority side refuses", "Consistent: pay coordination latency"]
+      - ["**PA/EL** (Cassandra, DynamoDB default, Dynamo-style)", "Available: accept writes, reconcile later", "Low latency: don't wait for all replicas"]
+      - ["**PC/EL-ish** (single-leader + async replicas)", "Leader side keeps writing; isolated followers serve stale reads", "Fast local reads, possibly stale"]
+
+pitfalls:
+  - "**Saying \"CAP: pick two\".** Partitions aren't optional; the real choice is consistency vs availability *during* a partition, and latency vs consistency the rest of the time (PACELC)."
+  - "**One model for the whole system.** Balances need strong guarantees, like counts don't. Choose per operation and say which is which."
+  - "**Last-writer-wins on wall clocks.** Clock skew silently discards newer writes. Use version numbers, hybrid logical clocks, or conflict-free data types."
+  - "**Check-then-act on stale reads.** Reading availability from a replica, then booking, double-books. Enforce the invariant at the write: a conditional write, unique constraint, or a transaction on the source of truth."
+  - "**Assuming \"strong\" means serializable.** Many databases default to read committed or snapshot isolation, which allow lost updates and write skew. Know your isolation level."
+
+depth:
+  - "**Isolation anomalies to name:** lost update (fix: `SELECT … FOR UPDATE` or compare-and-set), write skew (two doctors both go off call; fix: serializable or materialize the conflict), phantom reads (range predicate changes)."
+  - "**CRDTs:** data types whose concurrent updates merge deterministically (G-counters, OR-sets, sequence CRDTs for text). They give strong eventual consistency without coordination; collaborative editors use them."
+  - "**Hybrid logical clocks and TrueTime:** HLCs order events causally while staying close to wall time (CockroachDB); Spanner's TrueTime bounds clock uncertainty and waits it out to give external consistency."
+  - "**Consistency at the edges:** caches, search indexes and CDNs are eventually consistent views even if the database is strong. The user-visible model is the weakest component on the read path."
+  - "**Making eventual consistency acceptable:** design the UX for it (optimistic UI, \"processing\" states), make operations commutative and idempotent, and run reconciliation jobs that detect and repair divergence."
+
+checks:
+  - q: A ticketing site reads seat availability from a read replica, then writes the booking to the primary. Two users get the same seat. What's the root cause, and the fix?
+    a: >-
+      Check-then-act across a stale read: both checks saw the seat free. Reads can stay eventually consistent for browsing, but the invariant must be enforced at the write:
+      a conditional update on the primary (`UPDATE seats SET holder = ? WHERE id = ? AND holder IS NULL`, check rows affected), a unique constraint on (event, seat), or a short-lived hold with a TTL.
+  - q: Two on-call doctors each check "at least one other doctor is on call" and both go off call, under snapshot isolation. Name the anomaly and two fixes.
+    a: >-
+      Write skew: each transaction read the same set and wrote a different row, so no write-write conflict was detected.
+      Fixes: run it under serializable isolation, or lock the rows read (`SELECT … FOR UPDATE` on the on-call set), or materialize the conflict into one row (an on-call counter with a check constraint).
+  - q: A global social app wants likes, comments and account balances (for tipping). Pick a consistency model for each.
+    a: >-
+      Likes: eventual (counters merged per region, CRDT counter or periodic aggregation); slight lag is invisible.
+      Comments: causal plus read-your-writes, so replies never appear before their parent and authors see their own comment.
+      Balances: strong (linearizable) on a single home region or a consensus database, with idempotent transfer IDs; latency is acceptable for money.
+  - q: A Raft group spans 3 regions with ~80 ms RTT between them. What is the minimum commit latency for a write from the leader's region?
+    given: {rtt: 80}
+    calc:
+      - {ask: Commit latency (one majority round trip), unit: ms, expr: "rtt", show: "≈ 80 ms"}
+    a: "The leader needs one other region to ack: one cross-region RTT, ~80 ms, plus disk fsyncs. Clients in other regions add their own RTT to the leader. That's the price of linearizable writes across regions; colocate replicas or leaders with users to reduce it."

@@ -1,0 +1,82 @@
+id: reliability
+name: Reliability Patterns
+signal: ["\"what happens when X is slow or down?\"", "many service-to-service calls", "cascading failures / retry storms", "SLA of 99.9%+", "graceful degradation"]
+idea: >-
+  Distributed systems fail partially: a dependency is slow, not dead, and slowness spreads through blocked threads and retries.
+  Reliability comes from bounding everything (timeouts, retries, queues, concurrency), isolating failures (bulkheads, circuit breakers, cells),
+  and degrading deliberately (serve stale, drop optional features, shed low-priority load) instead of falling over.
+
+diagram:
+  type: arch
+  caption: protecting a caller from a failing dependency
+  nodes:
+    client: {label: Client, at: [0, 1], kind: client}
+    svc: {label: Product page, sub: caller, at: [1, 1]}
+    reco: {label: Recommender, sub: optional, at: [2, 0]}
+    price: {label: Pricing, sub: critical, at: [2, 2]}
+    cache: {label: Stale cache, sub: fallback, at: [2, 1], kind: cache}
+  edges: [[client, svc], [svc, reco], [svc, price], [svc, cache]]
+  frames:
+    - title: Healthy
+      flow: [[client, svc, GET], [svc, reco, "timeout 100 ms"], [svc, price, "timeout 200 ms"]]
+      hit: [reco, price]
+      note: "Each call has a timeout well inside the caller's own budget, its own connection pool (bulkhead) and at most one retry with jittered backoff."
+    - title: Reco degraded
+      flow: [[client, svc, GET], [svc, cache, read], [svc, price, "timeout 200 ms"]]
+      hit: [cache, price]
+      win: [reco]
+      note: "Recommendations time out repeatedly, so the circuit breaker opens: calls fail fast for ~30 s, the page renders with cached or generic recommendations, and the breaker probes with a few half-open requests before closing."
+
+numbers:
+  - {k: "99.9% / 99.99% per month", v: "43 min / 4.3 min downtime"}
+  - {k: Retry budget, v: "retries ≤ ~10% of requests"}
+  - {k: Backoff, v: "base × 2ⁿ, capped, full jitter"}
+  - {k: Breaker trip, v: "e.g. ≥ 50% errors over ≥ 20 calls in 10 s"}
+  - {k: Target utilization, v: "~50–70% at peak per instance"}
+
+tables:
+  - title: Patterns
+    cols: [Pattern, Prevents, How, Watch out]
+    rows:
+      - ["**Timeouts + deadlines**", "Threads blocked forever on a slow dependency", "Per-call timeout; propagate the remaining deadline downstream", "Timeouts longer than the caller's own budget are useless"]
+      - ["**Retries with backoff + jitter**", "Failing on transient errors", "Retry idempotent calls a bounded number of times, with exponential backoff and jitter", "Retry storms; retry at one layer only; use a retry budget"]
+      - ["**Circuit breaker**", "Hammering a dependency that's down; wasting time on doomed calls", "Open after an error threshold; fail fast; half-open probes", "Needs a fallback; per-host vs per-service granularity"]
+      - ["**Bulkhead**", "One slow dependency exhausting all threads / connections", "Separate pools or concurrency limits per dependency or tenant", "Under-sized pools reject healthy traffic"]
+      - ["**Load shedding**", "Overload collapsing everything", "Reject early (503) by priority when queues or latency exceed limits", "Shed cheap-to-reject work first; protect health checks"]
+      - ["**Graceful degradation**", "Total outage from a non-critical failure", "Fallbacks: stale cache, defaults, hide the feature", "Fallback paths rot if never exercised"]
+      - ["**Cell / shard isolation**", "Global blast radius", "Independent copies of the stack, each serving a subset of users", "Routing layer and cross-cell operations"]
+
+pitfalls:
+  - "**Retries at every layer.** 3 layers each retrying 3× turns one user request into 27 calls on the failing service. Retry at the edge or the immediate caller only, and cap with a budget."
+  - "**Retrying non-idempotent calls.** A timeout doesn't mean it failed. Retry only idempotent operations or those carrying an idempotency key."
+  - "**Missing jitter.** Synchronized retries arrive in waves that re-break the recovering service. Full jitter: sleep random(0, base × 2ⁿ)."
+  - "**Health checks that cascade.** If every instance's health check depends on the DB, a DB blip removes the whole fleet from the LB. Liveness checks the process; readiness checks only what the instance itself needs."
+  - "**Untested failover.** A standby, a fallback or a backup that's never exercised fails when needed. Practice: game days, chaos experiments, restore drills."
+
+depth:
+  - "**Metastable failures:** a trigger (spike, slow dependency) pushes a system into a state where retries, cache misses or queue backlog keep it overloaded after the trigger is gone. Fixes are about removing the feedback loop: retry budgets, shedding, cold-cache protection."
+  - "**Deadline propagation:** pass the absolute deadline (gRPC deadlines) so downstream services stop work the caller has already abandoned."
+  - "**Hedged requests:** for latency-critical reads, send a second request after the p95 latency and take the first answer. Cuts tail latency for ~5% extra load; only for idempotent reads."
+  - "**Static stability:** design the data plane to keep working when the control plane (config service, scheduler, auth refresh) is down, using the last known good state."
+  - "**Error budgets drive priorities:** with an SLO of 99.9%, the 0.1% is a budget. Burn it fast and feature releases pause for reliability work; leave it unused and you can ship faster."
+
+checks:
+  - q: "A request passes through 3 services, each retrying failed calls up to 3 times (4 attempts). The bottom service is down. How many calls hit it per user request?"
+    given: {attempts: 4, layers: 3}
+    calc:
+      - {ask: Calls on the failing service per user request, unit: "", expr: "attempts ** layers", show: "64"}
+    a: "Retries multiply across layers: 4³ = 64× load on a service that's already failing. Retry only at one layer, use a retry budget (e.g. ≤ 10% extra), and open circuit breakers so callers fail fast."
+  - q: A product page calls 6 services. Recommendations are optional, pricing and inventory are critical. Recommendations become slow (5 s). What should happen?
+    a: >-
+      A short timeout on recommendations (inside the page's budget), a bulkhead so its slowness can't consume the threads pricing needs, and a circuit breaker that opens and serves a fallback (cached or generic recommendations, or hide the widget).
+      Pricing and inventory keep their own pools and timeouts; the page stays up and fast.
+  - q: Three serial dependencies each have 99.9% availability. What is the best possible availability of a request that needs all three? What changes with a fallback for one of them?
+    given: {a: 0.999}
+    calc:
+      - {ask: All three required, unit: "%", expr: "a ** 3 * 100", show: "≈ 99.7%"}
+      - {ask: Two required (third has a fallback), unit: "%", expr: "a ** 2 * 100", show: "≈ 99.8%"}
+    a: "Serial dependencies multiply downtime. Fallbacks, caches and async processing remove dependencies from the critical path, which is often cheaper than making each one more available."
+  - q: After a 10-minute outage, the service recovers but immediately falls over again, several times. What's happening, and what breaks the cycle?
+    a: >-
+      A retry / reconnect storm, or a cold cache: all clients retry at once (plus backlog), and the cold service can't absorb the peak. It's a metastable failure.
+      Break it with jittered exponential backoff and retry budgets on clients, load shedding and admission control on the server, and gradual ramp-up (rate-limited warm-up, slow-start at the LB).

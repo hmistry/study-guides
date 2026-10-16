@@ -1,0 +1,200 @@
+id: chat
+name: Chat / Messaging
+prompt: Design a messaging app like WhatsApp or Messenger with 1:1 and group chats, delivery and read receipts, online presence, offline delivery and multiple devices per user.
+blocks: [apis, load-balancing, queues, partitioning, datastores, rate-limits-ids]
+
+steps:
+  - id: requirements
+    title: Requirements
+    min: 5
+    ask: |
+      - Which messaging features are in scope?
+      - What delivery guarantees and ordering do users expect?
+      - What scale, and how many concurrent connections?
+    answer: |
+      **Functional**
+      - 1:1 and group chats (up to ~1,000 members); text plus media references.
+      - Sent / delivered / read receipts; online presence and "last seen"; typing indicators (best effort).
+      - Offline users receive messages when they reconnect, plus a push notification.
+      - Multiple devices per user, all in sync. History is stored server-side (unless end-to-end encrypted with device-only storage; say which).
+
+      **Non-functional**
+      - **No message loss, no duplicates shown, per-conversation order preserved.**
+      - Low latency: ~100–300 ms end to end when both users are online.
+      - Highly available; degrade presence and typing first.
+
+      **Scale (assumed)**
+      - 500M DAU, 40 messages sent per user per day, 30% of DAU connected at peak, average message 100 bytes.
+
+  - id: estimation
+    title: Estimation
+    min: 5
+    ask: |
+      500M DAU, 40 messages per user per day, 30% concurrently connected, 500K connections per gateway server, 100 bytes per message, peak = 3× average.
+    given: {dau: "500e6", msgs: 40, online: 0.3, per_gw: "500e3", bytes: 100, peak: 3}
+    calc:
+      - {name: avg, ask: Average messages, unit: /s, expr: "dau * msgs / 86400", show: "≈ 230K/s"}
+      - {ask: Peak messages, unit: /s, expr: "avg * peak", show: "≈ 700K/s"}
+      - {name: conns, ask: Concurrent connections, unit: "", expr: "dau * online", show: "150M"}
+      - {ask: Gateway servers (no headroom), unit: "", expr: "conns / per_gw", show: "300"}
+      - {ask: Message storage per day, unit: TB, expr: "dau * msgs * bytes / 1e12", show: "2 TB"}
+    answer: |
+      - **~700K messages/s at peak** need a horizontally partitioned write path; one message is also several more events (receipts, delivery attempts).
+      - **150M persistent connections** across ~300 gateways (plan ~450 for headroom and drains). Connection state, not CPU, is the scaling unit.
+      - **~2 TB/day** (~730 TB/year before replication) of message history: a wide-column store partitioned by conversation, with old data tiered to cheaper storage.
+
+  - id: api
+    title: API
+    min: 4
+    ask: |
+      - What travels over the persistent connection, and what over plain HTTP?
+      - How does a client avoid sending a message twice after a reconnect?
+    answer: |
+      ```
+      WebSocket frames (client ↔ gateway):
+        → send      { client_msg_id, conversation_id, body, media_ids? }
+        ← ack       { client_msg_id, message_id, seq, ts }        # stored, ordered
+        ← message   { conversation_id, message_id, seq, sender, body, ts }
+        → receipt   { conversation_id, up_to_seq, type: delivered | read }
+        ← presence / typing events (best effort)
+
+      HTTP:
+        GET /v1/sync?cursor=<per-device cursor>        → missed messages since last sync
+        GET /v1/conversations/{id}/messages?before_seq=…&limit=50
+        POST /v1/media/uploads                         → presigned URL
+      ```
+      - `client_msg_id` (a UUID made on the device) makes sends **idempotent**: a resend after a dropped connection returns the original ack.
+      - Receipts are **cumulative** (`up_to_seq`), so one event covers many messages.
+
+  - id: data-model
+    title: Data model
+    min: 5
+    ask: |
+      - How are messages stored and ordered?
+      - How does each device know what it has missed?
+    answer: |
+      ```
+      messages      PK (conversation_id, bucket)  CK seq DESC
+                    message_id · sender_id · body · client_msg_id · ts      → Cassandra / ScyllaDB
+      conversations conversation_id · type · members (small groups) · last_seq
+      user_inbox    PK user_id  CK (updated_at)  → conversation_id, last_seq, unread   (for the chat list)
+      device_state  (user_id, device_id) → last synced position, push token
+      sessions      user_id → [gateway_id, device_id]   → Redis, TTL refreshed by heartbeats
+      presence      user_id → online / last_seen        → Redis, TTL
+      ```
+      - **Per-conversation sequence numbers** (`seq`) define order. Global ordering isn't needed and would be a bottleneck.
+      - Partitioning by conversation keeps a chat's history in one place; `bucket` (e.g. month) bounds partition size for long-lived chats.
+
+  - id: high-level
+    title: High-level design
+    min: 8
+    ask: Walk through sending a message to an online user, an offline user, and a group.
+    diagram:
+      type: arch
+      caption: gateways hold connections; the chat service owns ordering and storage
+      nodes:
+        alice: {label: Alice, at: [0, 0], kind: client}
+        bob: {label: Bob, at: [0, 2], kind: client}
+        gw1: {label: Gateway 1, sub: WebSocket, at: [1, 0]}
+        gw2: {label: Gateway 2, sub: WebSocket, at: [1, 2]}
+        chat: {label: Chat service, sub: assigns seq, at: [2, 1]}
+        store: {label: Message store, sub: by conversation, at: [3, 1], kind: db}
+        reg: {label: Sessions, sub: registry, at: [2, 2], kind: cache}
+        push: {label: Push, sub: APNs · FCM, at: [3, 2]}
+      edges: [[alice, gw1], [bob, gw2], [gw1, chat], [gw2, chat], [chat, store], [chat, reg], [chat, push]]
+      frames:
+        - title: Online
+          flow: [[alice, gw1, send], [gw1, chat, route], [chat, store, 1 append], [chat, reg, 2 lookup], [chat, gw2, 3 deliver], [gw2, bob, message]]
+          hit: [bob]
+          win: [chat, store, reg]
+          note: "The chat service assigns the next seq in the conversation, persists, acks Alice, looks up Bob's gateways in the registry and pushes to each of his connected devices."
+        - title: Offline
+          flow: [[alice, gw1, send], [gw1, chat, route], [chat, store, append], [chat, push, notify]]
+          hit: [push]
+          win: [chat, store]
+          note: "Bob has no live session: the message is already stored; a push notification goes out. When Bob reconnects, his device syncs from its cursor and gets everything after it, in order."
+        - title: Receipt
+          flow: [[bob, gw2, read up_to 42], [gw2, chat, receipt], [chat, gw1, forward], [gw1, alice, read ✓✓]]
+          hit: [alice]
+          win: [chat]
+          note: "Receipts are cumulative and flow back the same way. They're stored per (conversation, user) as a high-water mark, not per message."
+    answer: |
+      - **Gateways** only hold connections and forward frames; they're stateless apart from sockets, so they can be drained and replaced.
+      - **Chat service** (partitioned by conversation) assigns order, persists, and fans out to members' devices via the **session registry**.
+      - **Offline path:** store first, notify by push, deliver on sync.
+      - **Groups:** small groups fan out to each member's devices and inbox rows on write; very large groups and channels switch to fan-out on read.
+
+  - id: deep-dives
+    title: Deep dives
+    min: 15
+    ask: Pick 2–3. Answer each before revealing it.
+    items:
+      - id: ordering
+        q: How do you guarantee per-conversation ordering and no duplicates, with retries and multiple servers?
+        answer: |
+          - Route all writes for a conversation to **one owner** (partition the chat service by `conversation_id`, e.g. via a Kafka partition or consistent hashing), which assigns `seq = last_seq + 1` and persists before acking.
+          - Or assign `seq` with a conditional write / atomic increment on the conversation row; either way there's exactly one sequencer per conversation.
+          - **Idempotency:** the store keeps `client_msg_id` per conversation (unique), so a resend returns the existing `seq` instead of inserting twice.
+          - Clients **render by seq**, not by arrival time, and detect gaps (seq 41 then 43) to trigger a sync.
+
+      - id: delivery
+        q: How do you make delivery reliable when connections drop at the worst moment?
+        answer: |
+          - **Store before ack:** the sender's ack means durably stored. Until the ack arrives, the client keeps the message in its outbox and resends with the same `client_msg_id`.
+          - **Recipient side:** live pushes are an optimization; truth is the per-device cursor. On reconnect the device syncs everything after its cursor, so a push lost in flight is recovered.
+          - Delivered receipts are sent after the device persists the message locally; read receipts when shown.
+          - Result: at-least-once transport + idempotent storage + cursor-based sync = effectively exactly-once display.
+
+      - id: connections
+        q: How do you manage 150M persistent connections, including deploys and failures?
+        answer: |
+          - **Session registry** (user → gateway, device) in Redis with TTL refreshed by heartbeats (~30 s); stale entries expire on their own.
+          - **L4 load balancing** for WebSockets; gateways scale by connections (memory), not requests.
+          - **Deploys:** drain gradually, telling clients to reconnect with jittered backoff; never restart all gateways at once.
+          - **Mobile realities:** connections drop constantly. Fast resumption (session token, sync from cursor) matters more than keeping a socket alive; heartbeats tuned for battery.
+
+      - id: groups
+        q: How do group messages scale, from 5 members to a 100K-member channel?
+        answer: |
+          - **Small groups (≤ ~500):** one stored copy in the conversation, then fan-out of the live message to each member's online devices and an update to each member's inbox row. Cost ∝ members per message.
+          - **Large groups / channels:** don't touch every member's inbox. Members pull the channel's latest seq when they open the app (fan-out on read), and push notifications are batched and rate-limited.
+          - Membership changes are themselves ordered events in the conversation, so everyone agrees who received which message (important for end-to-end encryption key rotation).
+
+      - id: presence
+        q: Presence for 500M users is expensive. How do you design it?
+        answer: |
+          - Presence = heartbeat-refreshed TTL key per user; "last seen" = the time the key last changed.
+          - **Don't broadcast** every change to every contact. Send presence only to users who currently have a chat with that person open (subscriptions), and fetch it lazily when a chat list is shown.
+          - Debounce flapping (mobile networks), coarsen to minutes for "last seen", and let presence degrade first under load. It's a best-effort feature.
+
+      - id: e2ee
+        q: The product wants end-to-end encryption. What changes in the design?
+        answer: |
+          - Clients encrypt with per-device keys (Signal protocol: X3DH + double ratchet); the server stores and forwards ciphertext and distributes public key bundles.
+          - **Multi-device:** each message is encrypted for each recipient device (or groups use sender keys, re-keyed on membership change).
+          - Server-side features that read content disappear or move to clients: search, link previews, spam detection on content, server-side history (backups become encrypted client backups).
+          - Metadata (who talks to whom, when) is still visible to the server; minimize and protect it.
+
+  - id: wrap-up
+    title: Wrap-up
+    min: 3
+    ask: |
+      - What breaks first at 10×?
+      - What do you monitor?
+      - What makes this a staff-level answer?
+    answer: |
+      **At 10×:** connection count and reconnect storms, then hot conversations (huge groups) and fan-out cost. Storage grows linearly; tier old history.
+
+      **Monitor:** end-to-end delivery latency (send → delivered receipt), message loss probes (synthetic senders), connection count and churn per gateway, sync lag, push-notification success rate, registry error rate.
+
+      **Staff-level signals**
+      - Defines ordering per conversation with a single sequencer and idempotent sends.
+      - Treats live push as an optimization over cursor-based sync, which makes delivery correct across disconnects and devices.
+      - Handles small and huge groups differently.
+      - Knows what end-to-end encryption removes from the server's capabilities.
+
+      **Common mistakes**
+      - Global ordering or timestamps for message order.
+      - Acking before persisting.
+      - Broadcasting presence to every contact.
+      - One delivery path for 3-person chats and 100K-member channels.

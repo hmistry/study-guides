@@ -1,0 +1,51 @@
+# Tradeoff Glossary: term → definition with its trade-off; `see` is a block id. Sorted A–Z when rendered.
+terms:
+  - {term: Back-pressure, see: queues, def: "A slow consumer signals producers to slow down (bounded queues, blocking, 429s) instead of letting work pile up. Trades throughput at the edge for stability downstream."}
+  - {term: Bloom filter, see: storage-engines, def: "A bit array answering \"definitely not present\" or \"maybe present\". ~10 bits per key gives ~1% false positives and no false negatives; you can't delete from a plain one."}
+  - {term: Bulkhead, see: reliability, def: "Separate resource pools (threads, connections) per dependency or tenant so one failing part can't exhaust everything. Costs some idle capacity."}
+  - {term: CAP theorem, see: consistency, def: "During a network partition a system must choose between consistency and availability. Partitions aren't optional, so the real choice is C or A while partitioned."}
+  - {term: Cache stampede, see: caching, def: "Many requests miss on the same expired key at once and overload the backend. Fixed with request coalescing, locks or leases, early refresh, or serving stale."}
+  - {term: Change data capture (CDC), see: datastores, def: "Streaming a database's committed changes from its log (e.g. Debezium → Kafka) to update caches, search indexes and warehouses. Avoids dual writes; consumers are eventually consistent."}
+  - {term: Circuit breaker, see: reliability, def: "After repeated failures, calls to a dependency fail fast for a cooldown, then a few probes test recovery. Protects both sides; needs a fallback."}
+  - {term: Compaction, see: storage-engines, def: "Merging LSM files to drop overwritten and deleted data and bound read cost. Costs background I/O (write amplification) and can cause latency spikes."}
+  - {term: Consistent hashing, see: partitioning, def: "Keys and nodes hash onto a ring; each key belongs to the next node. Adding a node moves only ~1/n of keys. Virtual nodes even out the load."}
+  - {term: CRDT, see: consistency, def: "Conflict-free replicated data type: counters, sets, maps and text whose concurrent updates merge deterministically. Coordination-free convergence, limited to those types."}
+  - {term: Dead-letter queue (DLQ), see: queues, def: "Where messages go after exhausting retries, so a poison message doesn't block its partition. Needs alerting and a replay tool."}
+  - {term: Error budget, see: observability, def: "The allowed unreliability under an SLO (99.9% → 0.1%). Spending it fast pauses risky releases; unused budget allows faster shipping."}
+  - {term: Eventual consistency, see: consistency, def: "If writes stop, all replicas converge. Cheap and always available; readers may see stale or out-of-order data meanwhile."}
+  - {term: Fan-out on write / read, see: queues, def: "Push each item to every recipient's precomputed list when written, or assemble lists when read. Write fan-out makes reads cheap but struggles with huge audiences; hybrids use both."}
+  - {term: Fencing token, see: consensus, def: "A monotonically increasing number issued with a lock or lease; the protected resource rejects lower tokens, so a paused old holder can't corrupt data."}
+  - {term: Hedged request, see: reliability, def: "Send a duplicate request if the first hasn't answered by ~p95, and use whichever returns first. Cuts tail latency for a few percent more load; only for idempotent reads."}
+  - {term: Hinted handoff, see: replication, def: "When a replica is down, another node accepts its writes as hints and delivers them on recovery. Keeps writes available; hints can expire, so anti-entropy is still needed."}
+  - {term: Hot key, see: partitioning, def: "A single key with far more traffic than others, overloading one shard. Partitioning can't fix it; split the key, replicate it, or cache it in-process."}
+  - {term: Idempotency key, see: apis, def: "A client-chosen ID for an operation; the server stores the first result and returns it for retries. Turns at-least-once retries into exactly-once effects."}
+  - {term: Isolation level, see: consistency, def: "What concurrent transactions may observe: read committed, snapshot (allows write skew), serializable (as if one at a time). Stronger isolation costs throughput."}
+  - {term: Lease, see: consensus, def: "A time-limited grant (leadership, lock, hold) that expires unless renewed. Makes failures self-healing; safety still needs fencing because clocks and pauses lie."}
+  - {term: Linearizability, see: consistency, def: "Every operation appears to take effect at one instant between call and return, as if on a single copy. Needs coordination: latency, and unavailability on the minority side of a partition."}
+  - {term: Little's law, see: estimation, def: "Items in a system = arrival rate × time in system. Sizes thread and connection pools, and shows why latency spikes exhaust them."}
+  - {term: Load shedding, see: reliability, def: "Rejecting low-priority work early when overloaded so the rest succeeds. Trades some failed requests for avoiding total collapse."}
+  - {term: LSM tree, see: storage-engines, def: "Writes go to a log and memtable, flush to sorted immutable files, and get compacted. Very fast writes; reads and space pay for it."}
+  - {term: Merkle tree, see: replication, def: "A hash tree over key ranges; comparing roots and descending only into differing branches finds divergent data cheaply. Used for anti-entropy repair."}
+  - {term: MVCC, see: storage-engines, def: "Multi-version concurrency control: writers create new row versions while readers see a snapshot. No read locks; old versions need cleanup (vacuum)."}
+  - {term: Origin shield, see: cdn-blob, def: "A mid-tier cache between CDN edges and the origin, so each object is fetched from origin about once. One more hop on misses."}
+  - {term: Outbox pattern, see: dist-transactions, def: "Write the business change and an outgoing event in the same database transaction; a relay publishes the event. Removes the DB-plus-broker dual-write gap."}
+  - {term: PACELC, see: consistency, def: "If partitioned (P), choose availability or consistency (A/C); else (E), choose latency or consistency (L/C). Captures the everyday latency cost of consistency."}
+  - {term: Presigned URL, see: cdn-blob, def: "A time-limited, signed URL that lets a client upload or download one object directly from storage. Keeps bytes off app servers; scope it tightly."}
+  - {term: Quorum, see: replication, def: "With N replicas, writing to W and reading from R where W + R > N ensures read and write sets overlap. Not linearizable on its own."}
+  - {term: Raft, see: consensus, def: "A consensus algorithm: an elected leader replicates a log, and entries commit once a majority stores them. Survives minority failures; writes cost a majority round trip."}
+  - {term: Read repair, see: replication, def: "During a quorum read, stale replicas found in the response set are updated with the newest version. Fixes data that's read; anti-entropy fixes the rest."}
+  - {term: Read-your-writes, see: replication, def: "A session guarantee that a user sees their own writes immediately, even if others see them later. Implemented by routing or version tracking, not global consistency."}
+  - {term: RPO / RTO, see: replication, def: "Recovery point objective: how much recent data you may lose. Recovery time objective: how long recovery may take. Both drive sync vs async replication and failover design."}
+  - {term: Saga, see: dist-transactions, def: "A multi-step business transaction as a sequence of local transactions, each with a compensating action. Available and loosely coupled; intermediate states are visible."}
+  - {term: SLI / SLO / SLA, see: observability, def: "Indicator (what's measured, e.g. good requests / all), objective (internal target, e.g. 99.9%/30 d), agreement (external promise with penalties, looser than the SLO)."}
+  - {term: Snowflake ID, see: rate-limits-ids, def: "64-bit ID = millisecond timestamp + worker ID + per-ms sequence. Sortable by time with no coordination per ID; needs unique worker IDs and sane clocks."}
+  - {term: Split brain, see: consensus, def: "Two nodes both believe they're the leader and both accept writes, usually after a partition. Prevented by majority-based election and fencing."}
+  - {term: Tail latency, see: reliability, def: "The slow end of the latency distribution (p99, p99.9). Fan-out multiplies it: with many parallel calls, almost every request hits some backend's tail."}
+  - {term: Token bucket, see: rate-limits-ids, def: "Tokens refill at a fixed rate up to a burst capacity; each request takes one. Allows bursts with a bounded average rate; two numbers of state per key."}
+  - {term: Tombstone, see: storage-engines, def: "A marker recording a delete so replicas and compaction don't resurrect old data. Accumulated tombstones slow reads until they're compacted away."}
+  - {term: Two-phase commit (2PC), see: dist-transactions, def: "A coordinator asks all participants to prepare, then to commit. Atomic, but blocks holding locks if the coordinator fails after prepare."}
+  - {term: Vector clock, see: consistency, def: "A per-replica counter vector attached to each version, which shows whether two versions are ordered or concurrent. Detects conflicts; doesn't resolve them."}
+  - {term: Virtual nodes, see: partitioning, def: "Each physical node owns many small ranges on the hash ring, so load spreads evenly and a joining or failed node's work spreads over many peers."}
+  - {term: Write amplification, see: storage-engines, def: "Bytes physically written per byte of user data (WAL, page writes, compaction). Drives disk bandwidth and SSD wear."}
+  - {term: Write skew, see: consistency, def: "Two transactions read overlapping data and write different rows, together breaking an invariant that each checked. Allowed by snapshot isolation; prevented by serializable isolation or explicit locks."}
+  - {term: Write-ahead log (WAL), see: storage-engines, def: "Changes are appended and fsynced to a log before being applied to data pages, so a crash can be recovered by replaying it. Also the source for replication and CDC."}

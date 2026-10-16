@@ -1,0 +1,85 @@
+id: observability
+name: Observability & Ops
+signal: ["\"how would you know it's broken?\"", "SLAs / SLOs", "latency outliers", "debugging across many services", "safe deploys and rollbacks"]
+idea: >-
+  You can't operate what you can't see. Metrics tell you that something is wrong (cheap, aggregated), traces tell you where in the request path (sampled, per request), logs tell you why (detailed, expensive).
+  Tie alerts to user-facing SLOs rather than machine symptoms, and ship changes in a way that limits blast radius and makes rollback fast: most outages are caused by changes.
+
+diagram:
+  type: arch
+  caption: three signals from the same request
+  nodes:
+    svc: {label: Services, sub: OTel SDK, at: [0, 1]}
+    col: {label: Collector, sub: sample · batch, at: [1, 1]}
+    tsdb: {label: Metrics, sub: Prometheus, at: [2, 0], kind: db}
+    traces: {label: Traces, sub: Tempo · Jaeger, at: [2, 1], kind: db}
+    logs: {label: Logs, sub: Loki · ES, at: [2, 2], kind: db}
+    alert: {label: Alerting, sub: SLO burn rate, at: [3, 0]}
+  edges: [[svc, col], [col, tsdb], [col, traces], [col, logs], [tsdb, alert]]
+  frames:
+    - title: Emit
+      flow: [[svc, col, OTLP], [col, tsdb, aggregates], [col, traces, sampled], [col, logs, structured]]
+      win: [col]
+      hit: [tsdb, traces, logs]
+      note: "One SDK emits all three, sharing a trace ID. Logs and exemplars carry the trace ID, so you can jump from a latency spike to an example trace to its logs."
+    - title: Alert
+      flow: [[tsdb, alert, burn rate]]
+      hit: [alert]
+      win: [tsdb]
+      note: "Alert when the error budget burns fast (e.g. 14× the sustainable rate over 1 h), not on CPU at 80%. Symptoms users feel page someone; causes go to dashboards."
+
+numbers:
+  - {k: Golden signals, v: "latency · traffic · errors · saturation"}
+  - {k: Trace sampling, v: "~1–10% head, or tail-based (keep errors / slow)"}
+  - {k: Fast-burn alert, v: "2% of 30-day budget in 1 h (14.4×)"}
+  - {k: Canary, v: "1–5% traffic for 10–60 min"}
+  - {k: High-cardinality labels, v: "avoid user_id in metrics"}
+
+tables:
+  - title: Signals
+    cols: [Signal, Answers, Cost, Watch out]
+    rows:
+      - ["**Metrics**", "Is it broken? How much? Trends, SLOs, capacity", "Cheap: fixed series per label set", "Cardinality explosions (user IDs, URLs in labels); averages hide tails: use histograms"]
+      - ["**Traces**", "Where is the time spent? Which hop failed?", "Per request; usually sampled", "Context propagation must cross every hop, including queues"]
+      - ["**Logs**", "Why did this request fail? Details and context", "Most expensive at volume", "Structured (JSON) with trace IDs; sample or drop debug logs; never log secrets or PII"]
+      - ["**Profiles**", "Which code burns CPU / memory?", "Continuous profilers are cheap now", "Useful for cost and latency work, not alerting"]
+  - title: Deploy strategies
+    cols: [Strategy, How, Rollback, Cost]
+    rows:
+      - ["**Rolling**", "Replace instances in batches", "Roll forward or back in batches (minutes)", "Mixed versions during rollout: must be compatible"]
+      - ["**Blue-green**", "Full new stack; flip the LB", "Flip back (seconds)", "2× capacity during the switch; DB schema shared"]
+      - ["**Canary**", "Small % of traffic to the new version, compare metrics, then ramp", "Route canary traffic away (seconds)", "Needs good automated comparison of canary vs baseline"]
+      - ["**Feature flags**", "Ship dark, enable per cohort", "Turn the flag off (seconds), no deploy", "Flag debt; test both paths"]
+
+pitfalls:
+  - "**Alerting on causes, not symptoms.** CPU at 85% pages someone at night while users are fine; a silent 5% error rate never pages. Page on SLO burn; send causes to dashboards."
+  - "**Averages.** Mean latency hides the slow 1% that real users hit on every page with many calls. Track p50/p95/p99 with histograms, and per endpoint."
+  - "**Unbounded metric cardinality.** Labels like `user_id` or raw URLs create millions of series and take down the metrics system. Bound labels; put high-cardinality detail in traces and logs."
+  - "**Schema changes coupled to deploys.** A deploy that drops a column breaks old instances still running and makes rollback impossible. Expand → migrate → contract across separate releases."
+  - "**No runbooks or ownership.** An alert nobody understands is noise. Every page links to a runbook and an owning team."
+
+depth:
+  - "**SLIs and SLOs:** SLI = good events / valid events (e.g. requests under 300 ms and not 5xx). SLO = target over a window (99.9% / 30 days). The SLA is the external promise with penalties, set looser than the SLO."
+  - "**Multi-window burn-rate alerts:** page when both a long (1 h) and a short (5 min) window burn fast, so alerts are quick to fire and quick to resolve, with few false pages."
+  - "**Tail-based sampling:** keep 100% of error and slow traces and a small share of normal ones, decided after the trace completes in the collector."
+  - "**Progressive delivery with automated analysis:** canary → 5% → 25% → 100% with automatic rollback on SLO regression; pair with per-cell or per-region rollout so a bad change hits one cell first."
+  - "**Incident practice:** clear roles (incident commander, comms), mitigate first (rollback, failover, shed) and diagnose later, blameless postmortems with tracked action items."
+
+checks:
+  - q: "Your SLO is 99.9% of requests successful over 30 days. Traffic is 50M requests/day. How many failed requests is the monthly error budget?"
+    given: {daily: "50e6", days: 30, slo: 0.999}
+    calc:
+      - {ask: Monthly error budget, unit: requests, expr: "daily * days * (1 - slo)", show: "1.5M"}
+    a: "1.5M failures a month. A 1-hour incident failing 20% of requests burns ~2M × 0.2 ≈ 420K, over a quarter of the budget. Burn-rate alerts are built on exactly this arithmetic."
+  - q: p50 latency is 40 ms and steady, but users complain the app feels slow. What do you look at?
+    a: >-
+      The tail: p95/p99 per endpoint, and per-page fan-out (a page making 30 calls hits the p99 on most loads).
+      Use traces of slow requests to find the hop (GC pauses, a slow shard, lock contention, retries), and break latency down by region, client version and tenant.
+  - q: A deploy goes out and errors rise 2%. How should your deploy process have limited and handled this?
+    a: >-
+      Canary first: a small percentage of traffic (ideally one cell or AZ) with automated comparison of error rate and latency against the baseline, auto-rollback on regression.
+      Ship risky behavior behind a feature flag so it can be turned off without a deploy, and keep schema changes backward compatible so rollback is always possible.
+  - q: Why not put `user_id` as a label on your request-latency metric?
+    a: >-
+      Each distinct label value creates a separate time series; with millions of users you create millions of series, overwhelming storage and queries.
+      Keep metrics low-cardinality (endpoint, status, region); answer per-user questions with traces and structured logs, which are designed for high cardinality.

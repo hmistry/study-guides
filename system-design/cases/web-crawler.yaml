@@ -1,0 +1,190 @@
+id: web-crawler
+name: Web Crawler
+prompt: Design a web crawler for a search engine that fetches about 1 billion pages a month, respects robots.txt and per-site politeness, avoids duplicates and traps, and keeps important pages fresh.
+blocks: [queues, partitioning, storage-engines, cdn-blob, reliability, estimation]
+
+steps:
+  - id: requirements
+    title: Requirements
+    min: 5
+    ask: |
+      - What does the crawler produce, and for whom?
+      - What are the politeness and safety constraints?
+      - How do you decide what to crawl next, and how often to recrawl?
+    answer: |
+      **Functional**
+      - Start from seed URLs; fetch pages, store raw content, extract links, and add new URLs to the crawl.
+      - Respect `robots.txt` and crawl-delay; limit concurrent requests per host.
+      - Deduplicate URLs (normalized) and near-duplicate content.
+      - Prioritize important pages; recrawl based on how often pages change.
+      - Output: stored pages and a link graph for the indexing pipeline (indexing itself out of scope).
+
+      **Non-functional**
+      - Scalable to billions of pages; robust to malformed HTML, slow servers, spider traps and huge files.
+      - **Polite:** never overload a site; identify the crawler with a user agent and contact URL.
+      - Extensible: new content types and parsers without redesign.
+
+      **Scale (assumed)**
+      - 1B pages fetched per month, average 100 KB per page, 10B URLs known.
+
+  - id: estimation
+    title: Estimation
+    min: 5
+    ask: |
+      1B pages per month, 100 KB per page, 10B known URLs with an 8-byte fingerprint each, and a Bloom filter at 10 bits per URL.
+    given: {pages: "1e9", month: "30 * 86400", kb: 100, urls: "10e9"}
+    calc:
+      - {name: rate, ask: Average fetch rate, unit: pages/s, expr: "pages / month", show: "≈ 400/s"}
+      - {ask: Download bandwidth, unit: MB/s, expr: "rate * kb / 1000", show: "≈ 40 MB/s"}
+      - {ask: Raw content per month, unit: TB, expr: "pages * kb * 1000 / 1e12", show: "100 TB"}
+      - {ask: URL-seen set as 8-byte fingerprints, unit: GB, expr: "urls * 8 / 1e9", show: "80 GB"}
+      - {ask: URL-seen set as a Bloom filter, unit: GB, expr: "urls * 10 / 8 / 1e9", show: "12.5 GB"}
+    answer: |
+      - **400 pages/s** is modest in aggregate. The difficulty is politeness: those fetches must spread over millions of hosts, each fetched slowly.
+      - **40 MB/s** (~320 Mbps) download is easy; DNS lookups and slow servers dominate latency, so fetchers need high concurrency (thousands of in-flight requests).
+      - **100 TB/month** raw: compress (HTML compresses ~5×) and store in object storage, deduped by content hash.
+      - **URL dedup** fits in memory as a Bloom filter (12.5 GB) or a sharded fingerprint set.
+
+  - id: api
+    title: Component interfaces
+    min: 4
+    ask: There's no public API. Define the interfaces between the frontier, fetchers and parsers.
+    answer: |
+      ```
+      Frontier
+        add(urls[], source, priority_hint)             # dedup + enqueue
+        lease(fetcher_id, n) → [ {url, host, not_before} ]   # only hosts ready to be fetched
+        complete(url, status, next_crawl_at)           # releases the host slot
+
+      Fetcher → content store
+        put(url, fetched_at, status, headers, content_hash, body_ref)
+
+      Parser
+        on_page(page) → { links[], canonical_url?, simhash, metadata }
+      ```
+      - Leases with timeouts let a crashed fetcher's URLs return to the frontier automatically.
+      - The frontier returns URLs grouped so that one fetcher owns a host at a time, which makes politeness a local decision.
+
+  - id: data-model
+    title: Data model
+    min: 5
+    ask: What do you store per URL, per host and per page?
+    answer: |
+      ```
+      urls     url_fingerprint PK · url · host · priority · last_crawled · next_crawl_at
+               · last_status · content_hash · change_rate_estimate       → sharded by host
+      hosts    host PK · robots rules + fetched_at · crawl_delay · ip
+               · next_allowed_fetch · error_rate                         → sharded by host
+      pages    content_hash → compressed body in object storage (deduped)
+      links    (from_fingerprint, to_fingerprint) edges                  → for ranking (PageRank-like)
+      ```
+      - **Shard everything by host**: a host's URLs, robots rules and politeness state live together, so one worker can schedule that host without coordination.
+      - Content is addressed by hash, so identical pages under different URLs are stored once.
+
+  - id: high-level
+    title: High-level design
+    min: 8
+    ask: Draw the crawl loop and show where politeness, dedup and recrawl scheduling happen.
+    diagram:
+      type: arch
+      caption: the crawl loop, partitioned by host
+      nodes:
+        seeds: {label: Seeds, at: [0, 0], kind: client}
+        front: {label: Frontier, sub: per host, at: [1, 0], kind: queue}
+        fetch: {label: Fetchers, sub: robots · DNS, at: [2, 0]}
+        store: {label: Content store, sub: by hash, at: [3, 0], kind: db}
+        parse: {label: Parsers, sub: links · simhash, at: [3, 1]}
+        dedup: {label: URL filter, sub: dedup · seen set, at: [2, 1]}
+        sched: {label: Recrawl sched, sub: change rate, at: [1, 1]}
+      edges: [[seeds, front], [front, fetch], [fetch, store], [store, parse], [parse, dedup], [dedup, front], [sched, front]]
+      frames:
+        - title: Fetch
+          flow: [[seeds, front, add], [front, fetch, lease], [fetch, store, put]]
+          hit: [store]
+          win: [front, fetch]
+          note: "Fetchers lease URLs only from hosts whose next allowed time has passed, check cached robots rules, resolve DNS through a local cache, and fetch with strict timeouts and size limits."
+        - title: Extract
+          flow: [[store, parse, new page], [parse, dedup, links], [dedup, front, new URLs]]
+          hit: [front]
+          win: [parse, dedup]
+          note: "Parsers extract links and a SimHash; links are normalized and checked against the seen set. Only new URLs reach the frontier, routed to the shard that owns their host."
+        - title: Recrawl
+          flow: [[sched, front, due URLs]]
+          hit: [front]
+          win: [sched]
+          note: "Each URL has a next-crawl time from its importance and observed change rate. The scheduler re-enqueues URLs as they come due."
+    answer: |
+      - **Frontier:** prioritized, and per-host queues enforce politeness (one in-flight request per host, crawl-delay between fetches).
+      - **Fetchers:** async I/O with thousands of concurrent connections, robots and DNS caches, timeouts, size caps, redirect limits.
+      - **Parsers and URL filter:** extract links, normalize, dedupe against the seen set, apply trap heuristics.
+      - **Recrawl scheduler:** importance × change rate decides when to fetch again.
+      - **Partition by host hash** across crawler nodes: each node owns its hosts end to end.
+
+  - id: deep-dives
+    title: Deep dives
+    min: 15
+    ask: Pick 2–3. Answer each before revealing it.
+    items:
+      - id: frontier
+        q: Design the URL frontier so it enforces both priority and politeness.
+        answer: |
+          The classic **Mercator** design:
+          - **Front queues** by priority (e.g. 10 levels from PageRank-like importance and freshness need); a selector draws from them, biased toward high priority.
+          - **Back queues**, one per host (or per IP), each holding only that host's URLs. A host is in exactly one back queue.
+          - A **min-heap of (next_allowed_time, host)** decides which back queue a fetcher may pull from next; after a fetch, the host's next time = now + max(crawl-delay, k × last response time).
+          - Back queues refill from front queues when they empty. Persist the frontier (RocksDB / Kafka-backed) since it holds billions of URLs.
+
+      - id: dedup
+        q: "How do you avoid fetching the same thing twice: same URL, different URLs for the same page, and near-copies?"
+        answer: |
+          - **URL normalization:** lowercase scheme and host, remove default ports and fragments, sort or strip tracking query parameters, resolve relative paths; honor `rel=canonical`.
+          - **Seen set:** a Bloom filter (no false negatives, ~1% false positives that skip a few URLs) or exact fingerprints in a sharded KV, partitioned by host like everything else.
+          - **Exact content dupes:** hash the body; identical content under different URLs is stored once and linked.
+          - **Near-duplicates:** SimHash (64-bit) with Hamming distance ≤ 3 flags mirrors and boilerplate-variant pages; keep the canonical one and lower the others' recrawl priority.
+
+      - id: traps
+        q: How does the crawler avoid spider traps and hostile servers?
+        answer: |
+          - **Limits:** max URL length, path depth, redirects, page size, and fetch time; max pages per host per crawl cycle.
+          - **Pattern detection:** repeating path segments (`/a/b/a/b/…`), infinite calendars, session IDs in URLs, huge numbers of query-parameter permutations on one host.
+          - **Budgets by importance:** low-value hosts get small budgets, so a trap can't consume much.
+          - **Hostile responses:** timeouts for slow-loris servers, content-type checks, decompression-bomb limits, sandboxed parsers.
+
+      - id: freshness
+        q: How do you decide when to recrawl a page?
+        answer: |
+          - Estimate each page's **change rate** from history (changed / unchanged on recent fetches, `Last-Modified`, ETags) and its **importance**.
+          - Schedule next crawl ≈ a function of both: important, fast-changing pages (news home pages) every few minutes; static, unimportant pages every few months.
+          - Use **conditional GETs** (`If-Modified-Since`, `If-None-Match`) so unchanged pages cost a 304 and no transfer.
+          - Sitemaps and feeds (RSS, sitemap `lastmod`) give cheap change hints for sites that provide them.
+
+      - id: distribution
+        q: How do you distribute the crawler across hundreds of machines?
+        answer: |
+          - **Partition by host hash** (consistent hashing) so each node owns a set of hosts: politeness, robots caching and dedup for those hosts are all local, no cross-node locking.
+          - Discovered links for hosts owned elsewhere are batched and sent to the owning node (via a queue per partition).
+          - Very large hosts (Wikipedia-sized) get their own dedicated partition and a negotiated higher crawl rate.
+          - Node failure: reassign its host ranges; the frontier and seen set are persisted, so the new owner resumes.
+
+  - id: wrap-up
+    title: Wrap-up
+    min: 3
+    ask: |
+      - What breaks first at 10×?
+      - What do you monitor?
+      - What makes this a staff-level answer?
+    answer: |
+      **At 10× (10B pages/month):** frontier size and the seen set (100B URLs), DNS volume, and storage. Tier the frontier to disk, shard the seen set, run local recursive resolvers.
+
+      **Monitor:** pages/s, error rates by type (DNS, timeout, 4xx, 5xx), per-host politeness violations (should be zero), duplicate rate, freshness lag for top pages, frontier size by priority, complaint emails.
+
+      **Staff-level signals**
+      - Treats politeness as the core scheduling constraint and designs the frontier around it.
+      - Partitions by host so most decisions are local.
+      - Separates URL dedup, exact content dedup and near-duplicate detection.
+      - Has a principled recrawl policy (importance × change rate) and conditional GETs.
+
+      **Common mistakes**
+      - A single global FIFO queue (hammers sites, ignores importance).
+      - No trap defenses or size limits.
+      - Recrawling everything on a fixed schedule.

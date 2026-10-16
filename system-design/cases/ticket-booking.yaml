@@ -1,0 +1,202 @@
+id: ticket-booking
+name: Ticket Booking
+prompt: Design a ticketing system like Ticketmaster. Users browse events, choose seats and buy tickets. A popular on-sale brings millions of users within minutes for about 50,000 seats.
+blocks: [consistency, dist-transactions, caching, rate-limits-ids, reliability, estimation]
+
+steps:
+  - id: requirements
+    title: Requirements
+    min: 5
+    ask: |
+      - Which flows are in scope?
+      - What must never happen, and where can you be eventually consistent?
+      - What does an on-sale spike look like?
+    answer: |
+      **Functional**
+      - Browse and search events; view a seat map with availability.
+      - Select seats and get a **temporary hold** (~10 minutes) while paying; complete purchase; receive tickets.
+      - General-admission and reserved seating; per-account ticket limits.
+      - A fair queue (virtual waiting room) for high-demand on-sales; bot protection.
+
+      **Non-functional**
+      - **Never sell a seat twice**, never charge without issuing a ticket (or refund).
+      - Browsing and seat maps can be slightly stale (seconds); holds and purchases must be strongly consistent.
+      - Survive spikes of 100× normal traffic without falling over, and treat users fairly.
+
+      **Scale (assumed)**
+      - On-sale: 2M users arrive within 5 minutes for 50K seats; normal traffic is a few thousand requests per second.
+
+  - id: estimation
+    title: Estimation
+    min: 5
+    ask: |
+      2M users arriving within 5 minutes for 50K seats; each admitted user refreshes the seat map every 2 s; seats sell out in ~15 minutes.
+    given: {users: "2e6", window: 300, seats: "50e3", refresh: 2, sellout: 900}
+    calc:
+      - {ask: Arrival rate, unit: users/s, expr: "users / window", show: "≈ 6.7K/s"}
+      - {ask: Seat-map requests if everyone were admitted, unit: /s, expr: "users / refresh", show: "1M/s"}
+      - {ask: Users per seat, unit: "", expr: "users / seats", show: "40"}
+      - {ask: Average successful holds during the sell-out, unit: /s, expr: "seats / sellout", show: "≈ 56/s"}
+    answer: |
+      - **Only ~56 successful holds per second**, but they all fight over the same 50K rows: the problem is **contention**, not throughput.
+      - **1M seat-map requests/s** would crush the inventory database, so seat maps come from a cache and the waiting room limits how many users are active at once.
+      - **40 users per seat**: most users will fail. A fair, honest queue is a better experience than a site that times out for everyone.
+
+  - id: api
+    title: API
+    min: 4
+    ask: Define the waiting room, hold and purchase calls.
+    answer: |
+      ```
+      GET  /v1/events/{id}                         (CDN-cached: event info, venue map)
+      POST /v1/events/{id}/queue                   → { queue_token, position, eta }
+      GET  /v1/queue/{token}                       → { status: waiting | admitted, access_token? }
+
+      GET  /v1/events/{id}/availability            (cached ~1 s, per section bitmaps)
+      POST /v1/holds      Authorization: access_token
+           { event_id, seats: ["A-12", "A-13"] }   → 201 { hold_id, expires_at }  · 409 seats taken
+      POST /v1/orders     Idempotency-Key: …
+           { hold_id, payment_method }             → 201 { order_id, tickets } · 410 hold expired
+      DELETE /v1/holds/{id}
+      ```
+      - Holds are all-or-nothing for the requested seats.
+      - The order call is idempotent, so a client retry after a timeout can't charge twice.
+
+  - id: data-model
+    title: Data model
+    min: 5
+    ask: |
+      - How do you represent seat state so holds are atomic?
+      - Where does each kind of data live?
+    answer: |
+      ```
+      events     event_id · venue · on_sale_at · limits                      → SQL, cached
+      seats      PK (event_id, seat_id) · section · price_tier
+                 · status (AVAILABLE | HELD | SOLD) · hold_id · hold_expires_at · version
+                 → SQL, partitioned by event_id (one event's inventory on one shard)
+      holds      hold_id · user_id · event_id · seats[] · expires_at · state
+      orders     order_id · hold_id (unique) · user_id · payment_id · state · idempotency_key
+      ```
+      - **Inventory for one event lives on one shard**, so a multi-seat hold is a single local transaction.
+      - `hold_id` unique on orders means one hold can produce at most one order.
+      - Availability for seat maps is a **derived, cached view** (per-section bitmaps), refreshed from the seats table.
+
+  - id: high-level
+    title: High-level design
+    min: 8
+    ask: Walk through an on-sale from arrival to purchase.
+    diagram:
+      type: arch
+      caption: shield the inventory behind a waiting room and caches
+      nodes:
+        user: {label: User, at: [0, 1], kind: client}
+        cdn: {label: CDN, sub: static pages, at: [1, 0]}
+        wait: {label: Waiting room, sub: tokens · rate, at: [1, 1]}
+        book: {label: Booking svc, at: [2, 1]}
+        avail: {label: Availability, sub: cached ~1 s, at: [2, 0], kind: cache}
+        inv: {label: Inventory DB, sub: by event, at: [3, 1], kind: db}
+        pay: {label: Payments, at: [3, 2]}
+      edges: [[user, cdn], [user, wait], [wait, book], [book, avail], [book, inv], [book, pay], [inv, avail]]
+      frames:
+        - title: Queue
+          flow: [[user, cdn, event page], [user, wait, join]]
+          hit: [cdn]
+          win: [wait]
+          note: "Static pages come from the CDN. Users join the waiting room and get a signed token with a position; the room admits users at the rate the booking system can handle."
+        - title: Hold
+          flow: [[wait, book, admitted], [book, avail, seat map], [book, inv, cond. update]]
+          hit: [inv]
+          win: [book, avail]
+          note: "Admitted users see a seat map from the availability cache. A hold is one transaction on the event's shard that flips the chosen seats from AVAILABLE to HELD only if all are still available."
+        - title: Purchase
+          flow: [[book, pay, charge (idem key)], [book, inv, HELD → SOLD]]
+          hit: [inv, pay]
+          win: [book]
+          note: "Payment runs with an idempotency key; on success the seats move to SOLD and tickets are issued. If the hold expired first, the payment is voided or refunded."
+    answer: |
+      - **Edge:** CDN for event pages and assets; bot defenses.
+      - **Waiting room:** queue tokens, admission rate tied to booking capacity, signed access tokens with expiry.
+      - **Booking service:** reads availability from a cache; writes holds and orders as transactions on the event's inventory shard.
+      - **Hold expiry** sweeper returns unpaid seats; **payment** with idempotency and a void/refund path.
+
+  - id: deep-dives
+    title: Deep dives
+    min: 15
+    ask: Pick 2–3. Answer each before revealing it.
+    items:
+      - id: no-double-sell
+        q: How exactly do you prevent two users from holding or buying the same seat?
+        answer: |
+          One transaction on the event's shard:
+          ```
+          UPDATE seats SET status = 'HELD', hold_id = :h, hold_expires_at = now() + interval '10 min'
+          WHERE event_id = :e AND seat_id IN (:seats)
+            AND (status = 'AVAILABLE' OR (status = 'HELD' AND hold_expires_at < now()))
+          -- commit only if rows_affected = number of seats requested, else roll back → 409
+          ```
+          - Conditional updates (or `SELECT … FOR UPDATE` in seat order to avoid deadlocks) make it atomic; the database is the arbiter, never a cache.
+          - For general admission, use a counter row per section with `UPDATE … SET remaining = remaining - n WHERE remaining >= n`, or pre-split the count into several rows to spread contention.
+
+      - id: holds
+        q: How do holds expire reliably?
+        answer: |
+          - Store `hold_expires_at` on the seat rows. Expired holds are treated as available **by the hold query itself** (see the condition above), so correctness never depends on a background job running on time.
+          - A sweeper periodically resets expired holds so the availability view is accurate.
+          - Purchases check the hold is still valid and unexpired inside the same transaction that marks seats SOLD.
+          - Don't rely only on a cache TTL (e.g. Redis keys) as the source of truth; it can be the fast path, but the database decides.
+
+      - id: waiting-room
+        q: Design the virtual waiting room. How is it fair and how do you size admission?
+        answer: |
+          - Everyone arriving before the on-sale time gets a **random position** at open (no advantage for refresh-spamming); later arrivals join at the end.
+          - The room is mostly static (CDN-served page + a small queue service storing positions); clients poll with backoff.
+          - **Admission rate** = what the booking path can sustain (e.g. N users per minute), adjusted automatically by booking-service latency and remaining inventory; stop admitting when sold out and tell the queue.
+          - Admitted users get a **signed, short-lived access token** bound to their account; the booking service rejects requests without one, so nobody skips the line.
+
+      - id: seat-map
+        q: How do you serve seat maps to many users without hammering the inventory DB?
+        answer: |
+          - Maintain **per-section availability bitmaps** derived from the inventory (CDC or periodic snapshot), cached and refreshed about every second.
+          - Clients fetch bitmaps and render locally; optionally push deltas over a stream.
+          - Staleness is acceptable: a user may click a seat that was just taken and get a 409 with a fresh map.
+          - Offer **"best available"** selection server-side so most users don't need the map at all and requests spread across seats.
+
+      - id: payment
+        q: Payment succeeds but the order write fails (or the hold expired during payment). What happens?
+        answer: |
+          - Treat purchase as a small saga: **authorize** the card → mark seats SOLD (in a transaction that checks the hold) → **capture**. If marking SOLD fails, void the authorization.
+          - Idempotency keys on the order and on the payment call make retries safe.
+          - Extend a hold that is in payment (e.g. +2 minutes) rather than letting it expire mid-charge.
+          - Reconciliation job: payments without orders are refunded or completed; orders without captured payments are flagged.
+
+      - id: bots
+        q: How do you keep bots and scalpers from taking most of the tickets?
+        answer: |
+          - Verified accounts (phone / prior purchase history), presale codes for verified fans.
+          - CAPTCHA and device fingerprinting at queue entry, rate limits per account, payment card and device.
+          - Per-account ticket limits enforced in the hold transaction.
+          - Non-transferable or controlled-resale tickets reduce the incentive; anomaly detection after the fact cancels abusive orders.
+
+  - id: wrap-up
+    title: Wrap-up
+    min: 3
+    ask: |
+      - What breaks first at 10×?
+      - What do you monitor?
+      - What makes this a staff-level answer?
+    answer: |
+      **At 10× (20M users for one event):** the waiting room and edge, not inventory, because admission is throttled. Make the room fully CDN-backed and the queue service horizontally scalable.
+
+      **Monitor:** queue length and admission rate, hold success / 409 rate, booking latency, hold expiry rate, payment failures, oversell detector (should be zero), bot-block rate.
+
+      **Staff-level signals**
+      - Identifies contention on a small inventory as the core problem and keeps each event's inventory on one shard.
+      - Puts the invariant in the database write (conditional update), with expiry checked in the same query.
+      - Uses a waiting room to turn an uncontrollable spike into a controlled admission rate, and makes it fair.
+      - Handles payment and hold expiry as a saga with idempotency.
+
+      **Common mistakes**
+      - Checking availability on a cache or replica, then writing.
+      - Relying on a cron job to expire holds for correctness.
+      - Letting the full spike hit the booking service.
+      - Charging before seats are secured, with no void path.

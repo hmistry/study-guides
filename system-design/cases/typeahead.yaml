@@ -1,0 +1,177 @@
+id: typeahead
+name: Typeahead
+prompt: Design search autocomplete. As the user types into a search box, show the top 10 query suggestions for the current prefix, ranked by popularity, fast enough to feel instant.
+blocks: [caching, cdn-blob, partitioning, queues, storage-engines, estimation]
+
+steps:
+  - id: requirements
+    title: Requirements
+    min: 5
+    ask: |
+      - What is ranked, and how fresh must popularity be?
+      - What latency budget does "feels instant" mean?
+      - Personalization, languages, and safety?
+    answer: |
+      **Functional**
+      - Given a prefix, return up to 10 suggested queries, ranked by popularity (with time decay).
+      - Trending queries surface within minutes (nice to have); the base ranking can update hourly or daily.
+      - Filter offensive and policy-violating suggestions; per-language / per-region suggestions.
+      - Optional: light personalization (the user's own recent searches) blended on top.
+
+      **Non-functional**
+      - **End-to-end < ~100 ms** while typing, so server p99 well under 50 ms; requests are cancelled and superseded constantly.
+      - Very high read QPS, tiny responses; availability over freshness (stale suggestions are fine).
+
+      **Scale (assumed)**
+      - 100M DAU, 10 searches per user per day, ~4 suggestion requests per search after debouncing, 50M distinct popular queries indexed.
+
+  - id: estimation
+    title: Estimation
+    min: 5
+    ask: |
+      100M DAU, 10 searches each per day, 4 requests per search, peak 3×; 50M indexed queries with ~10 distinct prefixes each; ~100 bytes per prefix entry (key + top-10 IDs).
+    given: {dau: "100e6", searches: 10, per_search: 4, peak: 3, queries: "50e6", prefixes: 10, entry: 100}
+    calc:
+      - {ask: Peak suggestion requests, unit: /s, expr: "dau * searches * per_search / 86400 * peak", show: "≈ 140K/s"}
+      - {name: n, ask: Prefix entries, unit: "", expr: "queries * prefixes", show: "500M"}
+      - {ask: Index size with precomputed top-10 per prefix, unit: GB, expr: "n * entry / 1e9", show: "50 GB"}
+    answer: |
+      - **140K req/s of tiny lookups** suits in-memory serving with heavy caching; short prefixes (1–2 characters) are a small, extremely hot set that the CDN and browsers can serve.
+      - **~50 GB index** fits in RAM on one large machine, so the simplest design is **full replicas** of the index on every server rather than sharding. Shard only if languages or personalization multiply the size.
+      - Precomputing top-10 per prefix makes each request a single lookup: no tree walk or sort at request time.
+
+  - id: api
+    title: API
+    min: 4
+    ask: Define the request and response, and describe client behavior while typing.
+    answer: |
+      ```
+      GET /v1/suggest?q=new%20yo&lang=en&region=US&limit=10
+      → 200  Cache-Control: public, max-age=300
+      { "q": "new yo", "suggestions": [ {"text": "new york times", "score": 0.93}, … ] }
+      ```
+      - **Client:** debounce ~50–100 ms, cancel in-flight requests when a new key arrives, cache responses per prefix locally, and reuse a longer prefix's results when the user deletes characters.
+      - Normalize the prefix (lowercase, trim, collapse spaces, Unicode normalize) on both sides so cache keys match.
+      - Personalized suggestions use a separate, uncached call (or are blended client-side) so the shared response stays cacheable.
+
+  - id: data-model
+    title: Data model
+    min: 5
+    ask: |
+      - What raw data do you collect, and what do you serve from?
+      - Trie or hash map of prefixes?
+    answer: |
+      ```
+      search_log (stream)     query · lang · region · user_id? · ts           → Kafka → data lake
+      query_counts (batch)    (lang, region, query) → decayed count            → recomputed hourly/daily
+      serving index           (lang, region, prefix) → [top-10 (query, score)] → immutable snapshot, in memory
+      blocklist               terms / patterns to suppress                     → applied at build time
+      ```
+      - **Trie with top-K cached at each node** and a **prefix → top-K hash map** serve the same purpose. The hash map is simpler and faster to load; a compact trie (radix tree) saves memory by sharing prefixes.
+      - The serving index is **built offline and swapped atomically**; servers never update it in place.
+
+  - id: high-level
+    title: High-level design
+    min: 8
+    ask: Show the serving path and the pipeline that builds the index, including trending.
+    diagram:
+      type: arch
+      caption: offline build, online lookup
+      nodes:
+        user: {label: Browser, sub: debounce · cache, at: [0, 0], kind: client}
+        cdn: {label: CDN, sub: short prefixes, at: [1, 0]}
+        svc: {label: Suggest svc, sub: index in RAM, at: [2, 0]}
+        logs: {label: Search logs, sub: Kafka, at: [0, 2], kind: queue}
+        batch: {label: Aggregator, sub: hourly · decay, at: [1, 2]}
+        build: {label: Index builder, at: [2, 2]}
+        snap: {label: Snapshots, sub: object store, at: [3, 1], kind: db}
+        trend: {label: Trending, sub: stream · 5 min, at: [1, 1]}
+      edges: [[user, cdn], [cdn, svc], [logs, batch], [batch, build], [build, snap], [snap, svc], [logs, trend], [trend, svc]]
+      frames:
+        - title: Serve
+          flow: [[user, cdn, GET q=ne], [cdn, svc, miss]]
+          hit: [svc]
+          win: [cdn]
+          note: "Most short-prefix requests are answered by the browser cache or the CDN. Misses hit any suggest server, which does one in-memory lookup and returns in a few ms."
+        - title: Build
+          flow: [[logs, batch, consume], [batch, build, counts], [build, snap, publish v42], [snap, svc, load + swap]]
+          hit: [svc]
+          win: [batch, build, snap]
+          note: "Hourly: aggregate counts with time decay, filter by blocklist and thresholds, compute top-10 per prefix, publish a versioned snapshot. Servers load it in the background and swap a pointer."
+        - title: Trending
+          flow: [[logs, trend, stream], [trend, svc, overlay]]
+          hit: [svc]
+          win: [trend]
+          note: "A streaming job detects queries spiking against their baseline and pushes a small overlay that servers merge into results for a few hours, until the batch index catches up."
+    answer: |
+      - **Serving:** browser cache → CDN → stateless suggest servers each holding the full index in memory; one lookup per request.
+      - **Batch pipeline:** logs → decayed counts → filtered top-K per prefix → versioned snapshot → atomic swap on all servers.
+      - **Streaming overlay** for trending queries, merged at read time.
+      - Index versions make rollouts and rollbacks simple, and a bad build can be caught by validation before it ships.
+
+  - id: deep-dives
+    title: Deep dives
+    min: 15
+    ask: Pick 2–3. Answer each before revealing it.
+    items:
+      - id: structure
+        q: Trie or prefix hash map? How do you keep memory reasonable?
+        answer: |
+          - **Naive trie** walking all completions per request is too slow for popular short prefixes (millions of descendants). Cache the top-K at every node, so a lookup is O(prefix length).
+          - **Prefix → top-K map** is the flattened version: one hash lookup, trivially sharded, easy to build in a batch job, larger in memory because prefixes aren't shared.
+          - **Save memory:** store query strings once and reference them by integer ID in top-K lists; cap indexed prefix length (e.g. 20 chars, beyond that fall back to search); drop rare queries below a count threshold (also a privacy measure).
+
+      - id: ranking
+        q: How do you rank suggestions, and how does freshness work?
+        answer: |
+          - Score = time-decayed popularity (e.g. exponential decay with a half-life of days), so last year's spike fades.
+          - Blend signals: click-through on the suggestion, query success (did the user click a result), locale. Keep the formula simple and offline.
+          - **Trending:** compare a query's last-hour rate with its baseline; spikes enter the overlay with a boost that decays.
+          - **Personalization:** merge the user's recent searches matching the prefix on top, client-side or in a separate call, keeping the shared response cacheable.
+
+      - id: caching
+        q: Where does caching pay off most?
+        answer: |
+          - **Short prefixes dominate traffic and have few distinct values** (36 one-char, ~1,300 two-char per language). Cache them at the CDN and in the browser with a TTL of minutes.
+          - The client reuses results: "new y" results filtered locally may already answer "new yo".
+          - Server-side, everything is already in memory; a CDN hit simply saves the round trip and the server capacity.
+          - Invalidate by index version: include the version in the cache key, or just let short TTLs expire.
+
+      - id: scaling
+        q: The index grows to 2 TB with many languages and regions. How do you shard?
+        answer: |
+          - **Shard by (lang, region) first**: requests already carry them, and each shard is independent.
+          - Within a huge locale, shard by **prefix range** with a routing table built from traffic, not alphabetically (prefixes starting with "s" or "a" are far heavier than "x").
+          - Replicate each shard for availability and QPS; any replica can answer.
+          - Avoid hashing the full prefix if you want the client to reuse results across keystrokes from one server; routing by the first 2–3 characters keeps a user's typing on one shard.
+
+      - id: safety
+        q: How do you stop offensive or harmful suggestions, including sudden ones?
+        answer: |
+          - **Build-time filtering**: blocklists, classifiers, and minimum-popularity thresholds (rare queries can be personal data or manipulation).
+          - **Serve-time kill switch**: a small denylist pushed to servers within minutes that filters results at read time, for incidents that can't wait for the next build.
+          - Watch for **manipulation** (bots searching a phrase to make it trend): count distinct users, not raw queries, and rate-limit per client.
+          - Separate rules for sensitive categories (names of private people, medical, legal).
+
+  - id: wrap-up
+    title: Wrap-up
+    min: 3
+    ask: |
+      - What breaks first at 10×?
+      - What do you monitor?
+      - What makes this a staff-level answer?
+    answer: |
+      **At 10×:** index size with more locales and personalization, and the build pipeline's duration. Shard by locale, cap prefixes, and make builds incremental.
+
+      **Monitor:** server p99, CDN and browser hit ratio, suggestion click-through rate, index build success and age (staleness), denylist propagation time, empty-result rate.
+
+      **Staff-level signals**
+      - Precomputes top-K per prefix and does one lookup per request.
+      - Notices that 50 GB fits in RAM and keeps full replicas instead of sharding prematurely.
+      - Uses the client and CDN aggressively for short prefixes.
+      - Treats safety and manipulation as first-class, with a fast kill switch.
+
+      **Common mistakes**
+      - Walking the trie and sorting completions on every request.
+      - Updating the serving index in place on every search.
+      - Ignoring debouncing and cancellation on the client.

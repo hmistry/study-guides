@@ -1,0 +1,192 @@
+id: file-sync
+name: File Sync
+prompt: Design a file storage and sync service like Dropbox or Google Drive. Users keep files in a folder that syncs across all their devices, works offline, keeps version history, and can be shared with others.
+blocks: [cdn-blob, datastores, consistency, partitioning, queues, apis]
+
+steps:
+  - id: requirements
+    title: Requirements
+    min: 5
+    ask: |
+      - Which operations and clients are in scope?
+      - What must never happen to user data, and how fast should changes sync?
+      - How do you treat offline edits and conflicts?
+    answer: |
+      **Functional**
+      - Upload, download, rename, move, delete files and folders; files up to ~50 GB.
+      - Desktop and mobile clients sync automatically; changes reach other devices within seconds.
+      - Offline edits sync on reconnect; conflicting edits never silently overwrite each other.
+      - Version history and restore (e.g. 30 days); share folders and links with permissions.
+
+      **Non-functional**
+      - **Durability above all** (11 nines for content); metadata must never lose an acknowledged change.
+      - Bandwidth-efficient: upload only what changed; don't re-upload content the service already has.
+      - Strong consistency of metadata within a user's or shared folder's namespace; eventual consistency across devices is fine.
+
+      **Scale (assumed)**
+      - 500M users, 100M daily active, 2 GB stored per user on average, 20 file changes per active user per day, ~500 KB of new content per change after chunk dedup.
+
+  - id: estimation
+    title: Estimation
+    min: 5
+    ask: |
+      500M users × 2 GB; 100M DAU × 20 changes per day; ~500 KB of new content per change.
+    given: {users: "500e6", gb: 2, dau: "100e6", changes: 20, kb: 500}
+    calc:
+      - {ask: Logical storage, unit: EB, expr: "users * gb / 1e9", show: "1 EB"}
+      - {name: cps, ask: Metadata commits, unit: /s, expr: "dau * changes / 86400", show: "≈ 23K/s"}
+      - {ask: New content uploaded per day, unit: PB, expr: "dau * changes * kb * 1000 / 1e15", show: "1 PB"}
+      - {ask: Average upload throughput, unit: GB/s, expr: "dau * changes * kb * 1000 / 86400 / 1e9", show: "≈ 12 GB/s"}
+    answer: |
+      - **1 EB logical** (more with versions and replication): content-addressed chunk storage with dedup and erasure coding in a blob store, never in a database.
+      - **23K metadata commits/s** need a sharded, strongly consistent metadata store, partitioned so each commit stays within one shard.
+      - **~12 GB/s of uploads** go directly to the block store; delta sync and dedup keep this number from being 10× larger.
+
+  - id: api
+    title: API
+    min: 4
+    ask: |
+      - How does a client commit a changed file without re-uploading everything?
+      - How do other devices learn about changes?
+    answer: |
+      ```
+      POST /v1/commit
+      { namespace_id, path, base_rev, size, mtime, block_hashes: ["sha256…", …] }
+      → 200 { rev }                               # all blocks already present
+      → 412 { missing_blocks: [hashes…] }         # upload these, then retry the commit
+      → 409 { current_rev }                        # someone else changed it since base_rev
+
+      PUT  /v1/blocks/{sha256}   (presigned, direct to block storage; idempotent by hash)
+      GET  /v1/blocks/{sha256}
+      GET  /v1/changes?namespace=…&cursor=…        → [changes], next_cursor
+      GET  /v1/changes/wait?cursor=…               (long poll: returns when something changed)
+      ```
+      - **Commit is idempotent and content-addressed**: the server answers which blocks it lacks, so unchanged and already-known blocks are never uploaded.
+      - **`base_rev`** enables optimistic concurrency: a commit based on an old revision is rejected rather than overwriting.
+
+  - id: data-model
+    title: Data model
+    min: 5
+    ask: |
+      - What's in the metadata store, and how is it partitioned?
+      - How are file contents stored?
+    answer: |
+      ```
+      namespaces   namespace_id · owner · type (user root | shared folder)
+      files        PK (namespace_id, path) · file_id · rev · size · mtime · block_hashes[] · deleted
+      journal      PK (namespace_id) CK seq → change {path, rev, op}          # per-namespace ordered log
+      versions     (file_id, rev) → block_hashes[], author, ts                  # history, retention policy
+      blocks       sha256 → storage location · refcount                         # ~4 MB content-addressed blocks
+      ```
+      - **Partition metadata by `namespace_id`**: every commit touches one namespace, so it's a single-shard transaction. A shared folder is its own namespace mounted into members' trees.
+      - **Journal** with a per-namespace sequence gives each device a simple cursor: "give me everything after seq 18,442".
+      - **Blocks** live in object storage (erasure-coded, multi-AZ), deduplicated by hash.
+
+  - id: high-level
+    title: High-level design
+    min: 8
+    ask: Walk through saving a changed file on one laptop and its appearance on a phone.
+    diagram:
+      type: arch
+      caption: metadata and blocks travel separately
+      nodes:
+        laptop: {label: Laptop, sub: chunker, at: [0, 0], kind: client}
+        phone: {label: Phone, at: [0, 2], kind: client}
+        meta: {label: Metadata svc, sub: commit · journal, at: [1, 0]}
+        mdb: {label: Metadata DB, sub: by namespace, at: [2, 0], kind: db}
+        blocks: {label: Block store, sub: by SHA-256, at: [2, 1], kind: db}
+        notify: {label: Notifier, sub: long poll, at: [0, 1]}
+      edges: [[laptop, meta], [laptop, blocks], [phone, notify], [phone, meta], [phone, blocks], [meta, mdb], [meta, notify]]
+      frames:
+        - title: Upload
+          flow: [[laptop, meta, 1 commit], [laptop, blocks, 2 PUT missing], [meta, mdb, 3 journal], [meta, notify, 4 notify]]
+          hit: [mdb, blocks]
+          win: [meta]
+          note: "The client chunks the file and commits block hashes. The server replies with only the missing blocks; the client uploads those directly, then re-commits, which appends to the namespace journal."
+        - title: Sync
+          flow: [[notify, phone, wake], [phone, meta, changes], [phone, blocks, GET blocks]]
+          hit: [phone]
+          win: [notify, meta]
+          note: "The phone's long poll returns; it fetches journal entries after its cursor, downloads only blocks it doesn't have, reassembles the file and advances its cursor."
+    answer: |
+      - **Client:** file watcher, chunker (~4 MB blocks with SHA-256), local DB of synced state and cursor, upload / download queues.
+      - **Metadata service:** commits with optimistic concurrency, journal per namespace, permission checks.
+      - **Block store:** content-addressed, deduplicated, accessed directly by clients via presigned URLs.
+      - **Notifier:** long poll or WebSocket per device; carries only "something changed" signals, never data.
+
+  - id: deep-dives
+    title: Deep dives
+    min: 15
+    ask: Pick 2–3. Answer each before revealing it.
+    items:
+      - id: chunking
+        q: Fixed-size chunks or content-defined chunking? How does dedup work, and what are its risks?
+        answer: |
+          - **Fixed 4 MB blocks** are simple, but inserting one byte at the start of a file shifts every block: everything re-uploads.
+          - **Content-defined chunking** (rolling hash, e.g. Rabin / FastCDC, cutting where the hash matches a pattern) keeps boundaries stable around edits, so only nearby chunks change.
+          - **Dedup:** blocks are stored once by SHA-256 and reference-counted. Cross-user dedup saves a lot, but it leaks information ("does anyone have this exact file?" by watching upload behavior); mitigate by deduping per user / per namespace, or by always uploading before confirming.
+          - Compress blocks before storage; encrypt at rest with keys managed per tenant or per block.
+
+      - id: conflicts
+        q: Two devices edit the same file offline and both sync. What happens?
+        answer: |
+          - Each commit carries `base_rev`. The first to arrive wins (rev 6); the second gets **409** because its base (5) is no longer current.
+          - The losing client **keeps both**: it saves its version as "file (Alice's conflicted copy 2026-10-15).docx" and syncs that as a new file. No silent overwrite, no automatic merge of binary files.
+          - Directory operations (rename vs edit, delete vs edit) need rules too: edit wins over delete (restore the file), and renames are tracked by `file_id`, not path.
+          - Real-time co-editing (Google Docs) is a different design: operational transform or CRDTs on a document model, not file sync.
+
+      - id: journal
+        q: How do devices stay in sync reliably, including ones offline for weeks?
+        answer: |
+          - Every namespace has an append-only **journal** with a monotonically increasing sequence. Devices store a cursor per namespace.
+          - Sync = "changes after my cursor", paginated; apply in order; advance the cursor only after applying.
+          - **Notifications are hints**: lost notifications only delay sync; the cursor guarantees completeness.
+          - Very old cursors (journal compacted): fall back to a full listing diff against the device's local state, then resume from the current seq.
+
+      - id: metadata-scale
+        q: How do you scale the metadata store to 23K commits/s with strong consistency?
+        answer: |
+          - **Shard by namespace** in a relational store (MySQL / Postgres via Vitess-style sharding) or a consensus-replicated store; each commit is a local transaction on one shard.
+          - Shared folders as separate namespaces avoid cross-user transactions; a user's view is a mount table of namespaces.
+          - Hot namespaces (a company-wide shared folder with millions of files and many writers) get their own shards; paginate huge directory listings.
+          - Cache read-heavy metadata (listings, permissions) with invalidation driven by the journal.
+
+      - id: large-files
+        q: How do you handle a 50 GB upload over a flaky connection?
+        answer: |
+          - Block-level upload is naturally **resumable**: blocks already uploaded are skipped on retry (the server reports missing hashes).
+          - Upload blocks in parallel (bounded concurrency), with retries and backoff per block.
+          - Commit only after all blocks are present, so other devices never see a partial file.
+          - Garbage-collect blocks from abandoned uploads (refcount 0 after a grace period).
+
+      - id: deletion
+        q: How do version history and deletion work with deduplicated blocks?
+        answer: |
+          - Versions are lists of block hashes; restoring a version is just a new commit pointing at old blocks.
+          - Deleting a file or expiring a version decrements block refcounts; blocks at refcount 0 are deleted by a **garbage collector** after a safety delay (protects against races with in-flight commits referencing the block).
+          - Trash retention (e.g. 30 days) before permanent deletion; legal holds override.
+          - Refcount drift is inevitable at this scale: run periodic mark-and-sweep audits.
+
+  - id: wrap-up
+    title: Wrap-up
+    min: 3
+    ask: |
+      - What breaks first at 10×?
+      - What do you monitor?
+      - What makes this a staff-level answer?
+    answer: |
+      **At 10×:** metadata shards with hot shared namespaces, notification fan-out to many devices, and storage cost. Split hot namespaces, tier cold blocks, tune erasure coding.
+
+      **Monitor:** commit latency and 409 rate, sync lag (change committed → applied on other devices), block upload / download errors, dedup ratio, GC backlog, durability audits (sampled block checksums).
+
+      **Staff-level signals**
+      - Separates metadata (small, strongly consistent, sharded by namespace) from content (huge, immutable, content-addressed).
+      - Uses a per-namespace journal and cursors so sync is correct even when notifications are lost.
+      - Handles conflicts explicitly with base revisions and conflicted copies.
+      - Knows content-defined chunking and the privacy cost of cross-user dedup.
+
+      **Common mistakes**
+      - Uploading whole files on every change.
+      - Last-writer-wins on file contents.
+      - Pushing file data through the notification channel.
+      - Storing file contents in the database.

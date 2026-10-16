@@ -1,0 +1,92 @@
+id: cdn-blob
+name: CDN & Object Storage
+signal: [images / video / file uploads, "users worldwide", "static assets or downloads", "large files through your API servers", "egress cost"]
+idea: >-
+  Never push large bytes through your application servers. Store blobs in object storage (S3, GCS) and keep only metadata in your database;
+  clients upload and download directly with presigned URLs, and a CDN serves the hot bytes from the edge.
+  The design questions are the upload path, cache keys and invalidation, and the cost of egress and storage tiers.
+
+diagram:
+  type: arch
+  caption: bytes skip the app servers in both directions
+  nodes:
+    client: {label: Client, at: [0, 1], kind: client}
+    api: {label: API server, at: [1, 0]}
+    db: {label: Metadata DB, at: [2, 0], kind: db}
+    s3: {label: Object store, sub: S3 · GCS, at: [2, 1], kind: db}
+    cdn: {label: CDN edge, at: [1, 2]}
+    worker: {label: Processor, sub: thumbs · scan, at: [3, 1]}
+  edges: [[client, api], [api, db], [client, s3], [client, cdn], [cdn, s3], [s3, worker], [worker, db]]
+  frames:
+    - title: Upload
+      flow: [[client, api, 1 request upload], [api, db, 2 pending row], [client, s3, 3 PUT presigned]]
+      hit: [s3]
+      win: [api]
+      note: "The API authorizes, records a `pending` row and returns a presigned PUT URL (short TTL, fixed key and size). The client uploads straight to the object store, in parts for big files."
+    - title: Process
+      flow: [[s3, worker, 4 on create], [worker, db, 5 mark ready]]
+      hit: [worker]
+      win: [db]
+      note: "A storage event triggers processing (virus scan, thumbnails, transcoding). Only then is the row marked `ready`; a sweeper deletes uploads that stayed `pending`."
+    - title: Download
+      flow: [[client, cdn, GET /img/ab12.jpg], [cdn, s3, miss → origin]]
+      hit: [cdn]
+      win: [s3]
+      note: "The CDN serves hits from the edge in tens of ms; misses go to origin once per edge (or once total, with an origin shield). Private files use signed CDN URLs or cookies."
+
+numbers:
+  - {k: S3 durability, v: "11 nines (designed)"}
+  - {k: Object store GET latency, v: "~10–100 ms first byte"}
+  - {k: CDN edge hit, v: "~10–30 ms from user"}
+  - {k: Multipart part size, v: "5 MB–5 GB; up to 10,000 parts"}
+  - {k: Good static hit ratio, v: "95–99%"}
+
+tables:
+  - title: Storage tiers (S3-style)
+    cols: [Tier, Access, Relative cost, Use for]
+    rows:
+      - ["**Standard**", "ms, no retrieval fee", "1× storage", "Hot and recent content"]
+      - ["**Infrequent access**", "ms, per-GB retrieval fee, 30-day minimum", "~0.5×", "Older content still served occasionally"]
+      - ["**Archive (Glacier class)**", "minutes to hours to restore", "~0.1× or less", "Compliance copies, raw originals, backups"]
+  - title: CDN models
+    cols: [Model, How, Good for, Watch out]
+    rows:
+      - ["**Pull**", "Edge fetches from origin on first miss, caches per headers", "Most sites; zero upfront work", "First-request latency; origin load on cold starts; invalidation by TTL or purge"]
+      - ["**Push**", "You upload content to the CDN ahead of demand", "Large files with predictable demand (game patches, releases)", "You manage what's stored; storage cost on the CDN"]
+      - ["**Origin shield**", "A mid-tier cache between edges and origin", "Many edges, expensive origin", "One more hop on misses; a regional single point to plan for"]
+
+pitfalls:
+  - "**Proxying uploads through the API.** Large bodies tie up workers and memory, and double your bandwidth. Use presigned URLs and multipart uploads directly to storage."
+  - "**Mutable URLs with long cache TTLs.** Overwriting `logo.png` leaves stale copies in browsers and edges for the TTL. Use content-hashed or versioned names (`logo.3f9c.png`) and `Cache-Control: immutable`."
+  - "**Per-user data in a shared cache key.** Caching a response that varies by cookie or auth without the right `Vary` / key leaks one user's data to another."
+  - "**Trusting the client's upload.** Validate size and content type in the presigned policy, scan for malware, and only mark `ready` after processing; never serve user uploads from your main domain (XSS via HTML/SVG)."
+  - "**Ignoring egress.** Bandwidth out of a cloud often costs more than storage or compute. CDNs, compression, right-sized images and video bitrates are cost decisions."
+
+depth:
+  - "**Metadata and blob consistency:** the two stores can't commit atomically. Use a state machine (`pending` → `ready`), events from storage, and a garbage collector for orphans in both directions."
+  - "**Deduplicate by content hash:** store blobs under their SHA-256 and reference-count them from metadata. Saves storage for repeated uploads; deletion becomes a refcount-to-zero GC."
+  - "**Hot objects and request rates:** object stores scale per key prefix (thousands of req/s per prefix); a single viral object is the CDN's job, never the origin's."
+  - "**Signed delivery for private content:** short-lived signed URLs or cookies at the CDN keep caching benefits while enforcing access; rotate signing keys."
+  - "**Lifecycle policies:** move objects to cheaper tiers by age and access, expire temporary uploads, and keep versioning + object lock where you need protection against deletion or ransomware."
+
+checks:
+  - q: A photo app's API servers run out of memory during peak upload hours. Users upload 10 MB photos. What do you change?
+    a: >-
+      Stop accepting the bytes in the API. The API authorizes and returns a presigned PUT (or multipart) URL scoped to one key, size and content type; the client uploads directly to object storage.
+      A storage event triggers thumbnailing and scanning, then the metadata row flips to `ready`. API servers now handle only small JSON requests.
+  - q: You deploy a new `app.js` but some users still get the old one for hours. Why, and what's the fix?
+    a: >-
+      The file is cached under the same URL by browsers and CDN edges until its TTL expires; purges are partial and slow.
+      Fingerprint asset names with a content hash (`app.8c1e.js`) and cache them `immutable` for a year; only the small HTML that references them gets a short TTL.
+  - q: A video site serves 2 PB a month. CDN egress costs ~$0.02/GB at that volume. What's the monthly egress bill, and what does a 98% vs 90% hit ratio mean for origin egress?
+    given: {pb: 2, price: 0.02}
+    calc:
+      - {name: gb, ask: Monthly GB served, unit: GB, expr: "pb * 1e6", show: "2M GB"}
+      - {ask: CDN egress bill per month, unit: "$", expr: "gb * price", show: "$40K"}
+      - {ask: "Origin egress at 98% hit", unit: GB, expr: "gb * 0.02", show: "40K GB"}
+      - {ask: "Origin egress at 90% hit", unit: GB, expr: "gb * 0.10", show: "200K GB"}
+    a: "Going from 90% to 98% hit ratio cuts origin traffic 5×. Origin egress is often priced higher than CDN egress, and origin servers must be sized for it."
+  - q: How do you let users download private files through a CDN without making them public?
+    a: >-
+      Serve them through the CDN with signed URLs or signed cookies: your API checks authorization and issues a URL with an expiry and a signature the edge verifies.
+      The bucket only accepts requests from the CDN (origin access control). Keep expiries short and avoid putting user identity in cache keys unnecessarily.

@@ -1,0 +1,44 @@
+# Cheat Sheet: one row per block and per case, plus numbers to know. Every id must exist in guide.yaml.
+blocks:
+  - {id: estimation, when: "any scale question; one box or many?", move: "QPS = daily ÷ 10⁵; size for peak; × replication × growth; end with \"so…\"", num: "1 day ≈ 10⁵ s"}
+  - {id: apis, when: "define the contract; server push; retries", move: "REST public, gRPC internal, SSE for push; cursor pagination; idempotency keys", num: "WebSocket: 100K–1M conns/server"}
+  - {id: load-balancing, when: "more than one server; deploys; slow nodes", move: "L4 balances connections, L7 balances requests; P2C / least-requests; outlier ejection", num: "L7 proxy ~10–50K req/s/core"}
+  - {id: caching, when: "read-heavy; hot keys; DB latency too high", move: "cache-aside; delete on write; TTL + jitter; coalesce misses; plan for a cold cache", num: "95% → 99% hit = 5× less DB load"}
+  - {id: cdn-blob, when: "files, media, global users, egress cost", move: "presigned direct upload; metadata in DB, bytes in object store; hashed URLs at the CDN", num: "edge hit ~10–30 ms"}
+  - {id: datastores, when: "\"which database?\"", move: "SQL by default; add a specialized store for a need SQL can't meet; one source of truth + CDC", num: "one PG primary ~10K writes/s"}
+  - {id: storage-engines, when: "slow query; write-heavy workload", move: "B-tree for mixed OLTP, LSM for write-heavy; composite index: equality then range", num: "Bloom 10 bits/key ≈ 1% FP"}
+  - {id: replication, when: "node loss, read scale, regions", move: "single-leader / multi-leader / leaderless; sync vs async = RPO vs latency", num: "W + R > N"}
+  - {id: partitioning, when: "data or writes beyond one machine", move: "key keeps queries local and spreads load; consistent hashing; split hot keys", num: "adding 1 of n nodes moves ~1/n"}
+  - {id: consistency, when: "money, uniqueness, stale or reordered reads", move: "weakest model each operation tolerates; enforce invariants at the write", num: "cross-region linearizable ≥ 1 RTT"}
+  - {id: queues, when: "async work, bursts, many consumers", move: "queue for jobs, log for streams; at-least-once + idempotent consumers; outbox", num: "partitions ≥ peak consumers"}
+  - {id: dist-transactions, when: "one action spans several services", move: "saga with compensations + idempotency keys; avoid 2PC across services", num: "irreversible steps last"}
+  - {id: consensus, when: "one leader, locks, critical metadata", move: "etcd / ZooKeeper lease + fencing token; 3 or 5 nodes", num: "majority = ⌊n/2⌋ + 1"}
+  - {id: rate-limits-ids, when: "quotas, abuse, IDs on many servers", move: "token bucket in Redis via Lua; Snowflake / UUIDv7 for IDs", num: "Snowflake 4,096 IDs/ms/worker"}
+  - {id: reliability, when: "slow or failing dependencies", move: "timeouts inside the budget, one retry + jitter, breakers, bulkheads, load shedding", num: "3 layers × 3 retries = 27×"}
+  - {id: observability, when: "\"how would you know it's broken?\"", move: "SLO burn-rate alerts; metrics → traces → logs; canary + feature flags", num: "99.9% = 43 min/month"}
+
+cases:
+  - {id: url-shortener, crux: "100:1 reads; generating short codes", key: "range leases + bijective scramble; cache-aside + CDN; 302 with async analytics"}
+  - {id: rate-limiter, crux: "accuracy vs a network hop on every request", key: "in-process limiter + Redis Lua token bucket; local leases for hot keys; fail open or closed per rule"}
+  - {id: kv-store, crux: "always writable with tunable consistency", key: "consistent hashing + N/W/R quorums; hinted handoff, read repair, Merkle anti-entropy"}
+  - {id: news-feed, crux: "extremely skewed follower counts", key: "hybrid fan-out (push normal, pull celebrities); feeds of IDs, hydrate at read"}
+  - {id: chat, crux: "order and delivery across flaky connections", key: "per-conversation seq + idempotent sends; cursor sync, live push is only a hint"}
+  - {id: notifications, crux: "urgent vs bulk; unreliable, rate-limited providers", key: "priority queues end to end; per-recipient dedup; provider breakers + failover"}
+  - {id: typeahead, crux: "< 50 ms on every keystroke", key: "precomputed top-K per prefix in RAM, full replicas; CDN + client cache for short prefixes"}
+  - {id: web-crawler, crux: "politeness at billions of URLs", key: "Mercator frontier, partition by host; URL / content / near-dup dedup; change-rate recrawl"}
+  - {id: video-streaming, crux: "PB/day storage, 100+ Tbps egress", key: "chunk-parallel transcode DAG; HLS/DASH with ABR; tiered CDN with ISP caches"}
+  - {id: file-sync, crux: "bandwidth, and never losing an edit", key: "content-addressed chunks; per-namespace journal + cursors; base_rev → conflicted copy"}
+  - {id: proximity, crux: "500K location writes/s, no double dispatch", key: "in-memory cell index (H3) per city; CAS + offer leases; history async to Kafka"}
+  - {id: ticket-booking, crux: "contention for a small inventory under a huge spike", key: "waiting room sets the admission rate; conditional update with expiry in the same query"}
+
+numbers:
+  - {k: 1 day, v: "86,400 s ≈ 10⁵ s · 1M/day ≈ 12/s"}
+  - {k: RAM / NVMe / HDD, v: "100 ns / ~100 µs / ~10 ms random read"}
+  - {k: RTT same AZ / cross-region, v: "~0.3 ms / 70–150 ms"}
+  - {k: Redis instance, v: "~100K ops/s"}
+  - {k: Postgres primary, v: "~10K writes/s; TBs fit"}
+  - {k: Kafka partition, v: "~10 MB/s+"}
+  - {k: NIC, v: "10–25 Gbit/s ≈ 1–3 GB/s"}
+  - {k: 99.9% / 99.99%, v: "43 min / 4.3 min per month"}
+  - {k: Powers, v: "2¹⁰ ≈ 10³ · 2³² ≈ 4.3B · 62⁷ ≈ 3.5T"}
+  - {k: Little's law, v: "in flight = rate × latency"}

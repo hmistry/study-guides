@@ -1,0 +1,189 @@
+id: proximity
+name: Ride Sharing / Proximity
+prompt: Design the core of a ride-hailing app like Uber. Drivers continuously report their location; a rider requests a ride and is matched with a nearby available driver within seconds; both then see each other move on the map.
+blocks: [partitioning, storage-engines, queues, consistency, apis, estimation]
+
+steps:
+  - id: requirements
+    title: Requirements
+    min: 5
+    ask: |
+      - Which flows are core?
+      - What latency and correctness matter most during matching?
+      - What scale of drivers, updates and requests?
+    answer: |
+      **Functional**
+      - Drivers go online / offline and send location updates every few seconds.
+      - A rider requests a ride (pickup, destination); the system finds nearby available drivers, offers the trip, and confirms a match.
+      - Live tracking for both parties; trip lifecycle (requested → matched → arrived → in trip → completed); ETA and price estimate.
+      - Out of scope: payments, ratings, surge pricing internals (mention where they plug in).
+
+      **Non-functional**
+      - **Match within a few seconds**; location updates visible within ~1–2 s.
+      - **Never assign one driver to two riders** at once; a lost trip request is a lost customer.
+      - High write throughput for locations; available per city even if another region is down.
+
+      **Scale (assumed)**
+      - 2M drivers online at peak, one location update every 4 s; 20M rides per day; peak requests 5× average.
+
+  - id: estimation
+    title: Estimation
+    min: 5
+    ask: |
+      2M online drivers updating every 4 s, ~100 bytes per update; 20M rides per day with peak = 5× average.
+    given: {drivers: "2e6", every: 4, bytes: 100, rides: "20e6", peak: 5}
+    calc:
+      - {ask: Location updates, unit: /s, expr: "drivers / every", show: "500K/s"}
+      - {ask: Live location state, unit: MB, expr: "drivers * bytes / 1e6", show: "200 MB"}
+      - {ask: Location history written per day, unit: TB, expr: "drivers / every * bytes * 86400 / 1e12", show: "≈ 4.3 TB"}
+      - {ask: Peak ride requests, unit: /s, expr: "rides / 86400 * peak", show: "≈ 1.2K/s"}
+    answer: |
+      - **500K writes/s of ephemeral data** but only **200 MB of live state**: keep current locations in memory (sharded by geography), and stream history to Kafka → cold storage asynchronously. Never write each update to a disk-based database synchronously.
+      - **~1.2K ride requests/s** at peak is small; the hard part is the geo query and the consistency of driver assignment, not throughput.
+
+  - id: api
+    title: API
+    min: 4
+    ask: Define the driver and rider interfaces, including live updates.
+    answer: |
+      ```
+      Driver (persistent connection, WebSocket or gRPC stream):
+        → location   { lat, lng, heading, speed, ts, status: available | on_trip }
+        ← offer      { ride_id, pickup, eta, expires_in: 15 }
+        → respond    { ride_id, accept | decline }
+
+      Rider:
+        POST /v1/rides   { pickup, dropoff, product }  Idempotency-Key: …   → 202 { ride_id }
+        GET  /v1/rides/{id}                            → state, driver, eta
+        stream /v1/rides/{id}/track                    ← driver location every ~2 s
+        POST /v1/rides/{id}/cancel
+      ```
+      - Location updates are fire-and-forget (the next one supersedes a lost one); offers and responses need acks and timeouts.
+
+  - id: data-model
+    title: Data model
+    min: 5
+    ask: |
+      - How do you store live locations so "drivers near X" is fast?
+      - What needs a durable, consistent store?
+    answer: |
+      ```
+      live index (in memory, per city shard)   cell_id (H3 / S2 / geohash) → set of available driver_ids
+                                               driver_id → {lat, lng, heading, status, cell, ts}   TTL ~30 s
+      trips (durable, transactional)           ride_id · rider · driver · state · pickup · dropoff
+                                               · timestamps · price                                 → sharded SQL
+      driver_state (authoritative status)      driver_id → available | offered(ride) | on_trip, version
+      location history                         Kafka → object storage / warehouse (analytics, ETA models)
+      ```
+      - The live index is **soft state**: it can be rebuilt from the next round of updates within seconds.
+      - Trips and driver assignment are **hard state**: they need transactions or compare-and-set.
+
+  - id: high-level
+    title: High-level design
+    min: 8
+    ask: Walk through a location update, a ride request with matching, and live tracking.
+    diagram:
+      type: arch
+      caption: soft state for locations, hard state for trips
+      nodes:
+        driver: {label: Driver app, at: [0, 0], kind: client}
+        rider: {label: Rider app, at: [0, 2], kind: client}
+        loc: {label: Location svc, sub: by city shard, at: [1, 0]}
+        geo: {label: Geo index, sub: H3 cells · RAM, at: [2, 0], kind: cache}
+        kafka: {label: History, sub: Kafka, at: [3, 0], kind: queue}
+        ride: {label: Ride service, at: [1, 2]}
+        match: {label: Matcher, sub: by city, at: [2, 1]}
+        trips: {label: Trips DB, sub: transactional, at: [2, 2], kind: db}
+      edges: [[driver, loc], [loc, geo], [loc, kafka], [rider, ride], [ride, match], [match, geo], [match, trips], [ride, trips], [match, driver]]
+      frames:
+        - title: Location
+          flow: [[driver, loc, every 4 s], [loc, geo, move cell], [loc, kafka, async]]
+          hit: [geo]
+          win: [loc]
+          note: "The location service updates the driver's cell in the in-memory index of the city shard and appends to Kafka for history. Nothing durable sits on this path."
+        - title: Match
+          flow: [[rider, ride, request], [ride, match, find driver], [match, geo, k nearest], [match, trips, CAS driver], [match, driver, offer]]
+          hit: [trips]
+          win: [ride, match, geo]
+          note: "The matcher queries rings of cells around the pickup, ranks candidates by road ETA, atomically marks the best driver as offered (compare-and-set), and sends the offer with a timeout. Decline or timeout → next candidate."
+        - title: Track
+          flow: [[driver, loc, location], [loc, geo, update], [ride, rider, position]]
+          hit: [rider]
+          win: [loc]
+          note: "During a trip the driver's updates are also published to the trip's channel; the rider's connection receives them every ~2 s (smoothed on the client)."
+    answer: |
+      - **Location path:** connection gateway → location service (sharded by city/region) → in-memory geo index; history to Kafka.
+      - **Matching:** ride service persists the request, the matcher queries nearby available drivers, ranks by ETA, reserves one driver atomically, sends an offer, and creates the trip on acceptance.
+      - **Tracking:** pub/sub per trip pushes driver positions to the rider.
+      - Soft state (locations) is fast and rebuildable; hard state (trips, assignments) is transactional.
+
+  - id: deep-dives
+    title: Deep dives
+    min: 15
+    ask: Pick 2–3. Answer each before revealing it.
+    items:
+      - id: geo-index
+        q: Geohash, quadtree, or H3/S2 cells? How does a "nearby" query work?
+        answer: |
+          | Index | How | Notes |
+          |---|---|---|
+          | Geohash | Base-32 string; shared prefix ≈ nearby | Simple, works in any KV with prefix scans; cells distort near the poles and neighbors across boundaries have different prefixes |
+          | Quadtree | Split a cell into 4 when it holds too many points | Adapts to density (Manhattan vs desert); in-memory, rebuild or rebalance as drivers move |
+          | H3 / S2 | Hierarchical hexagonal / spherical cells with neighbor functions | Uniform neighbors (hexagons), multiple resolutions; Uber built H3 for exactly this |
+
+          **Query:** compute the pickup's cell, search it plus k rings of neighbors, expand rings until enough candidates are found, then rank candidates by **road ETA**, not straight-line distance (a river or highway changes everything).
+
+      - id: double-dispatch
+        q: How do you guarantee a driver is never matched to two riders at once?
+        answer: |
+          - Make the driver's status the single point of truth with **compare-and-set**: `available(v7) → offered(ride 123, v8)` succeeds for exactly one matcher.
+          - Better: route all matching for a city (or cell group) to **one matcher owner** (partitioned by geography), so contention is local, and still use CAS as a safety net.
+          - Offers carry an expiry; if the driver doesn't accept in ~15 s, the status reverts to available (lease semantics).
+          - The trip is created in the same transaction as the acceptance, so a crash can't leave a driver "on trip" with no trip.
+
+      - id: matching
+        q: Is "assign the nearest driver" good enough? How would you improve matching?
+        answer: |
+          - Greedy nearest-first is fast but globally poor: it can take a driver that a different rider needed more.
+          - **Batched matching:** collect requests for ~1–2 s per area and solve an assignment problem (minimize total ETA), trading a little latency for better global outcomes.
+          - Consider the driver's heading, current trip ending soon (chained trips), and supply/demand balance (which feeds surge pricing).
+          - Keep a fast fallback (greedy) if the optimizer is slow, so matching latency stays bounded.
+
+      - id: hotspots
+        q: A stadium event ends and 50K riders request at once in a few cells. What breaks, and what do you do?
+        answer: |
+          - The matcher shard for that city and the few hot cells get hammered; geo queries return thousands of candidates.
+          - Split hot areas into finer cells and shard by **cell group, not by city**, for very large metros; cap candidates per query.
+          - Queue requests with fair ordering and tell riders their position; surge pricing and pickup zones shape demand.
+          - Pre-scale for known events (schedules are public).
+
+      - id: failure
+        q: A location-service shard crashes, losing its in-memory index. What happens?
+        answer: |
+          - Drivers in those cities briefly can't be matched. A replacement shard rebuilds the index from the **next round of updates** (every 4 s) or from a replica fed by the same stream; within ~10 s it's complete.
+          - Trip state is durable and unaffected; active trips continue (the apps keep their own state and reconnect).
+          - Run a hot standby per shard subscribed to the same update stream for faster failover; partition by city so a failure is local.
+
+  - id: wrap-up
+    title: Wrap-up
+    min: 3
+    ask: |
+      - What breaks first at 10×?
+      - What do you monitor?
+      - What makes this a staff-level answer?
+    answer: |
+      **At 10×:** location update ingestion (5M/s) and hot city shards. Reduce update frequency when idle, batch updates, split metros into cell-group shards.
+
+      **Monitor:** time to match (p50/p99), offer acceptance and timeout rates, unmatched requests, location update lag, ETA error, double-assignment detector (should be zero), per-city shard load.
+
+      **Staff-level signals**
+      - Separates soft, high-rate location state (memory, rebuildable) from hard trip state (transactional).
+      - Explains a cell-based geo index and ring expansion, ranked by road ETA.
+      - Prevents double-dispatch with ownership + CAS + offer leases.
+      - Talks about hotspots and batched matching as real-world concerns.
+
+      **Common mistakes**
+      - Writing every location update to a relational database.
+      - `SELECT … ORDER BY distance` over all drivers.
+      - Straight-line distance as the matching metric.
+      - No timeout on driver offers.

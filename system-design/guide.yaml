@@ -1,0 +1,33 @@
+# Catalog: every block and case in display order. A file in blocks/ or cases/ must have an entry here;
+# entries without a file show as "soon".
+blocks:
+  - {id: estimation, name: Estimation}
+  - {id: apis, name: APIs & Protocols}
+  - {id: load-balancing, name: Load Balancing & Gateways}
+  - {id: caching, name: Caching}
+  - {id: cdn-blob, name: CDN & Object Storage}
+  - {id: datastores, name: Choosing a Datastore}
+  - {id: storage-engines, name: Storage Engines & Indexes}
+  - {id: replication, name: Replication}
+  - {id: partitioning, name: Partitioning}
+  - {id: consistency, name: Consistency Models}
+  - {id: queues, name: Queues & Streams}
+  - {id: dist-transactions, name: Distributed Transactions}
+  - {id: consensus, name: Consensus & Coordination}
+  - {id: rate-limits-ids, name: Rate Limiting & Unique IDs}
+  - {id: reliability, name: Reliability Patterns}
+  - {id: observability, name: Observability & Ops}
+
+cases:
+  - {id: url-shortener, name: URL Shortener}
+  - {id: rate-limiter, name: Distributed Rate Limiter}
+  - {id: kv-store, name: Key-Value Store}
+  - {id: news-feed, name: News Feed}
+  - {id: chat, name: Chat / Messaging}
+  - {id: notifications, name: Notification System}
+  - {id: typeahead, name: Typeahead}
+  - {id: web-crawler, name: Web Crawler}
+  - {id: video-streaming, name: Video Streaming}
+  - {id: file-sync, name: File Sync}
+  - {id: proximity, name: Ride Sharing / Proximity}
+  - {id: ticket-booking, name: Ticket Booking}

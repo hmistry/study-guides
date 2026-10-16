@@ -1,0 +1,192 @@
+id: news-feed
+name: News Feed
+prompt: Design the home timeline of a social network like Twitter/X or Facebook. Users follow others and post; opening the app shows a ranked feed of recent posts from the people they follow.
+blocks: [caching, queues, partitioning, datastores, estimation, reliability]
+
+steps:
+  - id: requirements
+    title: Requirements
+    min: 5
+    ask: |
+      - Which features are core, and which are out?
+      - What latency and freshness do users expect?
+      - What does the follower distribution look like, and why does it matter?
+    answer: |
+      **Functional**
+      - Post (text + media references), follow / unfollow, view home feed (paginated), ranked by relevance with recency.
+      - Out of scope: search, DMs, ad serving (mention where ads would be blended in), media processing.
+
+      **Non-functional**
+      - Feed load p99 **< 200 ms**; feed is read far more than posts are written.
+      - Eventual consistency is fine: a new post can take a few seconds to appear in followers' feeds.
+      - Highly available reads: a stale feed beats an error.
+
+      **Scale (assumed)**
+      - 300M DAU, 10 feed loads per user per day, 0.5 posts per user per day, 200 followers on average, celebrities with up to 100M followers.
+
+      > The follower distribution is extremely skewed. Any design that treats a celebrity like an average user breaks.
+
+  - id: estimation
+    title: Estimation
+    min: 5
+    ask: |
+      300M DAU; 10 feed loads and 0.5 posts per user per day; 200 followers on average; keep the latest 500 post IDs (8 bytes each) per user's precomputed feed; peak = 3× average.
+    given: {dau: "300e6", loads: 10, posts: 0.5, followers: 200, feed_len: 500, id_bytes: 8, peak: 3}
+    calc:
+      - {ask: Peak feed reads, unit: /s, expr: "dau * loads / 86400 * peak", show: "≈ 100K/s"}
+      - {name: wps, ask: Average posts, unit: /s, expr: "dau * posts / 86400", show: "≈ 1.7K/s"}
+      - {ask: Fan-out writes if every post is pushed to every follower, unit: /s, expr: "wps * followers", show: "≈ 350K/s"}
+      - {ask: Memory for precomputed feeds (IDs only), unit: TB, expr: "dau * feed_len * id_bytes / 1e12", show: "1.2 TB"}
+    answer: |
+      - **100K feed reads/s at peak** must be cheap, so feeds should be precomputed rather than assembled from scratch on every read.
+      - **Fan-out on write turns 1.7K posts/s into ~350K feed inserts/s** on average. Manageable with a queue and workers, but a single 100M-follower post would be 100M inserts: the celebrity problem.
+      - **1.2 TB of feed IDs** fits a Redis cluster of ~20–30 nodes. Store only IDs in feeds and hydrate posts from a separate post cache.
+
+  - id: api
+    title: API
+    min: 4
+    ask: Define posting, following and reading the feed, including pagination.
+    answer: |
+      ```
+      POST /v1/posts                      { "text": "...", "media_ids": [...] }      → 201 { post_id }
+      POST /v1/users/{id}/follow          → 204          DELETE … /follow → 204
+      GET  /v1/feed?cursor=<opaque>&limit=20
+        → { "items": [ {post, author, counts, reason} ], "next_cursor": "..." }
+      ```
+      - **Cursor pagination**: the cursor encodes the last item's position (score and ID) in the user's feed snapshot, so new posts don't shift pages.
+      - Pull-to-refresh asks for items newer than the first one shown (`since` cursor).
+      - Posting returns immediately; fan-out happens asynchronously.
+
+  - id: data-model
+    title: Data model
+    min: 5
+    ask: |
+      - Where do posts, the follow graph and feeds live?
+      - What's the partition key for each?
+    answer: |
+      ```
+      posts        post_id (Snowflake, time-ordered) PK · author_id · text · media · created_at
+                   → sharded KV / wide-column, by post_id; plus a per-author timeline (author_id, post_id DESC)
+      follows      (follower_id → followee_id) and the reverse (followee_id → follower_id)
+                   → two tables, each partitioned by its first ID
+      feed cache   feed:{user_id} → sorted set of (score, post_id), capped at ~500–800
+                   → Redis cluster, by user_id
+      counts       likes / replies per post → counters, aggregated asynchronously
+      ```
+      - The **reverse follow table** (followee → followers) drives fan-out; the forward table drives "following" lists and pull merges.
+      - **Feeds hold IDs only.** Post content, author profiles and counts are hydrated from their own caches, so an edit or delete shows up everywhere.
+
+  - id: high-level
+    title: High-level design
+    min: 8
+    ask: Draw the write path (post → followers' feeds) and the read path, and show how celebrities differ.
+    diagram:
+      type: arch
+      caption: hybrid fan-out, push for most authors and pull for celebrities
+      nodes:
+        author: {label: Author, at: [0, 0], kind: client}
+        reader: {label: Reader, at: [0, 2], kind: client}
+        post: {label: Post service, at: [1, 0]}
+        kafka: {label: Post events, sub: Kafka, at: [2, 0], kind: queue}
+        fan: {label: Fan-out, sub: workers, at: [3, 0]}
+        graph: {label: Follow graph, at: [3, 1], kind: db}
+        feed: {label: Feed cache, sub: Redis · IDs, at: [2, 1], kind: cache}
+        fsvc: {label: Feed service, sub: merge · rank, at: [1, 2]}
+        pcache: {label: Post cache, sub: hydrate, at: [2, 2], kind: cache}
+      edges: [[author, post], [post, kafka], [kafka, fan], [fan, graph], [fan, feed], [reader, fsvc], [fsvc, feed], [fsvc, pcache]]
+      frames:
+        - title: Post
+          flow: [[author, post, POST], [post, kafka, event], [kafka, fan, consume], [fan, graph, followers], [fan, feed, ZADD × 200]]
+          hit: [feed]
+          win: [post, kafka, fan]
+          note: "The post is stored, then an event drives fan-out workers that page through the author's followers and insert the post ID into each active follower's feed."
+        - title: Read feed
+          flow: [[reader, fsvc, GET /feed], [fsvc, feed, top 800 IDs], [fsvc, pcache, multi-get]]
+          hit: [feed, pcache]
+          win: [fsvc]
+          note: "The feed service reads candidate IDs, merges in recent posts from followed celebrities, ranks, hydrates the top 20 with a batched multi-get, and returns a cursor."
+        - title: Celebrity post
+          flow: [[author, post, POST], [post, kafka, event], [kafka, fan, skip push]]
+          win: [post, kafka, fan]
+          note: "Authors above a follower threshold (e.g. 10K) aren't fanned out. Their posts sit in their author timeline, and each reader pulls them at read time from the few celebrities they follow."
+    answer: |
+      - **Write path:** post service → posts store → `post-created` event → fan-out workers → follower graph → feed cache (sorted sets of IDs).
+      - **Read path:** feed service → feed cache candidates + pulled celebrity posts → ranker → hydrate from post / user / counts caches → response.
+      - **Hybrid fan-out:** push for normal authors, pull for celebrities and for very inactive readers.
+      - Everything on the read path is cached; the source-of-truth stores only see misses and writes.
+
+  - id: deep-dives
+    title: Deep dives
+    min: 15
+    ask: Pick 2–3. Answer each before revealing it.
+    items:
+      - id: fanout
+        q: Compare fan-out on write, fan-out on read, and the hybrid. Where do you set the threshold?
+        answer: |
+          | Model | Read cost | Write cost | Problem |
+          |---|---|---|---|
+          | Push (on write) | One cache read | followers × inserts per post | Celebrities: 100M inserts per post; wasted work for inactive followers |
+          | Pull (on read) | Query every followee's recent posts, merge | One insert | Reads fan out to hundreds of timelines: slow and expensive at 100K reads/s |
+          | Hybrid | Cache read + merge a few celebrity timelines | Bounded by threshold | Two code paths to maintain |
+
+          **Threshold** by follower count (e.g. 10K–100K) or dynamically by measured fan-out cost. Also skip pushing to users inactive for > 30 days and rebuild their feed on their next login.
+
+      - id: ranking
+        q: How do you rank the feed within a 200 ms budget?
+        answer: |
+          - **Candidate generation:** ~500–1,000 IDs from the precomputed feed + pulled celebrity posts (+ recommendations / ads from other sources).
+          - **Lightweight scoring:** features (author affinity, recency, engagement so far, media type) fetched from a feature store; a small model scores all candidates in ~20–50 ms.
+          - **Heavy ranking** on the top ~100 with a larger model; then **policy rules**: diversity (not 5 posts from one author), freshness boosts, blocked/muted filters.
+          - Cache the ranked page per user for a short time so pagination is stable; re-rank on refresh.
+
+      - id: hydration
+        q: A feed page shows 20 posts with authors, counts and "liked by friends". How do you keep hydration fast?
+        answer: |
+          - **Batched multi-gets** against post, user and counter caches (one round trip each, in parallel), never per-item calls.
+          - **Counters** (likes, replies) come from a separate, eventually consistent counter service, cached with short TTLs; exact counts aren't needed.
+          - **Hot posts** (viral) are replicated in an in-process cache on feed servers to avoid hot keys in Redis.
+          - Partial failure: if counts time out, render without them rather than failing the page.
+
+      - id: consistency
+        q: A user deletes a post, or blocks someone. How do you keep feeds correct?
+        answer: |
+          - Feeds hold IDs, so **hydration filters** deleted posts (tombstoned in the post store) and blocked/muted authors at read time. That's immediate without touching millions of feeds.
+          - Asynchronously remove the ID from feeds (best effort) to reclaim space.
+          - Unfollow: filter at read time using the current follow set, then clean up lazily.
+          - Privacy changes (a protected account) are also enforced at hydration, never trusted to the precomputed feed.
+
+      - id: new-user
+        q: What about a brand-new user, or one returning after 6 months?
+        answer: |
+          - Their feed isn't precomputed (or was evicted). **Build on demand**: pull recent posts from their followees' author timelines (pull path), rank, and write the result into the feed cache.
+          - New users with few follows get **recommended content** (popular in their region / interests) blended in.
+          - Make the cold path fast enough (parallel timeline reads, limits per author) and protect it with concurrency limits so a wave of returning users can't overload storage.
+
+      - id: failure
+        q: The Redis feed cluster loses a shard. What happens to users on it?
+        answer: |
+          - Feeds are **derived data**: they can be rebuilt from posts + follow graph. Users on the lost shard fall back to the pull path (slower, still correct) while the shard is rebuilt.
+          - Protect storage from the fallback stampede: rate-limit rebuilds, serve a simpler "recent from followees" feed under load, use replicas so a single node loss is a failover, not a rebuild.
+
+  - id: wrap-up
+    title: Wrap-up
+    min: 3
+    ask: |
+      - What breaks first at 10×?
+      - What do you monitor?
+      - What makes this a staff-level answer?
+    answer: |
+      **At 10×:** fan-out write volume and feed-cache memory. Raise the push threshold, trim feed length, push only to active users, and move more authors to the pull path.
+
+      **Monitor:** feed p99 by stage (candidates, rank, hydrate), fan-out lag (post → visible in feeds), cache hit ratios, ranker timeouts, empty-feed rate.
+
+      **Staff-level signals**
+      - Starts from the skewed follower distribution and lands on hybrid fan-out with a stated threshold.
+      - Keeps feeds as ID lists and hydrates at read time, which solves deletes, edits and privacy.
+      - Splits the read path into a latency budget per stage, with graceful degradation.
+      - Treats the feed cache as rebuildable derived data.
+
+      **Common mistakes**
+      - Pure fan-out on write (celebrities) or pure fan-out on read (latency).
+      - Storing full post bodies in every follower's feed.
+      - Offset pagination on a feed that changes every second.

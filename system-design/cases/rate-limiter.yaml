@@ -1,0 +1,201 @@
+id: rate-limiter
+name: Distributed Rate Limiter
+prompt: Design a rate-limiting service used by an API gateway fleet to enforce per-API-key limits (for example 1,000 requests per minute) across hundreds of gateway servers and several regions.
+blocks: [rate-limits-ids, caching, partitioning, reliability, consistency, estimation]
+
+steps:
+  - id: requirements
+    title: Requirements
+    min: 5
+    ask: |
+      - What kinds of limits must be expressible (per key, per endpoint, per tier, several windows)?
+      - How accurate must limits be, and what added latency is acceptable?
+      - What happens when the limiter itself fails?
+    answer: |
+      **Functional**
+      - Limits per API key, optionally per endpoint and per tier (free / pro / enterprise); several windows at once (e.g. 20/s and 10K/day).
+      - Rules are configurable without deploys.
+      - Rejected requests get `429` with `Retry-After` and `RateLimit-*` headers.
+      - Out of scope: billing, abuse detection (it can consume our counters later).
+
+      **Non-functional**
+      - Adds **< 1–2 ms p99** to every request; it's on the hot path of all traffic.
+      - **Highly available**: limiter failure must not take down the API. Fail open for normal endpoints, closed for sensitive ones (login, OTP).
+      - **Accuracy** within a few percent is fine; brief over-admission is acceptable, sustained over-admission isn't.
+
+      **Scale (assumed)**
+      - 1M requests/s across the fleet, 10M active keys, 3 regions.
+
+      > The tension is accuracy vs latency: a perfectly shared counter needs a network round trip on every request.
+
+  - id: estimation
+    title: Estimation
+    min: 5
+    ask: |
+      Assume 1M requests/s, 10M active keys, ~100 bytes of state per key and rule, ~100K ops/s per Redis shard, and ~200 bytes per limiter round trip.
+    given: {qps: "1e6", keys: "10e6", state: 100, per_shard: "100e3", rt_bytes: 200}
+    calc:
+      - {ask: Counter memory, unit: GB, expr: "keys * state / 1e9", show: "1 GB"}
+      - {name: shards, ask: Redis shards at one op per request, unit: "", expr: "qps / per_shard", show: "10"}
+      - {ask: Limiter network traffic, unit: MB/s, expr: "qps * rt_bytes / 1e6", show: "200 MB/s"}
+    answer: |
+      - **Memory is tiny (1 GB)**: state fits in RAM many times over. The constraint is **operations per second**, not size.
+      - **~10 shards** at one op per request; plan ~20 for headroom and failover. Sharding by key spreads load evenly, except for very hot keys.
+      - **200 MB/s** of limiter traffic is fine, but the round trip itself costs latency. That's the main design pressure: avoid a remote call per request where accuracy allows.
+
+  - id: api
+    title: API
+    min: 4
+    ask: |
+      - What does the gateway call, and what does it get back?
+      - How are rules managed?
+      - What does the client see when limited?
+    answer: |
+      ```
+      Internal (gateway → limiter library / service):
+        check(key, rule_id, cost = 1)
+        → { allowed: bool, remaining: int, reset_ms: int, retry_after_ms: int }
+
+      Rules (admin API, versioned):
+        PUT /v1/rules/{rule_id}
+        { "match": {"tier": "free", "route": "/v1/search"},
+          "limits": [{"rate": 20, "per": "1s", "burst": 40}, {"rate": 10000, "per": "1d"}],
+          "on_failure": "open" }
+
+      Client-facing response when limited:
+        429 Too Many Requests
+        Retry-After: 3
+        RateLimit-Limit: 1000   RateLimit-Remaining: 0   RateLimit-Reset: 3
+      ```
+      - `cost` lets expensive endpoints consume more than one unit.
+      - Return remaining-quota headers on every response so well-behaved clients slow down before they're rejected.
+
+  - id: data-model
+    title: Data model
+    min: 5
+    ask: |
+      - Where do rules live, and how do gateways get them?
+      - What state does each counter keep, and where?
+    answer: |
+      **Rules:** a small config store (Postgres or etcd), versioned. Gateways load all rules into memory and receive pushes on change; the rules never sit on the request path.
+
+      **Counters (token bucket per key and rule):**
+      ```
+      key:   rl:{api_key}:{rule_id}          (hash tag {api_key} → one Redis slot per key)
+      value: tokens (float), last_refill_ms (int)
+      TTL:   ~2 × window, so idle keys expire on their own
+      ```
+      - Token bucket: 2 numbers per key, allows a configured burst, and refill is computed lazily on access, so there are no timers.
+      - For daily quotas, a fixed-window counter `rl:{key}:{rule}:{yyyymmdd}` with `INCRBY` and expiry is simpler and accurate enough.
+      - Sharding by `api_key` keeps all of a key's rules on one shard, so a multi-window check is one script call.
+
+  - id: high-level
+    title: High-level design
+    min: 8
+    ask: Draw the request path, rule distribution and the failure path.
+    diagram:
+      type: arch
+      caption: limiter as a library in the gateway, state in sharded Redis
+      nodes:
+        client: {label: Client, at: [0, 1], kind: client}
+        gw: {label: Gateway, sub: limiter lib, at: [1, 1]}
+        redis: {label: Redis cluster, sub: by api_key, at: [2, 0], kind: cache}
+        api: {label: Backend, at: [2, 2]}
+        rules: {label: Rules service, sub: push on change, at: [0, 0]}
+      edges: [[client, gw], [gw, redis], [gw, api], [rules, gw]]
+      frames:
+        - title: Check
+          flow: [[client, gw, request], [gw, redis, Lua take], [gw, api, allowed]]
+          hit: [api]
+          win: [redis, gw]
+          note: "The gateway matches rules in memory, then runs one Lua script on the key's shard that refills and takes tokens for every matching rule atomically. ~0.5 ms in the same AZ."
+        - title: Rules update
+          flow: [[rules, gw, new version]]
+          win: [rules, gw]
+          note: "Rules are pushed (or polled every few seconds) and swapped atomically in each gateway. Nothing on the request path waits for the rules service."
+        - title: Redis down
+          flow: [[client, gw, request], [gw, api, local limit]]
+          hit: [api]
+          win: [gw]
+          note: "The breaker to the shard opens. The gateway falls back to a local bucket with limit ÷ gateway count: approximate, but the API stays up. Login and OTP rules fail closed instead."
+    answer: |
+      - **Limiter as a library** inside each gateway, not a separate hop: rules are matched locally, and only the counter update goes to Redis.
+      - **Redis cluster sharded by API key**, one Lua script per request for atomic refill-and-take across all matching rules.
+      - **Rules service** pushes versioned rules; gateways keep the last good version if it's down (static stability).
+      - **Failure mode is a decision per rule:** fail open with local approximate limits, or fail closed.
+
+  - id: deep-dives
+    title: Deep dives
+    min: 15
+    ask: Pick 2–3. Answer each before revealing it.
+    items:
+      - id: algorithm
+        q: Which algorithm do you choose, and why not a fixed window?
+        answer: |
+          - **Fixed window** allows 2× the limit across a boundary (100 at 0:59 and 100 at 1:00). Fine for daily quotas, wrong for per-second protection.
+          - **Sliding window log** is exact but stores a timestamp per request: too much memory at 1M req/s.
+          - **Sliding window counter** blends the current and previous window weighted by overlap: 2 counters, error of a few percent. A good choice if you think in "N per window".
+          - **Token bucket** (pick): rate + burst stated explicitly, 2 numbers per key, lazy refill, and it maps directly to how customers think ("20/s, bursts up to 40").
+
+      - id: atomicity
+        q: Hundreds of gateways update the same key at once. How do you avoid races?
+        answer: |
+          - Never `GET` then `SET` from the gateway: concurrent requests all read the same token count and all pass.
+          - Run refill + check + decrement in **one Lua script** (atomic per shard), passing the current time from the gateway or using Redis `TIME`.
+          - Multi-rule checks (per-second and per-day) for one key live on one shard thanks to the `{api_key}` hash tag, so one script checks all of them and takes from none if any fails.
+          - Clock skew between gateways: let the script use the Redis server's clock, so refill math has one time source per key.
+
+      - id: latency
+        q: Even 0.5 ms per request matters at the edge. How do you cut the round trip without losing control?
+        answer: |
+          - **Local pre-allocation:** each gateway leases a small batch of tokens (e.g. 5% of the key's rate) from Redis and spends them locally, refilling asynchronously. Over-admission is bounded by outstanding leases.
+          - **Async sync of local counters:** count locally and push deltas every ~100 ms; reject locally once the last known global count plus local delta exceeds the limit. Small over-admission, no per-request hop.
+          - **Only hot keys need the precise path**; most keys are far below their limit, so a local check plus occasional sync suffices.
+          - Pipeline and colocate Redis in the same AZ as gateways; use connection pooling and avoid TLS handshakes per request.
+
+      - id: hot-keys
+        q: One enterprise customer sends 300K requests/s with a limit of 400K/s. One Redis shard handles ~100K ops/s. What now?
+        answer: |
+          - A single key can't be served by one shard. **Split the counter** into N sub-buckets (`key#0..7`), each with limit/N; a gateway picks a sub-bucket by its own ID. Slight unfairness between sub-buckets, but load spreads.
+          - Or use the **local pre-allocation** approach for this key: gateways lease large token batches, so Redis sees a few ops per second per gateway instead of every request.
+          - Detect hot keys automatically (top-K counting in gateways) and switch their strategy; don't configure it by hand.
+
+      - id: multi-region
+        q: Limits are global per key, but traffic arrives in 3 regions. How do you enforce them?
+        answer: |
+          - A single global counter adds a cross-region RTT (~70–150 ms) to every request: unacceptable.
+          - **Split the budget per region** (e.g. by recent traffic share) and enforce locally; rebalance shares every few seconds through a small global coordinator. Over-admission is bounded by the rebalance interval.
+          - Or **replicate counters asynchronously** (CRDT-style G-counters per region) and enforce on local count + last known remote counts; accept a few percent over-admission.
+          - Daily quotas are easier: sync usage every minute; nobody notices 0.1% overage on a daily limit.
+
+      - id: failure
+        q: What happens when Redis, or the whole limiter, fails?
+        answer: |
+          - **Per-rule failure policy:** fail open for ordinary API traffic (an outage of the limiter must not become an outage of the API) and fail closed for login, OTP and abuse-sensitive endpoints.
+          - **Degraded mode:** fall back to in-memory local buckets with limit ÷ number of gateways; approximate but protective.
+          - **Timeouts** of a few ms on the Redis call and a circuit breaker per shard, so a slow shard can't add latency to everything.
+          - Redis replicas with automatic failover; losing a few seconds of counter state only grants a brief extra allowance, which is acceptable.
+
+  - id: wrap-up
+    title: Wrap-up
+    min: 3
+    ask: |
+      - What breaks first at 10×?
+      - What do you monitor?
+      - What makes this a staff-level answer?
+    answer: |
+      **At 10× (10M req/s):** Redis ops per second. Local pre-allocation or delta sync becomes the default path rather than the exception; hot-key detection gets more important.
+
+      **Monitor:** limiter p99 latency, Redis ops and errors per shard, fail-open events, 429 rate per rule and tier, over-admission (sampled comparison with ground truth), rule propagation lag.
+
+      **Staff-level signals**
+      - States the accuracy vs latency trade-off up front and chooses per rule.
+      - Decides failure behavior explicitly (open vs closed) and designs a degraded mode.
+      - Handles hot keys and multi-region with bounded over-admission rather than global locks.
+      - Keeps rules off the hot path and the limiter in-process.
+
+      **Common mistakes**
+      - A separate limiter microservice hop on every request.
+      - Non-atomic read-modify-write counters.
+      - Per-server limits presented as global ones.
+      - Ignoring what happens when Redis is down.

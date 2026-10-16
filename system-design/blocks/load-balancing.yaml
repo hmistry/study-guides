@@ -1,0 +1,87 @@
+id: load-balancing
+name: Load Balancing & Gateways
+signal: [more than one server, "zero-downtime deploys", "\"how do clients find the service?\"", "auth / rate limits in front of many services", "uneven load or slow nodes"]
+idea: >-
+  A load balancer spreads requests over healthy instances and hides their failures; that is what makes stateless services horizontally scalable.
+  L4 balancers route connections (fast, protocol-agnostic); L7 balancers route requests (paths, headers, retries, TLS).
+  The choices that matter are the algorithm, how health is detected, where state lives, and what removes the balancer itself as a single point of failure.
+
+diagram:
+  type: arch
+  caption: from DNS to an instance
+  nodes:
+    client: {label: Client, at: [0, 1], kind: client}
+    dns: {label: DNS / GeoDNS, sub: anycast, at: [1, 0]}
+    l4: {label: L4 LB, sub: NLB · Maglev, at: [1, 1]}
+    l7: {label: L7 gateway, sub: Envoy · ALB, at: [2, 1]}
+    a: {label: Service A, sub: 3 instances, at: [3, 0]}
+    b: {label: Service B, sub: 3 instances, at: [3, 2]}
+    reg: {label: Registry, sub: health checks, at: [2, 2]}
+  edges: [[client, dns], [client, l4], [l4, l7], [l7, a], [l7, b], [reg, l7]]
+  frames:
+    - title: Request
+      flow: [[client, dns, resolve], [client, l4, TCP / QUIC], [l4, l7, conn], [l7, a, "/orders/*"]]
+      hit: [a]
+      win: [l4, l7]
+      note: "DNS picks the region, L4 spreads connections across gateway nodes, L7 terminates TLS and routes by path to an instance chosen by its algorithm."
+    - title: Failure
+      flow: [[reg, l7, A-2 unhealthy], [l7, a, skip A-2]]
+      win: [reg, l7]
+      hit: [a]
+      note: "Active health checks plus passive outlier detection (5xx, timeouts) eject a bad instance within seconds. In-flight requests on it fail and are retried elsewhere if idempotent."
+
+numbers:
+  - {k: L4 LB, v: "millions of conns/s; ~µs added latency"}
+  - {k: L7 proxy per core, v: "~10K–50K req/s"}
+  - {k: Health check interval, v: "~5–10 s; eject after 2–3 failures"}
+  - {k: DNS TTL for failover, v: "30–60 s (clients may ignore it)"}
+  - {k: Connection draining, v: "30–300 s on deploys"}
+
+tables:
+  - title: Algorithms
+    cols: [Algorithm, How, Good for, Watch out]
+    rows:
+      - ["**Round robin**", "Each instance in turn", "Uniform requests, uniform hosts", "Ignores load: a slow host keeps receiving its share"]
+      - ["**Least connections / requests**", "Pick the instance with fewest in flight", "Mixed request costs, long requests", "Needs shared state across LB nodes, or it's per node"]
+      - ["**Power of two choices**", "Sample 2 at random, take the less loaded", "Large fleets; near-optimal with little state", "Needs a load signal (in-flight count, latency)"]
+      - ["**Consistent / ring hash**", "Hash a key (user, session) onto a ring of instances", "Cache affinity, sticky sessions, sharded state", "Hot keys; reshuffles ~1/n on membership change"]
+      - ["**Weighted**", "Any of the above with weights", "Canaries, mixed hardware", "Weights drift from reality; prefer measured load"]
+  - title: L4 vs L7
+    cols: [Layer, Sees, Can do, Costs]
+    rows:
+      - ["**L4 (TCP/UDP)**", "IPs and ports", "Very fast; any protocol; preserves end-to-end TLS", "No path routing, retries or per-request balancing; long connections stick to one backend"]
+      - ["**L7 (HTTP/gRPC)**", "Methods, paths, headers, bodies", "TLS termination, routing, retries, rate limits, auth, observability, per-request balancing over HTTP/2", "More CPU and latency; it's in the request path for every feature you add"]
+
+pitfalls:
+  - "**Shallow health checks.** `/health` returning 200 while the DB pool is exhausted keeps a broken node in rotation. Check what the node needs (with timeouts), but don't make one dependency's outage fail every node's check, or the LB ejects the whole fleet."
+  - "**Long-lived connections defeat balancing.** gRPC over HTTP/2 or WebSockets pin to one backend; new instances get no traffic. Balance per request at L7, or cap connection age so clients reconnect."
+  - "**Sticky sessions as a crutch.** They make scale-in and failover lose state. Move session state to a shared store and keep instances stateless."
+  - "**Retry storms at the LB.** Retrying every failure at every layer multiplies load during an outage (3 layers × 3 retries = 27×). Retry once, at one layer, with a retry budget."
+  - "**The LB as a single point of failure.** Run it as a redundant pair or a fleet behind anycast/ECMP, across AZs; managed LBs do this for you."
+
+depth:
+  - "**Global traffic:** GeoDNS or anycast picks the nearest healthy region; within a region, L4 spreads to an L7 fleet. Failover by DNS is slow (TTL caching), anycast reroutes in seconds."
+  - "**Service mesh vs central gateway:** a gateway handles north–south (edge) concerns: auth, rate limits, routing. A sidecar mesh (Envoy) handles east–west: mTLS, retries, outlier detection per call. Both add hops; justify them by fleet size."
+  - "**Load shedding at the edge:** when overloaded, reject early (503 + `Retry-After`) by priority rather than queueing everything; a queue at 100% utilization just adds latency to requests that will time out anyway."
+  - "**Slow-start for new instances:** warm JIT and caches by ramping weight over ~30–60 s; otherwise new pods are hit with full traffic and fail health checks under load."
+  - "**Zero-downtime deploys:** readiness ≠ liveness. Mark not-ready, drain connections, then stop. Blue-green flips at the LB; canary shifts weight gradually and watches error rates."
+
+checks:
+  - q: After scaling a gRPC service from 4 to 8 instances, the new instances get almost no traffic. Why, and how do you fix it?
+    a: >-
+      gRPC multiplexes all calls over long-lived HTTP/2 connections, and an L4 balancer balances connections, not requests, so existing clients stay pinned to the old 4.
+      Fix: balance per request with an L7 proxy or client-side load balancing (look-aside / xDS), and cap max connection age so clients periodically reconnect and re-spread.
+  - q: One instance has a bad disk and answers in 2 s instead of 20 ms, but its health check passes. Round robin keeps sending it 1/n of traffic. What do you change?
+    a: >-
+      Use a load-aware algorithm (least requests or power of two choices) so slow instances naturally get less, and add passive outlier detection that ejects an instance on high latency or error rate.
+      Pair it with request timeouts and one retry, so the slow tail doesn't reach users.
+  - q: An L7 proxy core handles ~20K req/s. Peak is 300K req/s and you want to survive losing one of 3 AZs. How many proxy cores in total?
+    given: {peak: "300e3", per_core: "20e3", azs: 3}
+    calc:
+      - {name: base, ask: Cores to carry peak, unit: "", expr: "peak / per_core", show: "15"}
+      - {ask: Total cores so 2 of 3 AZs carry peak, unit: "", expr: "base * azs / (azs - 1)", show: "≈ 23"}
+    a: "Provision so any 2 AZs carry the full peak: 1.5× the base. Then add headroom for traffic growth and the retry surge that follows an AZ failure."
+  - q: When do you want consistent hashing at the load balancer instead of least-requests?
+    a: >-
+      When the backend holds per-key state that is expensive to rebuild: a local cache, a shard of in-memory data, a WebSocket session, a chat room's state.
+      Hashing the key keeps it on one instance, and membership changes only move ~1/n of keys. Watch for hot keys; use bounded-load consistent hashing to cap any instance's share.

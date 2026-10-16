@@ -1,0 +1,91 @@
+id: replication
+name: Replication
+signal: ["\"what if a node dies?\"", "read-heavy load beyond one machine", "users in several regions", "RPO / RTO targets", "stale reads after a write"]
+idea: >-
+  Keep copies of the same data on several nodes for availability, durability and read scale.
+  The core choice is who accepts writes (one leader, several leaders, or any replica with quorums) and when a write counts as done (synchronously on how many copies).
+  Every replication scheme trades write latency against the data you can lose and the staleness readers can see.
+
+diagram:
+  type: arch
+  caption: single-leader replication, with one synchronous follower
+  nodes:
+    client: {label: Client, at: [0, 1], kind: client}
+    leader: {label: Leader, sub: AZ a, at: [1, 1], kind: db}
+    f1: {label: Follower 1, sub: AZ b · sync, at: [2, 0], kind: db}
+    f2: {label: Follower 2, sub: AZ c · async, at: [2, 2], kind: db}
+    reader: {label: Reader, at: [3, 1], kind: client}
+  edges: [[client, leader], [leader, f1], [leader, f2], [reader, f1], [reader, f2]]
+  frames:
+    - title: Write
+      flow: [[client, leader, 1 write], [leader, f1, 2 sync], [leader, f2, async]]
+      hit: [leader, f1]
+      win: [f2]
+      note: "The leader acknowledges once the synchronous follower has the write (semi-sync), so a single node loss loses nothing. The async follower may lag by ms to seconds."
+    - title: Read
+      flow: [[reader, f2, read]]
+      hit: [f2]
+      note: "Reads from followers scale out but may be stale. A user who just wrote can miss their own write unless the read goes to the leader or to a follower that has caught up."
+    - title: Failover
+      flow: [[client, f1, writes]]
+      hit: [f1]
+      win: [f2]
+      note: "The leader dies. The sync follower is promoted (it has every acknowledged write); f2 re-points to it. Fencing must stop the old leader from accepting writes if it comes back."
+
+numbers:
+  - {k: Async lag (same region), v: "~ms; seconds under load"}
+  - {k: Cross-region lag, v: "≥ RTT (~70–150 ms) + apply time"}
+  - {k: Automated failover, v: "~10–60 s detection + promotion"}
+  - {k: Quorum example, v: "N = 3, W = 2, R = 2 → W + R > N"}
+  - {k: Typical replication factor, v: "3 (across 3 AZs)"}
+
+tables:
+  - title: Topologies
+    cols: [Topology, Writes go to, Strengths, Costs]
+    rows:
+      - ["**Single-leader**", "One leader per dataset (or per shard)", "Simple; no write conflicts; strong reads from the leader", "Leader is the write bottleneck; failover window; follower staleness"]
+      - ["**Multi-leader**", "A leader in each region / DC", "Local writes in every region; survives region partition", "Write conflicts must be resolved (LWW, CRDTs, app merge)"]
+      - ["**Leaderless (Dynamo)**", "Any W of N replicas", "No failover; tunable consistency; tolerates slow nodes", "Quorum math, read repair, hinted handoff, sloppy quorums; conflicts via versions"]
+      - ["**Consensus-based (Raft / Paxos)**", "The elected leader; commit on a majority", "Linearizable, automatic safe failover", "Majority round trip per write; minority side unavailable during a partition"]
+  - title: Synchronous vs asynchronous
+    cols: [Mode, Ack after, RPO on leader loss, Write latency]
+    rows:
+      - ["**Async**", "Leader's local commit", "Seconds of writes can be lost", "Lowest"]
+      - ["**Semi-sync**", "One follower has it", "Zero for single failures", "+1 RTT to the nearest follower"]
+      - ["**Sync to all**", "Every replica", "Zero", "Slowest replica's latency; any replica down blocks writes"]
+      - ["**Majority (quorum)**", "⌊N/2⌋ + 1 replicas", "Zero for minority failures", "Median replica latency"]
+
+pitfalls:
+  - "**Read-your-writes violations.** A user updates their profile, the next request reads a lagging follower, and the old value is back. Route that user's reads to the leader for a short window, or read from a replica at least as new as their last write position."
+  - "**Monotonic-read violations.** Successive reads hit different followers and data appears to go backwards. Pin a user to one replica (hash user → replica)."
+  - "**Split brain.** A partitioned old leader keeps accepting writes after a new one is elected. Use consensus-based election and fencing tokens / STONITH so only one leader can write."
+  - "**Async failover loses acknowledged writes.** Promoting a lagging follower silently discards the old leader's tail, and auto-increment IDs may be reused. Know your RPO and say it."
+  - "**Replicas as backups.** A bad `DELETE` replicates everywhere in milliseconds. You still need point-in-time backups."
+
+depth:
+  - "**Quorums aren't linearizable by themselves:** with W + R > N you can still see anomalies (sloppy quorums, concurrent writes, read repair races). Dynamo-style stores give eventual consistency with tunable staleness, not strong consistency."
+  - "**Conflict resolution in multi-leader:** last-writer-wins silently drops data under clock skew. Use version vectors to detect concurrency, CRDTs for mergeable types (counters, sets), or route each record to a home region to avoid conflicts entirely."
+  - "**Log shipping options:** physical WAL (exact, version-coupled), logical / row-based (portable, feeds CDC), statement-based (non-deterministic functions break it)."
+  - "**Lag is a capacity signal:** replicas that can't keep up during peaks will serve ever-staler reads. Alert on lag in seconds and in bytes, and shed read traffic from lagging replicas."
+  - "**Multi-region choices:** single write region + read replicas (simple, cross-region write latency for remote users), or partition data by home region (writes stay local), or a global consensus database (Spanner) that pays an RTT per commit."
+
+checks:
+  - q: "N = 5 replicas. You want writes to survive 2 node failures and reads to always overlap the latest write. Choose W and R."
+    given: {n: 5}
+    calc:
+      - {name: w, ask: "W: a majority, so writes survive 2 nodes down", unit: "", expr: "n // 2 + 1", show: "3"}
+      - {ask: Smallest R with W + R > N, unit: "", expr: "n - w + 1", show: "3"}
+    a: "W = 3, R = 3: both are majorities, so any read quorum overlaps any write quorum, and 2 nodes can be down. W = 5 / R = 1 would make every node failure block writes."
+  - q: A user changes their display name and immediately sees the old one. Reads go to async followers. Fix it without sending all reads to the leader.
+    a: >-
+      Give read-your-writes for the writer only: after a write, record the leader's log position (or a timestamp) in the session; route that user's reads to a replica that has applied at least that position, or to the leader for a few seconds.
+      Everyone else keeps reading from any follower.
+  - q: Your leader fails over to an async follower that was 2 seconds behind at 5K writes/s. What did you lose, and how do you prevent it?
+    given: {lag: 2, rate: 5000}
+    calc:
+      - {ask: Acknowledged writes lost, unit: "", expr: "lag * rate", show: "10K"}
+    a: "10K acknowledged writes vanish (and IDs may be reissued). Prevent with semi-sync or quorum commit for the promotion candidate, and only promote a replica that has every acknowledged write."
+  - q: When would you choose multi-leader replication, and what do you have to design for?
+    a: >-
+      When users in several regions must write with local latency and keep working through a region partition (e.g. collaborative apps, global user profiles).
+      You must design conflict handling: avoid conflicts by giving each record a home region, or detect them with version vectors and merge (CRDTs, app-specific rules). Never rely on wall-clock LWW for data you can't lose.

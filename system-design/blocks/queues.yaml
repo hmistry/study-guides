@@ -1,0 +1,93 @@
+id: queues
+name: Queues & Streams
+signal: ["work that can finish later (emails, encoding)", "traffic bursts the backend can't absorb", "one event, many consumers", "decouple services / teams", "\"exactly once\""]
+idea: >-
+  A queue decouples producers from consumers in time and rate: it absorbs bursts, retries failures and lets each side scale independently.
+  Message queues (SQS, RabbitMQ) hand each message to one worker and delete it on ack; logs (Kafka, Kinesis, Pulsar) keep an ordered, replayable stream that many consumer groups read at their own pace.
+  Delivery is at-least-once in practice, so consumers must be idempotent.
+
+diagram:
+  type: arch
+  caption: a partitioned log with two consumer groups
+  nodes:
+    p: {label: Producers, sub: key = order_id, at: [0, 1], kind: client}
+    log: {label: Topic, sub: 3 partitions, at: [1, 1], kind: queue}
+    g1: {label: Billing group, sub: 3 consumers, at: [2, 0]}
+    g2: {label: Analytics, sub: group of 1, at: [2, 2]}
+    dlq: {label: DLQ, sub: dead letters, at: [3, 0], kind: queue}
+    db: {label: Billing DB, at: [3, 1], kind: db}
+  edges: [[p, log], [log, g1], [log, g2], [g1, dlq], [g1, db]]
+  frames:
+    - title: Produce · consume
+      flow: [[p, log, append], [log, g1, own offsets], [log, g2, own offsets]]
+      hit: [log]
+      win: [g1, g2]
+      note: "Producers append; a key always lands in the same partition, so events for one order stay in order. Each group tracks its own offsets; partitions cap the parallelism within a group."
+    - title: Process · commit
+      flow: [[g1, db, 1 apply (idempotent)], [g1, log, 2 commit offset]]
+      hit: [db]
+      win: [g1]
+      note: "Apply the effect, then commit the offset. A crash in between replays the message, so the effect must be idempotent (dedup on event id or an upsert)."
+    - title: Poison message
+      flow: [[g1, dlq, N retries]]
+      hit: [dlq]
+      win: [g1]
+      note: "A message that always fails would block its partition forever. After bounded retries with backoff, park it in a dead-letter queue, alert, and move on."
+
+numbers:
+  - {k: Kafka partition throughput, v: "~10 MB/s+ write"}
+  - {k: Kafka end-to-end latency, v: "~5–50 ms"}
+  - {k: SQS standard, v: "near-unlimited TPS; at-least-once, best-effort order"}
+  - {k: SQS FIFO, v: "300 msg/s per group (3K batched); higher in high-throughput mode"}
+  - {k: Typical Kafka retention, v: "7 days (or compacted forever)"}
+
+tables:
+  - title: Queue vs log
+    cols: [Property, "Message queue (SQS, RabbitMQ)", "Log (Kafka, Kinesis, Pulsar)"]
+    rows:
+      - ["**Consumption**", "Competing consumers; a message goes to one worker", "Consumer groups; every group sees every message"]
+      - ["**After processing**", "Acked messages are deleted", "Retained by time or size; replayable"]
+      - ["**Ordering**", "None (standard) or per group (FIFO)", "Per partition, by key"]
+      - ["**Scaling consumers**", "Add workers freely", "Up to the partition count per group"]
+      - ["**Per-message control**", "Visibility timeouts, delays, per-message retry, DLQ", "Offset per partition; a stuck message blocks its partition"]
+      - ["**Best for**", "Task queues, jobs, uneven work items", "Event streams, CDC, fan-out to many systems, replay / backfill"]
+  - title: Delivery semantics
+    cols: [Semantic, How, Risk]
+    rows:
+      - ["**At-most-once**", "Commit before processing", "Crashes lose messages"]
+      - ["**At-least-once**", "Commit after processing", "Duplicates on retry: consumers must be idempotent"]
+      - ["**Effectively-once**", "At-least-once + idempotent writes, or transactional read-process-write (Kafka transactions)", "Only within the system's boundary; external side effects (email, payment API) still need dedup keys"]
+
+pitfalls:
+  - "**Believing in exactly-once delivery.** Networks make duplicates unavoidable. Build idempotent consumers: dedup table on event id, upserts, or conditional writes."
+  - "**Too few partitions.** Consumer parallelism is capped by partitions, and adding them later reshuffles key → partition (breaking per-key order). Size partitions for peak consumer count."
+  - "**Hot partition keys.** Keying by `customer_id` puts a whale customer's whole load on one partition and one consumer. Add a sub-key, or accept loss of strict per-customer order."
+  - "**No backpressure.** An unbounded queue hides an outage until it holds days of backlog and latency is hours. Alert on consumer lag in time, and shed or degrade at the producer."
+  - "**Long processing under a visibility timeout.** If work exceeds the timeout, the message reappears and two workers process it. Extend visibility (heartbeat) or keep tasks small."
+
+depth:
+  - "**Transactional outbox:** write business data and an `outbox` row in one DB transaction; a relay (or CDC) publishes outbox rows. This removes the dual-write gap between DB and broker."
+  - "**Ordering vs parallelism:** order is per partition, so pick the key that defines what must be ordered (an account, an order), nothing broader. Within a consumer, process keys in parallel but each key serially."
+  - "**Retry topology:** immediate retries for transient errors, delayed retry topics (1 min, 10 min, 1 h) for flaky dependencies, then DLQ. Never block the main partition while waiting."
+  - "**Log compaction:** keep only the latest value per key forever, making the topic a changelog you can rebuild state from (Kafka Streams state stores, CDC topics)."
+  - "**Queues as load levelers:** size consumers for average plus margin, not peak; the queue absorbs peaks. Lag SLOs (e.g. emails within 5 min) define how much backlog is acceptable."
+
+checks:
+  - q: An order service writes the order to Postgres, then publishes `OrderCreated` to Kafka. Occasionally the event is missing. Why, and how do you fix it?
+    a: >-
+      Dual write: a crash or broker error between the commit and the publish loses the event (or the reverse order publishes events for rolled-back orders).
+      Use a transactional outbox: insert the event into an outbox table in the same transaction as the order; a relay or CDC (Debezium) publishes it at least once; consumers dedupe by event id.
+  - q: A topic gets 120 MB/s at peak. One partition handles ~10 MB/s and one consumer processes ~4 MB/s. How many partitions?
+    given: {peak: 120, part: 10, consumer: 4}
+    calc:
+      - {ask: Partitions for broker throughput, unit: "", expr: "peak / part", show: "12"}
+      - {ask: Partitions so enough consumers can keep up, unit: "", expr: "peak / consumer", show: "30"}
+    a: "Consumers are the bottleneck: at least 30 partitions so 30 consumers can run in parallel. Round up with headroom (e.g. 48) since adding partitions later breaks key ordering."
+  - q: A payment-notification consumer sometimes sends the same email twice. The queue is at-least-once. Design the fix.
+    a: >-
+      Make the effect idempotent: before sending, insert `(event_id)` into a processed table with a unique constraint (or use the email provider's idempotency key); skip on conflict.
+      Do the insert and the send in an order that's safe on crash: record 'sending', send with an idempotency key, then mark 'sent', so a retry can't double-send.
+  - q: When would you use SQS instead of Kafka?
+    a: >-
+      For independent work items: each job goes to one worker, needs per-message retries, delays and DLQs, and you don't need replay or multiple consumer groups (e.g. image resizing, sending emails).
+      Kafka fits event streams consumed by several systems, ordered per key, with replay and long retention.

@@ -1,0 +1,90 @@
+id: consensus
+name: Consensus & Coordination
+signal: ["exactly one leader / scheduler / owner", "distributed lock", "cluster membership and configuration", "\"what if two nodes both think they're primary?\"", "strongly consistent metadata"]
+idea: >-
+  Consensus (Raft, Paxos, Zab) lets a group of nodes agree on an ordered log of decisions despite crashes, as long as a majority is up and talking.
+  You rarely implement it: you use a coordination service (etcd, ZooKeeper, Consul) or a database built on it for leader election, locks, membership and small critical metadata.
+  The hard part is not electing a leader but stopping the old one: leases and fencing tokens.
+
+diagram:
+  type: arch
+  caption: a lease-based leader and fencing tokens
+  nodes:
+    a: {label: Worker A, sub: old leader, at: [0, 0]}
+    b: {label: Worker B, sub: new leader, at: [0, 2]}
+    etcd: {label: etcd / ZK, sub: 3–5 nodes · Raft, at: [1, 1], kind: db}
+    store: {label: Storage, sub: checks token, at: [2, 1], kind: db}
+  edges: [[a, etcd], [b, etcd], [a, store], [b, store]]
+  frames:
+    - title: Acquire
+      flow: [[a, etcd, lease · token 33], [a, store, write (33)]]
+      hit: [a]
+      win: [etcd]
+      note: "A holds a lease (TTL ~10 s, renewed by heartbeats) and gets a monotonically increasing token, 33. Every write it makes carries the token."
+    - title: Pause · new leader
+      flow: [[b, etcd, lease · token 34], [b, store, write (34)]]
+      hit: [b]
+      win: [etcd]
+      note: "A stalls in a 30 s GC pause; its lease expires and B becomes leader with token 34. Storage now remembers 34 as the highest token seen."
+    - title: Fenced
+      flow: [[a, store, write (33) ✗]]
+      win: [store]
+      note: "A wakes up still believing it's leader and writes with 33. Storage rejects any token lower than one it has seen. Without fencing, both A and B would write: split brain."
+
+numbers:
+  - {k: Cluster size, v: "3 (tolerates 1) or 5 (tolerates 2)"}
+  - {k: Write latency, v: "1 majority RTT + fsync (~ms in one region)"}
+  - {k: etcd practical limits, v: "~10K writes/s; data ≤ ~8 GB"}
+  - {k: Election timeout, v: "~150–300 ms (Raft default range)"}
+  - {k: Typical lease TTL, v: "~5–30 s"}
+
+tables:
+  - title: Coordination primitives
+    cols: [Need, Primitive, Notes]
+    rows:
+      - ["**Leader election**", "Lease on a key (etcd lease, ZK ephemeral node)", "Leader must stop work when it can't renew; pair with fencing"]
+      - ["**Mutual exclusion**", "Lock = lease + fencing token", "Locks for correctness need fencing; locks for efficiency (avoid duplicate work) can be best-effort"]
+      - ["**Membership / discovery**", "Ephemeral registrations + watches", "Consul / ZK / etcd; or gossip (SWIM) for large, eventually consistent membership"]
+      - ["**Configuration**", "Versioned keys + watches", "Small data only; push changes to clients"]
+      - ["**Unique sequence / ID ranges**", "Atomic compare-and-set on a counter", "Lease ranges, not single IDs, to keep load low"]
+  - title: Locks you might be offered
+    cols: [Option, "Safe for correctness?", Why]
+    rows:
+      - ["**etcd / ZooKeeper lock + fencing**", "Yes", "Linearizable store, sessions, monotonic revision usable as a token"]
+      - ["**DB row lock / advisory lock**", "Yes, within that DB", "The DB is the authority; the lock dies with the session"]
+      - ["**Redis `SET NX PX` (single node)**", "Efficiency only", "Lost on failover with async replication; no fencing"]
+      - ["**Redlock (multi-node Redis)**", "Debated: not without fencing", "Relies on timing assumptions; pauses and clock jumps break it"]
+
+pitfalls:
+  - "**Locks without fencing.** A paused process (GC, VM migration, network) outlives its lease and keeps acting. Only the resource checking a token can make it safe."
+  - "**Even-sized clusters.** 4 nodes tolerate 1 failure, like 3, but need a larger majority. Use 3 or 5; 7+ only adds write latency."
+  - "**Using the coordination service as a database.** etcd and ZooKeeper are for small, critical metadata. Bulk data or high write rates destabilize the cluster everything else depends on."
+  - "**Stretching consensus across distant regions casually.** Every write pays a cross-region majority RTT, and a partition leaves the minority side read-only."
+  - "**Assuming clocks are synchronized.** Leases work on durations measured locally, not timestamps compared across machines; NTP jumps and pauses still need fencing."
+
+depth:
+  - "**Raft in a paragraph:** a leader appends entries and replicates them; an entry commits when a majority has it; elections use randomized timeouts and terms; a node votes only for candidates whose log is at least as up to date. Committed entries are never lost while a majority survives."
+  - "**FLP and the practical way out:** no deterministic algorithm guarantees consensus in a fully asynchronous system with one crash. Real systems use timeouts (partial synchrony): safety always holds, liveness needs the network to behave."
+  - "**Read paths:** linearizable reads need either a quorum read, a leader lease, or a read index round; follower reads are cheaper but may be stale."
+  - "**Sharded consensus:** large systems (Spanner, CockroachDB, TiKV) run thousands of small Raft groups, one per range, rather than one giant group."
+  - "**Avoid needing consensus:** single-writer designs (partition ownership), idempotent operations, and CRDTs often remove the need for coordination on the hot path, keeping it for rare control-plane decisions."
+
+checks:
+  - q: A cron-like scheduler runs on 3 nodes and must fire each job exactly once. How do you design it?
+    a: >-
+      Elect one active scheduler with a lease in etcd/ZooKeeper; the others stand by and watch the key. The leader fires jobs, recording each run with a unique `(job, scheduled_time)` key under a unique constraint, so a duplicate fire after a failover is rejected.
+      Workers execute idempotently. The lease plus the dedup key (a form of fencing) give effectively-once firing even if two leaders overlap briefly.
+  - q: A 5-node Raft cluster loses 2 nodes. Can it still accept writes? What about losing 3?
+    given: {n: 5}
+    calc:
+      - {ask: Majority size, unit: "", expr: "n // 2 + 1", show: "3"}
+      - {ask: Failures tolerated, unit: "", expr: "n - (n // 2 + 1)", show: "2"}
+    a: "With 2 down, 3 remain, still a majority: writes continue. With 3 down, the 2 survivors can't form a majority, so the cluster stops accepting writes (it stays safe, not available)."
+  - q: A team uses a Redis `SET NX` lock with a 10 s TTL to ensure only one worker updates a customer's balance. What can go wrong and what would you do?
+    a: >-
+      A worker pauses past the TTL, another acquires the lock, and both write: lost updates. Redis failover with async replication can also forget the lock.
+      For correctness, enforce it at the data: a conditional update (`WHERE version = ?`), a DB row lock, or a fencing token checked by the store. Keep the Redis lock only as an efficiency hint.
+  - q: Why do coordination services recommend 3 or 5 nodes, not 2 or 4?
+    a: >-
+      A cluster needs a strict majority. 2 nodes tolerate 0 failures (both needed); 4 tolerate 1, the same as 3, but every write waits for 3 acks instead of 2.
+      Odd sizes maximize failures tolerated per node; 5 is the usual choice when you must survive two failures or one failure during maintenance.

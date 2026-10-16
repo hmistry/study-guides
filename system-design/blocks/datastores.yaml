@@ -1,0 +1,62 @@
+id: datastores
+name: Choosing a Datastore
+signal: ["\"which database would you use?\"", "access pattern by key vs ad-hoc queries", "transactions across rows", "time-series / logs / events", "full-text search or graph traversal"]
+idea: >-
+  Start from the access patterns and the guarantees, not the brand: what are the queries, how much data, what consistency, which transactions.
+  A relational database is the right default until a specific need breaks it (write scale beyond one primary, a single huge access pattern, search, graph traversal).
+  Then add a specialized store for that need, and decide which one is the source of truth.
+
+numbers:
+  - {k: One Postgres / MySQL primary, v: "~10K writes/s; TBs comfortably"}
+  - {k: DynamoDB / Cassandra, v: "scale writes linearly by partition"}
+  - {k: Single-key KV read, v: "~1–10 ms (p99, managed)"}
+  - {k: Elasticsearch indexing lag, v: "~1 s refresh (near real-time)"}
+  - {k: Columnar scan, v: "GB/s per node; 10–100× compression"}
+
+tables:
+  - title: Store families
+    cols: [Family, Examples, Strong at, Weak at]
+    rows:
+      - ["**Relational**", "Postgres, MySQL, Aurora, Spanner", "Transactions, joins, constraints, ad-hoc queries, mature tooling", "Write scale past one primary without sharding (Spanner / CockroachDB trade latency for it)"]
+      - ["**Key-value**", "DynamoDB, Redis, RocksDB", "Predictable single-key latency at any scale", "Queries other than by key; multi-item transactions are limited"]
+      - ["**Wide-column (LSM)**", "Cassandra, ScyllaDB, Bigtable, HBase", "Very high write throughput, time-ordered rows within a partition, multi-DC", "Ad-hoc queries; you model one table per query; read-before-write is expensive"]
+      - ["**Document**", "MongoDB, Firestore", "Nested, evolving records read as a unit", "Cross-document joins and transactions (possible, but not the sweet spot)"]
+      - ["**Search**", "Elasticsearch, OpenSearch", "Full-text, relevance, faceting, fuzzy match", "Being a source of truth; strong consistency; heavy write churn"]
+      - ["**Columnar / OLAP**", "ClickHouse, BigQuery, Snowflake, Druid", "Aggregations over billions of rows", "Point lookups and frequent updates"]
+      - ["**Time-series**", "Prometheus, InfluxDB, TimescaleDB", "Append-mostly metrics, downsampling, retention", "General queries; high-cardinality labels"]
+      - ["**Graph**", "Neo4j, Neptune", "Multi-hop traversals (friends of friends, fraud rings)", "Scale-out and bulk analytics"]
+
+pitfalls:
+  - "**Choosing NoSQL for scale you don't have.** 3 TB and 5K writes/s fit one well-run Postgres with replicas. Say the numbers, then choose."
+  - "**Modeling a wide-column store like SQL.** In Cassandra/DynamoDB you design one table per query, partition key first. A query you didn't plan for becomes a full scan or a new table."
+  - "**Search index as the source of truth.** Elasticsearch can lose acknowledged writes in some failures and is eventually consistent. Keep truth in a database and rebuild the index from it."
+  - "**Dual writes.** Writing to the DB and then to the search index or cache from the app loses updates on crashes and reorders them under concurrency. Use the outbox pattern or CDC."
+  - "**Unbounded partitions.** A partition key like `user_id` for a chat log grows forever; one celebrity becomes a hot, giant partition. Bucket by time: `(user_id, month)`."
+
+depth:
+  - "**Polyglot persistence with one truth:** a relational or KV store owns each entity; search, cache, analytics and feeds are derived views fed by CDC (Debezium → Kafka). Derived stores can be rebuilt; the truth can't."
+  - "**NewSQL trade-off:** Spanner / CockroachDB give horizontally scaled serializable transactions at the cost of commit latency (consensus round trips, cross-region if replicas are global). Worth it when correctness across shards beats single-digit-ms writes."
+  - "**DynamoDB-style single-table design:** overload partition and sort keys to serve several access patterns from one table with GSIs. Powerful, but every new access pattern is a schema change."
+  - "**OLTP vs OLAP separation:** analytics queries on the primary hurt latency for users. Ship changes to a columnar warehouse and let it be minutes behind."
+  - "**Operational cost is a first-class criterion:** backups, schema migrations, upgrades, on-call expertise. A managed service you know beats a better-fit system nobody can run."
+
+checks:
+  - q: An e-commerce app needs orders, inventory and payments with strict correctness, plus product search with typo tolerance. Which stores?
+    a: >-
+      A relational database (Postgres / Aurora) as the source of truth for orders, inventory and payments: transactions and constraints matter most.
+      Elasticsearch for product search, fed by CDC from the product tables, accepting ~1 s staleness. Search results link back to IDs, and the checkout re-reads price and stock from the database.
+  - q: An IoT platform ingests 2M sensor readings per second, queried as "last 24 h for device X" and hourly aggregates. Which store, and what partition key?
+    given: {rate: "2e6", bytes: 100, day: 86400}
+    calc:
+      - {ask: Raw data per day, unit: TB, expr: "rate * bytes * day / 1e12", show: "≈ 17 TB"}
+    a: >-
+      Write-heavy, append-only, time-ordered, queried by device and time range: a wide-column/LSM store (Cassandra, ScyllaDB, Bigtable) or a time-series DB.
+      Partition by `(device_id, day)` with clustering by timestamp, so partitions stay bounded. Roll up into hourly aggregates with a stream job, and TTL raw data after N days.
+  - q: The team writes to Postgres and then to Elasticsearch in the same request handler. Search sometimes shows stale or missing products. Why, and the fix?
+    a: >-
+      Dual writes: a crash between the two writes, a failed index request, or two concurrent updates applied in different orders leave the index divergent, and nothing repairs it.
+      Use CDC (or a transactional outbox) so every committed change flows, in order, to an indexer that retries until applied. Add a periodic reconciliation job.
+  - q: When does a relational database stop being the right answer?
+    a: >-
+      When writes exceed what one primary can take and sharding by hand is worse than a distributed store; when one access pattern dominates at huge scale (single-key lookups, time-series appends);
+      when you need capabilities it lacks (relevance search, multi-hop graph, columnar scans); or when multi-region active-active writes are required.

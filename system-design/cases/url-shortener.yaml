@@ -1,0 +1,228 @@
+id: url-shortener
+name: URL Shortener
+prompt: Design a URL shortening service like bit.ly. Users submit a long URL and get a short link; anyone opening the short link is redirected to the original.
+blocks: [estimation, caching, rate-limits-ids, datastores, replication, queues]
+
+steps:
+  - id: requirements
+    title: Requirements
+    min: 5
+    ask: |
+      - Which features are in scope, and which do you explicitly cut?
+      - Which non-functional requirements matter most, and for which path (create vs redirect)?
+      - What scale do you assume? Say the numbers out loud.
+    answer: |
+      **Functional**
+      - Create a short link for a long URL; optional custom alias and expiry.
+      - Redirect `GET /{code}` → the long URL.
+      - Click analytics per link: in scope, but asynchronous (confirm with the interviewer).
+      - Out of scope: link editing, user management, a QR-code service.
+
+      **Non-functional**
+      - Redirects: **high availability (99.99%)** and **low latency** (p99 < 50 ms server-side). A broken redirect breaks someone else's page.
+      - Creates: can be slower and less available (99.9% is fine).
+      - Durability: links must never silently change target or disappear before they expire.
+      - Codes shouldn't be enumerable. Ask whether links are ever treated as private.
+
+      **Scale (assumed)**
+      - 100M new links / month, 10B redirects / month (100:1), links kept 5 years.
+
+      > The asymmetry is the whole design: redirects are 100× creates and are the latency- and availability-critical path.
+
+  - id: estimation
+    title: Estimation
+    min: 5
+    ask: |
+      Using the assumed scale (100M creates and 10B redirects a month, 500 B per link, 5 years, peak 5× average), work out each number below.
+      Then say what each one decides.
+    given: {creates: "100e6", redirects: "10e9", month: "30 * 86400", bytes: 500, years: 5, peak: 5, hot: "10e6"}
+    calc:
+      - {name: w, ask: Average create QPS, unit: /s, expr: "creates / month", show: "≈ 40/s"}
+      - {name: r, ask: Average redirect QPS, unit: /s, expr: "redirects / month", show: "≈ 4K/s"}
+      - {ask: Peak redirect QPS, unit: /s, expr: "r * peak", show: "≈ 20K/s"}
+      - {name: n, ask: Links created over 5 years, unit: "", expr: "creates * 12 * years", show: "6B"}
+      - {ask: Storage over 5 years (before replication), unit: TB, expr: "n * bytes / 1e12", show: "3 TB"}
+      - {ask: "Distinct 7-char base62 codes (62⁷)", unit: "", expr: "62 ** 7", show: "≈ 3.5T"}
+      - {ask: Cache for the 10M hottest links, unit: GB, expr: "hot * bytes / 1e9", show: "5 GB"}
+    answer: |
+      - **40 creates/s is trivial.** One primary handles 100× that, so don't shard for writes.
+      - **20K redirects/s at peak** is a modest read load, but it must be fast and highly available everywhere. Cache plus replicas.
+      - **3 TB (9 TB replicated)** fits a small cluster. Storage isn't the constraint.
+      - **7 base62 characters** give ~3.5T codes, ~600× more than 6B links. 6 characters (57B) would also fit, but a sparse space makes codes harder to guess.
+      - **The hot set fits in RAM:** 5 GB fits on one cache node, so replicate it for availability, not for size.
+
+  - id: api
+    title: API
+    min: 4
+    ask: |
+      - Define the create and redirect endpoints, with request, response and status codes.
+      - Which redirect status code do you return, and why?
+      - How does a client safely retry a create after a timeout?
+    answer: |
+      ```
+      POST /v1/links
+        Idempotency-Key: 7c1e…          (client-generated; retries return the same link)
+        { "long_url": "https://…", "alias": "optional", "expires_at": "optional" }
+      → 201 { "code": "aZ3kP9q", "short_url": "https://sho.rt/aZ3kP9q" }
+        409 alias taken · 400 invalid URL · 429 rate limited
+
+      GET /{code}
+      → 302 Location: <long_url>         404 unknown · 410 expired or removed
+
+      DELETE /v1/links/{code}            → 204
+      GET    /v1/links/{code}/stats?from=&to=
+      ```
+
+      | Status | Browser caches it? | Effect |
+      |---|---|---|
+      | 301 Moved Permanently | Yes, indefinitely | Fewest hits on you, but repeat clicks are invisible to analytics and you can't expire or retarget the link |
+      | 302 / 307 Found | Only if `Cache-Control` allows | Every click reaches you (or the CDN): analytics work, and links can expire |
+
+      Choose **302** with a short CDN `s-maxage`, since analytics and expiry are requirements.
+      Validate on create: http/https only, length ≤ 2 KB, and not your own domain (no redirect loops).
+
+  - id: data-model
+    title: Data model
+    min: 5
+    ask: |
+      - What's stored, and what's the access pattern?
+      - Which kind of datastore, and why? What's the partition key?
+      - Do you dedupe identical long URLs?
+    answer: |
+      ```
+      links
+        code        CHAR(7)    primary key
+        long_url    TEXT       ≤ 2 KB
+        owner_id    BIGINT     nullable
+        created_at  TIMESTAMP
+        expires_at  TIMESTAMP  nullable
+      ```
+      - **Access pattern:** almost every read is a single-key lookup by `code`. That suits a KV or wide-column store (DynamoDB, Cassandra) or a relational table with that PK.
+      - **Choice:** Postgres can hold 6B rows / 3 TB with partitioning, but a managed KV store gives horizontal scale and multi-region replication with less operational work. Either is defensible; say which and why.
+      - **Partition key = `code`**, uniform once codes are scrambled. Never partition by `created_at` (every write lands on the newest partition).
+      - **"My links":** a secondary index on `(owner_id, created_at)`, or a separate table.
+      - **Dedupe:** no by default. Global dedupe needs a unique index on `hash(long_url)` and merges different users' analytics and expiry. Offer per-user dedupe if asked.
+
+  - id: high-level
+    title: High-level design
+    min: 8
+    ask: |
+      Draw the components and walk through the redirect path and the create path.
+      Where do analytics events go?
+    diagram:
+      type: arch
+      caption: read path, write path and analytics kept apart
+      nodes:
+        client: {label: Client, at: [0, 2], kind: client}
+        edge: {label: CDN / LB, at: [1, 2]}
+        read: {label: Redirect svc, at: [2, 1]}
+        write: {label: Create svc, at: [2, 3]}
+        events: {label: Click log, sub: Kafka, at: [3, 0], kind: queue}
+        agg: {label: Aggregator, sub: → OLAP, at: [4, 0]}
+        cache: {label: Cache, sub: Redis, at: [3, 1], kind: cache}
+        db: {label: Link store, sub: KV · replicated, at: [4, 2], kind: db}
+        ids: {label: ID allocator, sub: range leases, at: [3, 3]}
+      edges: [[client, edge], [edge, read], [edge, write], [read, cache], [read, db], [read, events], [events, agg], [write, ids], [write, db]]
+      frames:
+        - title: Redirect
+          flow: [[client, edge, GET /aZ3k], [edge, read, edge miss], [read, cache, 1 get], [read, db, 2 on miss], [read, events, 3 click · async]]
+          hit: [cache]
+          win: [edge, read]
+          note: "The CDN answers repeat clicks within `s-maxage`. Otherwise the redirect service reads the cache (~99% hit), falls back to a replica, and returns 302. The click event is fire-and-forget."
+        - title: Create
+          flow: [[client, edge, POST], [edge, write], [write, ids, lease ids], [write, db, put-if-absent]]
+          hit: [db]
+          win: [write, ids]
+          note: "The create service takes the next ID from its locally leased range, scrambles it into a 7-char code, and does a conditional insert. It contacts the allocator only once per million links."
+        - title: Analytics
+          flow: [[read, events, click event], [events, agg, consume]]
+          hit: [agg]
+          win: [events]
+          note: "Click events never touch the link store. A stream job rolls them up per (code, minute) into an OLAP store for the stats API."
+    answer: |
+      - **Redirect path:** CDN/LB → stateless redirect service → Redis (cache-aside, TTL = min(1 day, time to expiry)) → link store replica on a miss → 302.
+      - **Create path:** create service → next ID from a locally leased range → scramble to a code → conditional insert → 201.
+      - **Analytics:** the redirect service emits a click event to Kafka without waiting; a stream aggregator writes rollups to an OLAP store.
+      - Each path scales and fails on its own: an analytics outage must never break redirects, and a create outage must never break redirects either.
+
+  - id: deep-dives
+    title: Deep dives
+    min: 15
+    ask: Pick 2–3 to go deep on; the interviewer will often choose. Answer each before revealing it.
+    items:
+      - id: codes
+        q: How do you generate short codes? Compare at least three approaches and pick one.
+        answer: |
+          | Approach | How | Problems |
+          |---|---|---|
+          | Hash the URL | base62(SHA-256(url) mod 62⁷) | Collisions need check + rehash with a salt; the same URL always gets the same code (implicit global dedupe) |
+          | Random | 7 random base62 chars + conditional insert | Retries grow with fill (birthday bound); fine here, since 6B / 3.5T ≈ 0.2% fill |
+          | Global counter | DB sequence → base62 | A single bottleneck and SPOF; sequential codes are enumerable and leak your volume |
+          | Range leases | each server leases 1M IDs from a coordinator (a DB row or ZooKeeper) and counts locally | A crash wastes part of a range (fine); IDs are still sequential within a range |
+
+          **Pick:** range leases + a **keyed bijective scramble** of the ID into the 62⁷ space (a small Feistel network, i.e. format-preserving encryption).
+          That means no collisions, no coordination on the hot path, and codes that don't reveal order.
+          **Random + conditional insert** is the simplest acceptable answer, as long as you can do its collision math.
+
+      - id: read-path
+        q: Redirects must be fast and available worldwide. Walk through the read path, including links that don't exist.
+        answer: |
+          - **Edge:** the CDN caches 302 responses with `s-maxage` of minutes. Purge on delete or expiry, or keep TTLs short enough not to need to.
+          - **Cache:** Redis cache-aside by `code`. The 5 GB hot set fits one node, so replicate per region for availability.
+          - **Unknown codes:** scanners probe random codes and every one misses. Cache "not found" for a few minutes, and/or keep a Bloom filter of existing codes in front of the store (a false positive only costs one DB read).
+          - **Store:** single-key lookup on a regional replica. A replica lagging behind a just-created link → retry the miss against the primary before returning 404.
+          - **Expiry:** check `expires_at` on read and return 410; the TTL never outlives the link.
+
+      - id: analytics
+        q: Product wants click counts per link, per country and per day. How do you add that without slowing redirects?
+        answer: |
+          - **Never write on the redirect path.** Buffer click events in-process and ship them to Kafka asynchronously: (code, ts, country, referrer, UA, event id).
+          - A **stream job** (Flink / Kafka Streams) aggregates per (code, minute, country) into an OLAP store (ClickHouse, Druid). The stats API queries rollups, never raw events.
+          - **Accuracy:** say which you want. At-least-once delivery + dedup by event id gives near-exact counts; accepting a little loss on crash is cheaper. Unique visitors → HyperLogLog.
+          - Filter bots before counting. This is also why the API step chose 302 over 301.
+
+      - id: aliases
+        q: Users can choose a custom alias. What changes?
+        answer: |
+          - Same table, same uniqueness: create with a **conditional insert** (`INSERT … ON CONFLICT DO NOTHING`, or DynamoDB `attribute_not_exists`); a conflict returns 409.
+          - **Namespace collisions:** a generated code can equal an alias someone already took. The conditional insert catches it; the generator retries with its next ID. Or require aliases of ≥ 8 characters so the spaces never overlap.
+          - A blocklist for reserved paths (`api`, `login`, `admin`) and abuse terms; per-user quotas.
+
+      - id: multi-region
+        q: Make it survive a full region outage, with users worldwide.
+        answer: |
+          - **Reads: active-active.** Every region has the redirect service, a cache and a store replica behind the CDN. Redirects don't depend on the primary.
+          - **Writes:** at 40/s, a single primary region with async replication is defensible. On failover, RPO = replication lag, and a just-created link can 404 elsewhere for a moment (mitigated by the retry-on-primary rule).
+          - **Or multi-region writes with no conflicts:** give each region its own ID ranges so generated codes can never collide; replicate with a global table (DynamoDB Global Tables, Cassandra multi-DC).
+          - Only custom aliases can conflict across regions. Route alias creation to one home region, or confirm with a read after the write.
+
+      - id: abuse
+        q: How do you prevent abuse (spam, malware, enumeration)?
+        answer: |
+          - Rate-limit creates per API key and IP (token bucket); bulk creation requires auth.
+          - Scan destination URLs asynchronously (Safe Browsing, internal lists). Flagged links get an interstitial or a 410, and the CDN entry is purged.
+          - Non-sequential codes (deep dive 1) prevent enumeration. But 7 base62 chars is ~42 bits: **a short link is not a secret**, so don't use one as an access token.
+
+  - id: wrap-up
+    title: Wrap-up
+    min: 3
+    ask: |
+      - What breaks first at 10× scale?
+      - What would you monitor?
+      - What makes this a staff-level answer rather than a senior one?
+    answer: |
+      **At 10×:** still not writes (400/s). The first limits are analytics volume (100B events/month), CDN egress cost, and cache memory if the hot set grows with the long tail.
+
+      **Monitor:** redirect p50/p99 per region, cache hit ratio, 404 rate (scanners), replica lag, ID-range lease failures, and analytics consumer lag.
+
+      **Staff-level signals**
+      - Leads with the read/write asymmetry from the numbers, and lets it drive every choice.
+      - Picks one ID scheme and defends it with collision and enumeration math.
+      - Keeps analytics off the hot path and states its accuracy contract.
+      - Names the failure modes (cache loss, region loss, a viral link) and the answer to each.
+
+      **Common mistakes**
+      - Sharding the write path that handles 40/s.
+      - MD5-and-truncate with no collision handling.
+      - Counting clicks synchronously in the link row (a hot row on viral links).
+      - 301 redirects plus "and we'll show analytics".

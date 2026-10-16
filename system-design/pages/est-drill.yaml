@@ -1,0 +1,68 @@
+# Estimation Drill: numeric problems in the same given / calc format as block checks; build.py verifies every `show`.
+problems:
+  - q: A microblogging service stores 400M new posts a day at ~300 bytes each (text + metadata), kept 5 years.
+    given: {per_day: "400e6", bytes: 300, years: 5}
+    calc:
+      - {name: gb, ask: New data per day, unit: GB, expr: "per_day * bytes / 1e9", show: "120 GB"}
+      - {ask: After 5 years (before replication), unit: TB, expr: "gb * 365 * years / 1000", show: "≈ 220 TB"}
+    a: "Text is cheap: a few hundred TB fits a modest cluster. Media, not text, will dominate storage."
+  - q: Users upload 100M photos a day, ~2 MB each after compression.
+    given: {uploads: "100e6", mb: 2}
+    calc:
+      - {name: tb, ask: New storage per day, unit: TB, expr: "uploads * mb * 1e6 / 1e12", show: "200 TB"}
+      - {ask: New storage per year, unit: PB, expr: "tb * 365 / 1000", show: "73 PB"}
+    a: "Tens of PB a year: object storage with lifecycle tiers, and thumbnails generated once at upload, not on read."
+  - q: An API serves 50K requests/s with an average response of 20 KB.
+    given: {qps: 50000, kb: 20}
+    calc:
+      - {name: gbs, ask: Egress, unit: GB/s, expr: "qps * kb * 1e3 / 1e9", show: "1 GB/s"}
+      - {ask: Egress in network units, unit: Gbps, expr: "gbs * 8", show: "8 Gbps"}
+    a: "8 Gbps fits a few NICs, but egress is billed: compress JSON (often 5–10×) and cache at the edge."
+  - q: Peak load is 300K requests/s. One server handles 2K requests/s, and you run servers at 60% of capacity to absorb failures and spikes.
+    given: {peak: "300e3", per: 2000, util: 0.6}
+    calc:
+      - {ask: Servers needed, unit: "", expr: "peak / (per * util)", show: "250"}
+    a: "Planning at 60% leaves room for losing an AZ and for retry surges. Running at 100% would need 150 servers and fall over on the first incident."
+  - q: A catalog has 1B items of ~1 KB each. The hottest 20% serve almost all reads. Cache nodes have 64 GB usable.
+    given: {items: "1e9", hot: 0.2, kb: 1, node: 64}
+    calc:
+      - {name: gb, ask: Hot working set, unit: GB, expr: "items * hot * kb * 1e3 / 1e9", show: "200 GB"}
+      - {ask: Cache nodes (no replicas), unit: "", expr: "gb / node", show: "≈ 3"}
+    a: "Round up to 4 for per-key overhead and fragmentation, then add a replica per shard for availability: ~8 nodes."
+  - q: A Kafka topic receives 200K events/s of ~1 KB, retained 7 days with replication factor 3.
+    given: {eps: "200e3", kb: 1, days: 7, rf: 3}
+    calc:
+      - {ask: Disk needed across the cluster, unit: TB, expr: "eps * kb * 1e3 * days * 86400 * rf / 1e12", show: "≈ 360 TB"}
+    a: "Retention is a storage decision: tiered storage (old segments in object storage) or shorter retention with an archive to the data lake."
+  - q: A request depends on 5 services in series, each 99.95% available. Separately, a component with 99% availability is run as two independent replicas, either of which can serve.
+    given: {a: 0.9995, n: 5, b: 0.99}
+    calc:
+      - {ask: Availability of the 5-service chain, unit: "%", expr: "a ** n * 100", show: "≈ 99.75%"}
+      - {ask: Availability of the replicated pair, unit: "%", expr: "(1 - (1 - b) ** 2) * 100", show: "≈ 99.99%"}
+    a: "Chains lose availability; redundancy gains it, but only if failures are independent (different AZs, no shared dependency)."
+  - q: An app runs 5K DB queries/s at 4 ms average each, across 10 app servers.
+    given: {qps: 5000, ms: 4, servers: 10}
+    calc:
+      - {name: conns, ask: Connections busy at once, unit: "", expr: "qps * ms / 1000", show: "20"}
+      - {ask: Per app server, unit: "", expr: "conns / servers", show: "2"}
+    a: "Little's law sizes pools: a pool of ~5–10 per server is plenty. Huge pools mostly add contention on the database."
+  - q: An LSM store absorbs 50K writes/s of 1 KB with a write amplification of ~10.
+    given: {wps: "50e3", kb: 1, wa: 10}
+    calc:
+      - {ask: Physical disk writes, unit: MB/s, expr: "wps * kb * 1e3 * wa / 1e6", show: "500 MB/s"}
+    a: "Compaction, not the user writes, dominates disk bandwidth and SSD wear. Budget for it when sizing disks."
+  - q: A page fans out to 50 backends in parallel; each responds slower than its p99 1% of the time.
+    given: {n: 50, p: 0.99}
+    calc:
+      - {ask: Requests that hit at least one slow backend, unit: "%", expr: "(1 - p ** n) * 100", show: "≈ 40%"}
+    a: "The backend p99 becomes the page's p60. Hedged requests, fewer fan-out hops, and partial results tame the tail."
+  - q: A failed node held 10 TB. Re-replication streams at 200 MB/s.
+    given: {tb: 10, mbps: 200}
+    calc:
+      - {ask: Time to restore full replication, unit: h, expr: "tb * 1e12 / (mbps * 1e6) / 3600", show: "≈ 14 h"}
+    a: "For 14 hours some data has one fewer copy. Smaller nodes, or many-to-many re-replication from all peers (vnodes), shrink this window."
+  - q: A Snowflake ID uses 41 bits for milliseconds since a custom epoch.
+    given: {bits: 41}
+    calc:
+      - {ask: Years until the timestamp overflows, unit: years, expr: "2 ** bits / 1000 / 86400 / 365", show: "≈ 70"}
+    a: "~70 years from the chosen epoch: pick a recent epoch, not 1970, or you've already used most of the range."

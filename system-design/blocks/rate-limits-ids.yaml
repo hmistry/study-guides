@@ -1,0 +1,86 @@
+id: rate-limits-ids
+name: Rate Limiting & Unique IDs
+signal: ["public API or login endpoint", "protect a backend from bursts or abuse", "per-user / per-tenant quotas", "IDs generated on many servers", "IDs that sort by time"]
+idea: >-
+  Two small building blocks that show up in almost every design.
+  Rate limiting decides how much each client may do per unit of time; the algorithm sets burst behavior, and the hard part is a shared, low-latency counter across many servers.
+  Unique IDs must be generated without coordination on the hot path; time-ordered IDs (Snowflake, UUIDv7) also keep B-tree inserts sequential and make IDs roughly sortable.
+
+diagram:
+  type: arch
+  caption: a token bucket shared through Redis
+  nodes:
+    client: {label: Client, sub: API key k, at: [0, 1], kind: client}
+    gw: {label: Gateway, sub: limiter, at: [1, 1]}
+    redis: {label: Redis, sub: "bucket:k", at: [2, 0], kind: cache}
+    api: {label: Service, at: [2, 2]}
+  edges: [[client, gw], [gw, redis], [gw, api]]
+  frames:
+    - title: Allowed
+      flow: [[client, gw, request], [gw, redis, take 1 (Lua)], [gw, api, forward]]
+      hit: [api]
+      win: [redis]
+      note: "One atomic script refills tokens for elapsed time (rate × Δt, capped at the burst size), takes one if available, and returns the remaining count."
+    - title: Limited
+      flow: [[client, gw, request], [gw, redis, empty], [gw, client, 429]]
+      win: [redis, gw]
+      note: "No token: reply `429 Too Many Requests` with `Retry-After`. The backend never sees the request."
+
+numbers:
+  - {k: Redis round trip, v: "~0.2–1 ms per check"}
+  - {k: Snowflake layout, v: "41 b ms time · 10 b worker · 12 b sequence"}
+  - {k: Snowflake per worker, v: "4,096 IDs per ms"}
+  - {k: 41-bit ms timestamp, v: "~69 years from the epoch"}
+  - {k: UUIDv4 collision, v: "negligible (122 random bits)"}
+
+tables:
+  - title: Rate-limit algorithms
+    cols: [Algorithm, How, Bursts, Memory / cost]
+    rows:
+      - ["**Token bucket**", "Tokens refill at rate r up to capacity b; each request takes one", "Allows bursts up to b, then r", "2 numbers per key; the common default (AWS, Stripe)"]
+      - ["**Leaky bucket**", "Requests queue and drain at a fixed rate", "Smooths output; no bursts", "A queue per key; adds latency"]
+      - ["**Fixed window**", "Count per calendar window (per minute)", "Up to 2× the limit across a window boundary", "1 counter; simplest"]
+      - ["**Sliding window log**", "Store every request timestamp; count those in the last window", "Exact", "O(requests) memory per key"]
+      - ["**Sliding window counter**", "Weighted blend of current and previous fixed windows", "Close to exact", "2 counters; good accuracy/cost trade-off"]
+  - title: ID schemes
+    cols: [Scheme, "Sortable by time?", Coordination, Notes]
+    rows:
+      - ["**DB auto-increment**", "Yes", "Single DB (or one per shard with offsets)", "Simple; leaks volume; a write bottleneck and SPOF at scale"]
+      - ["**UUIDv4**", "No", "None", "128 bits; random inserts fragment B-trees"]
+      - ["**UUIDv7 / ULID**", "Yes (ms)", "None", "128 bits, time prefix + random; index-friendly"]
+      - ["**Snowflake**", "Yes (ms)", "Worker ID assignment only", "64 bits fit a BIGINT; needs sane clocks"]
+      - ["**Range leases**", "Roughly", "Rare (one call per block)", "Compact sequential integers; a crash wastes part of a block"]
+
+pitfalls:
+  - "**Limiting per server instead of globally.** With 20 servers and a local limit of 100/s, a client gets 2,000/s. Share state (Redis) or divide the limit by the instance count and accept imprecision."
+  - "**Non-atomic read-then-write counters.** `GET` then `SET` lets concurrent requests all pass. Use `INCR` with expiry or a Lua script."
+  - "**The limiter as a single point of failure.** If Redis is down, decide in advance: fail open (availability) for general APIs, fail closed for login and abuse-sensitive endpoints."
+  - "**Keying by IP alone.** NAT and mobile carriers put thousands of users behind one IP, while attackers rotate IPs. Prefer API key / user id, with IP limits as a coarse outer layer."
+  - "**Clock rollback with Snowflake.** If the clock goes backwards, IDs can repeat. Refuse to issue (or wait) until time passes the last timestamp used."
+
+depth:
+  - "**Layered limits:** per-IP at the edge (cheap, coarse), per-user / per-key at the gateway (product quotas), per-dependency concurrency limits inside services (protect databases). Each answers a different threat."
+  - "**Approximate local + periodic sync:** for very high rates, each node keeps local counters and syncs deltas to a central store every ~100 ms; small over-admission traded for no per-request round trip."
+  - "**Adaptive concurrency limits:** instead of fixed rates, limit in-flight requests based on observed latency (TCP-Vegas-style, Netflix concurrency-limits). They protect a service whose capacity changes."
+  - "**Multi-region limits:** per-region budgets (global limit ÷ regions) with occasional rebalancing beat a single global counter with cross-region latency on every request."
+  - "**Worker IDs for Snowflake:** assign them via a coordination service with leases, or derive from a stable pod ordinal; two live workers with the same ID produce duplicates."
+
+checks:
+  - q: "An API allows 100 requests/minute per key with fixed windows. How many requests can a client make within ~1 second around a window boundary? How do you fix it?"
+    a: >-
+      Up to 200: 100 in the last second of one window and 100 in the first second of the next.
+      Use a sliding window counter (weight the previous window by its overlap) or a token bucket with rate 100/min and a chosen burst size, which states burst behavior explicitly.
+  - q: A Snowflake worker can issue 4,096 IDs per ms. How many IDs per second is that per worker, and with 1,024 workers?
+    given: {per_ms: 4096, workers: 1024}
+    calc:
+      - {name: per_s, ask: Per worker per second, unit: /s, expr: "per_ms * 1000", show: "≈ 4.1M/s"}
+      - {ask: Whole cluster per second, unit: /s, expr: "per_s * workers", show: "≈ 4.2B/s"}
+    a: "Throughput is never the limit; correctness is: unique worker IDs and a monotonic clock. A burst beyond 4,096 in one ms just waits for the next millisecond."
+  - q: The login endpoint must resist credential stuffing from a botnet using 50K IPs. What limits do you apply?
+    a: >-
+      Per-account failed-attempt limits (with exponential backoff or temporary lock and notification), per-IP and per-ASN/subnet limits at the edge, and global anomaly limits on failures per minute that trigger CAPTCHA or step-up auth.
+      The limiter fails closed for this endpoint. Track by username too, since the botnet spreads across IPs but targets the same accounts.
+  - q: Why do UUIDv4 primary keys slow inserts compared with UUIDv7?
+    a: >-
+      v4 is uniformly random, so each insert lands on a random leaf page of the B-tree: page splits, poor cache locality and write amplification as the index outgrows memory.
+      v7 starts with a millisecond timestamp, so new keys append near the right edge of the index; the hot pages stay in cache.

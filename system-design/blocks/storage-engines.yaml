@@ -1,0 +1,95 @@
+id: storage-engines
+name: Storage Engines & Indexes
+signal: ["write-heavy vs read-heavy workload", "\"why is this query slow?\"", "secondary lookups (by email, by status)", "time-ordered appends at high rate", "full-text search"]
+idea: >-
+  Every database sits on one of two engine families. B-trees update pages in place: fast, predictable reads, but random writes.
+  LSM trees append to memory and flush sorted files, then compact: very high write throughput, at the price of read and space amplification.
+  Indexes are copies of data sorted another way: each one speeds a query and slows every write.
+
+diagram:
+  type: arch
+  caption: an LSM write and read path (Cassandra, RocksDB, Bigtable)
+  nodes:
+    client: {label: Write / read, at: [0, 1], kind: client}
+    wal: {label: WAL, sub: append-only, at: [1, 0], kind: queue}
+    mem: {label: Memtable, sub: sorted · in RAM, at: [1, 1]}
+    bloom: {label: Bloom filters, sub: per SSTable, at: [1, 2]}
+    l0: {label: SSTables L0, sub: recent flushes, at: [2, 1], kind: db}
+    ln: {label: SSTables L1..n, sub: compacted, at: [3, 1], kind: db}
+  edges: [[client, wal], [client, mem], [mem, l0], [l0, ln], [client, bloom], [bloom, l0]]
+  frames:
+    - title: Write
+      flow: [[client, wal, 1 append], [client, mem, 2 insert]]
+      hit: [mem]
+      win: [wal]
+      note: "A write is a sequential log append plus an in-memory insert: no disk seeks, so writes are cheap. The WAL makes it durable."
+    - title: Flush · compact
+      flow: [[mem, l0, flush], [l0, ln, compact]]
+      win: [l0, ln]
+      note: "Full memtables flush to immutable sorted files. Compaction merges files, drops overwritten and deleted (tombstoned) keys and keeps read cost bounded, using background I/O."
+    - title: Read
+      flow: [[client, mem, 1 check], [client, bloom, "2 may contain?"], [bloom, l0, 3 read]]
+      hit: [l0]
+      win: [mem, bloom]
+      note: "A read checks the memtable, then newest to oldest SSTables. Bloom filters skip files that can't hold the key, so a point read is ~1 disk read; range scans touch every level."
+
+numbers:
+  - {k: B-tree depth, v: "3–4 levels for billions of rows"}
+  - {k: B-tree page, v: "4–16 KB (Postgres 8 KB)"}
+  - {k: LSM write amplification, v: "~10–30× (leveled)"}
+  - {k: Bloom filter, v: "~10 bits/key → ~1% false positives"}
+  - {k: Index size, v: "often 20–50% of table size, each"}
+
+tables:
+  - title: B-tree vs LSM
+    cols: [Property, "B-tree (Postgres, MySQL InnoDB)", "LSM (RocksDB, Cassandra)"]
+    rows:
+      - ["**Writes**", "Random page writes + WAL; page splits", "Sequential appends; high throughput"]
+      - ["**Point reads**", "One root-to-leaf path, very predictable", "Memtable + Bloom-filtered SSTables; slightly more variable"]
+      - ["**Range scans**", "Excellent: leaves are linked in order", "Merge across levels; fine but costlier"]
+      - ["**Amplification**", "Read amp low; write amp from full-page writes", "Write amp from compaction; space amp from old versions"]
+      - ["**Tail latency**", "Steady", "Compaction stalls can spike p99 if under-provisioned"]
+      - ["**Best for**", "OLTP with mixed reads and writes, transactions", "Write-heavy, time-series, append-mostly, huge datasets"]
+  - title: Index types
+    cols: [Index, Answers, Cost / caveat]
+    rows:
+      - ["**B-tree (default)**", "Equality, ranges, ORDER BY, prefix of a composite key", "Write cost per index; column order in composites matters"]
+      - ["**Composite `(a, b)`**", "`a = ?`, `a = ? AND b > ?`, sort by `a, b`", "Useless for `b = ?` alone (leftmost-prefix rule)"]
+      - ["**Covering / INCLUDE**", "Query served from the index alone (index-only scan)", "Bigger index; more write cost"]
+      - ["**Hash**", "Equality only", "No ranges or ordering"]
+      - ["**Inverted (GIN, Lucene)**", "Which documents contain term X; arrays, JSON keys", "Heavy to update; batched or near-real-time"]
+      - ["**Geospatial (R-tree, geohash, S2)**", "Points within a box or radius", "Choose cell sizes for your query radius"]
+      - ["**Partial**", "Only rows matching a predicate (`WHERE status = 'open'`)", "Query must match the predicate"]
+
+pitfalls:
+  - "**Indexing everything.** Each index is another write, more WAL and more cache pressure. Index for the queries you run; drop unused ones (check usage stats)."
+  - "**Wrong composite order.** `(created_at, user_id)` can't serve `WHERE user_id = ? ORDER BY created_at`; `(user_id, created_at)` can. Equality columns first, then the range or sort column."
+  - "**Low-selectivity indexes.** An index on a boolean or a 3-value status rarely helps; the planner scans anyway. Use a partial index on the rare value instead."
+  - "**Deletes in LSM stores.** Deletes write tombstones that live until compaction. Queue-like patterns (insert, read, delete) in Cassandra pile up tombstones and make reads slow or failing."
+  - "**Random UUIDv4 primary keys in B-trees.** Inserts land on random pages: page splits, cache misses, bloated indexes. Use time-ordered IDs (UUIDv7, Snowflake)."
+
+depth:
+  - "**Read / write / space amplification:** no engine minimizes all three (RUM conjecture). Leveled compaction favors reads and space; size-tiered favors writes. Choose by workload, and say so."
+  - "**Write-ahead log and checkpoints:** durability comes from fsyncing the WAL, not data pages. Group commit batches fsyncs; `synchronous_commit = off`-style settings trade the last few ms of writes for throughput."
+  - "**MVCC:** readers see a snapshot while writers create new versions. Old versions need cleanup (Postgres VACUUM, InnoDB purge); long-running transactions block it and cause bloat."
+  - "**Clustered vs heap tables:** InnoDB stores rows in the primary-key B-tree (secondary indexes point to the PK); Postgres uses a heap with indexes pointing to tuple locations. This shapes how PK choice affects every lookup."
+  - "**Search engines are inverted indexes plus segments:** Lucene writes immutable segments and merges them, LSM-style. That's why indexing is near-real-time (refresh interval) and why updates are delete + reinsert."
+
+checks:
+  - q: "A query `SELECT * FROM orders WHERE customer_id = ? AND status = 'open' ORDER BY created_at DESC LIMIT 20` is slow. What index?"
+    a: >-
+      `(customer_id, status, created_at DESC)`: equality columns first, then the sort column, so the database walks one index range in order and stops after 20 rows.
+      If open orders are rare, a partial index `(customer_id, created_at) WHERE status = 'open'` is smaller and faster. Add INCLUDE columns if you want an index-only scan.
+  - q: A logging service writes 500K events/s and rarely reads them, mostly by time range. B-tree or LSM, and why?
+    a: >-
+      LSM: writes become sequential appends and batched flushes, sustaining far more throughput than random B-tree page updates.
+      Reads by time range work well if the key is time-ordered within a partition (e.g. `(source, hour)` + timestamp). Use TTL-based expiry with time-window compaction so whole files drop instead of tombstoning rows.
+  - q: A Bloom filter uses 10 bits per key. An SSTable holds 50M keys. How much memory for its filter?
+    given: {keys: "50e6", bits: 10}
+    calc:
+      - {ask: Filter size, unit: MB, expr: "keys * bits / 8 / 1e6", show: "≈ 62 MB"}
+    a: "~1% false positives for ~62 MB. That's why filters for billions of keys are a real memory cost, and why some stores let you tune bits per key per table."
+  - q: Why do random UUIDv4 primary keys hurt insert performance in MySQL/InnoDB, and what do you use instead?
+    a: >-
+      InnoDB clusters rows by primary key, so random keys insert into random pages across the whole tree: constant page splits, poor cache locality, and a fragmented, larger index.
+      Time-ordered IDs (UUIDv7, Snowflake, ULID) append near the right edge of the tree, keeping inserts sequential and the working set small.
