@@ -1,0 +1,76 @@
+# Glossary: sorted A–Z on render. `see` must be a topic id (build-checked); no duplicate terms.
+terms:
+  - {term: ACCESS EXCLUSIVE lock, see: locking, def: "The table lock most ALTER TABLE, DROP, TRUNCATE and VACUUM FULL take. Conflicts with everything, even SELECT, and queued requests for it block later queries."}
+  - {term: Advisory lock, see: locking, def: "A lock on an arbitrary number, meaningful only to your app (`pg_try_advisory_xact_lock`). Use for “only one runner” jobs; the session variant leaks through transaction pooling."}
+  - {term: Anti-join, see: joins, def: "Rows of A with no match in B: `NOT EXISTS` or `LEFT JOIN … WHERE b.id IS NULL`. `NOT IN` breaks when B has NULLs."}
+  - {term: Autovacuum, see: mvcc-wal, def: "Background workers that vacuum and analyze tables once enough rows change. Defaults (20% dead) are too lazy for big tables; tune per table."}
+  - {term: Bitmap heap scan, see: query-planning, def: "Collects matching row locations from one or more indexes into a bitmap, then reads heap pages in physical order. Good for medium selectivity and AND / OR of indexes."}
+  - {term: BRIN index, see: indexes, def: "Stores min / max per block range: tiny, and effective only when the column follows physical order (append-only time series)."}
+  - {term: Checkpoint, see: mvcc-wal, def: "Flushes all dirty pages so crash recovery can start from that point. The first change to each page afterwards logs a full page image, so WAL spikes after checkpoints."}
+  - {term: Composite index, see: indexes, def: "An index on several columns. Serves queries on a leftmost prefix; put equality columns first, then one range or sort column."}
+  - {term: Covering index, see: indexes, def: "An index holding every column a query needs (`INCLUDE (…)`), enabling an index-only scan."}
+  - {term: CTE, see: subqueries, def: "A named subquery (`WITH x AS (…)`). Inlined since PG 12 unless MATERIALIZED, recursive, or referenced more than once."}
+  - {term: ctid, see: mvcc-wal, def: "A row version's physical address, (page, slot). Changes on every update; never use it as an identifier."}
+  - {term: Deadlock, see: locking, def: "Two transactions each waiting for a lock the other holds. Postgres detects it after `deadlock_timeout` and aborts one with 40P01."}
+  - {term: Deferrable constraint, see: constraints, def: "A UNIQUE, FK or EXCLUDE constraint checked at the end of the statement or at commit instead of per row. Enables swaps and circular references; can't arbitrate ON CONFLICT."}
+  - {term: DISTINCT ON, see: patterns, def: "Postgres-only: keep the first row per key according to ORDER BY. The idiomatic “latest row per user”."}
+  - {term: EXCLUDED, see: writes, def: "In `ON CONFLICT DO UPDATE`, the row that would have been inserted. The bare table name refers to the existing row."}
+  - {term: Exclusion constraint, see: constraints, def: "No two rows may satisfy a set of operator comparisons, such as same room and overlapping time range. A generalized UNIQUE, backed by GiST."}
+  - {term: Expand-contract, see: scaling, def: "Changing a schema in backward-compatible steps (add new, dual-write, backfill, switch reads, remove old) so rolling deploys never break."}
+  - {term: Extended statistics, see: query-planning, def: "`CREATE STATISTICS` on several columns (dependencies, ndistinct, mcv) so the planner stops assuming correlated columns are independent."}
+  - {term: Fan-out, see: joins, def: "Row multiplication when joining one-to-many relations. Inflates counts and sums; aggregate the many side before joining."}
+  - {term: FILTER clause, see: aggregation, def: "`count(*) FILTER (WHERE status = 'paid')`: a conditional aggregate, the clean way to pivot values into columns."}
+  - {term: Freezing, see: mvcc-wal, def: "Marking old row versions as visible to everyone so their 32-bit transaction ids can be reused. Prevents XID wraparound."}
+  - {term: Functional dependency, see: aggregation, def: "When grouping by a table's primary key, Postgres lets you select its other columns without grouping by them."}
+  - {term: Gaps and islands, see: patterns, def: "Finding runs of consecutive values: `value - row_number()` is constant within a run, so it works as a GROUP BY key."}
+  - {term: Generated column, see: schema-design, def: "A column computed from others (`GENERATED ALWAYS AS (…) STORED`), kept in sync by the database."}
+  - {term: Generic plan, see: query-planning, def: "A cached plan for a prepared statement that ignores parameter values. Postgres may switch to it after five executions; bad for skewed data."}
+  - {term: GIN index, see: indexes, def: "An inverted index: from each element (array item, JSON key, word, trigram) to the rows containing it. Powers `@>`, full-text and `LIKE '%x%'` with pg_trgm."}
+  - {term: GiST index, see: indexes, def: "A balanced tree for overlap, containment and nearest-neighbour queries: ranges, geometry, exclusion constraints."}
+  - {term: Hash join, see: query-planning, def: "Builds a hash table on the smaller input and probes it with the larger. Best for big equality joins; spills to disk when over work_mem."}
+  - {term: HOT update, see: mvcc-wal, def: "Heap-only tuple: an update that changes no indexed column and fits on the same page, so no index is touched. Lost when you index a hot column."}
+  - {term: Identity column, see: setup-ddl, def: "`GENERATED ALWAYS | BY DEFAULT AS IDENTITY`: the standard replacement for `serial`. ALWAYS rejects explicit values."}
+  - {term: Index-only scan, see: indexes, def: "Answers a query from the index alone, skipping heap pages the visibility map marks all-visible. Depends on vacuum keeping that map current."}
+  - {term: Keyset pagination, see: query-planning, def: "Paging by the last seen key (`WHERE (at, id) < ($at, $id) … LIMIT n`) instead of OFFSET: constant cost per page."}
+  - {term: LATERAL, see: subqueries, def: "Lets a FROM-subquery reference earlier tables, running it per row: the clean form of “top N for each”."}
+  - {term: Lock queue, see: locking, def: "Waiting lock requests line up; a queued strong lock (ALTER TABLE) blocks later weaker ones, so one waiting DDL can stall all traffic."}
+  - {term: Lost update, see: isolation, def: "Two read-modify-write cycles overlap and the second write overwrites the first. Allowed by Read Committed; prevent with atomic updates, locks or Repeatable Read."}
+  - {term: MERGE, see: writes, def: "SQL-standard statement (PG 15+) to insert, update or delete per match against a source. Not race-free against concurrent inserts, unlike ON CONFLICT."}
+  - {term: MVCC, see: mvcc-wal, def: "Multi-version concurrency control: writers create new row versions, readers pick versions by snapshot, so reads never block writes."}
+  - {term: Nested loop, see: query-planning, def: "For each outer row, look up matching inner rows. Ideal for few outer rows with an index; terrible when the outer estimate is far too low."}
+  - {term: NOT VALID, see: constraints, def: "Adds a CHECK or FK without checking existing rows (new writes are checked). `VALIDATE CONSTRAINT` later scans without blocking writes."}
+  - {term: NULLS NOT DISTINCT, see: constraints, def: "PG 15+ option making a UNIQUE constraint treat NULLs as equal, so only one NULL is allowed."}
+  - {term: Optimistic locking, see: locking, def: "Save with `WHERE version = $read_version` and bump the version; zero rows updated means someone else saved first. No lock held during user think time."}
+  - {term: Partial index, see: indexes, def: "An index over only the rows matching a WHERE clause. Small and selective; with UNIQUE it expresses rules like “one open cart per user”."}
+  - {term: Partition pruning, see: scaling, def: "Skipping partitions that can't match the query's partition-key conditions, at plan or execution time."}
+  - {term: PgBouncer, see: scaling, def: "A lightweight connection pooler. Transaction mode lets thousands of clients share a few server connections, at the cost of session state."}
+  - {term: Phantom read, see: isolation, def: "Re-running a query finds new rows another transaction inserted. Possible at Read Committed; not at Postgres's Repeatable Read."}
+  - {term: PITR, see: scaling, def: "Point-in-time recovery: restore a base backup and replay archived WAL up to a chosen moment."}
+  - {term: Read Committed, see: isolation, def: "Postgres's default level: each statement sees data committed before it started. Two statements in one transaction can disagree."}
+  - {term: Recursive CTE, see: recursive, def: "`WITH RECURSIVE`: an anchor plus a step that joins against the previous step's rows, repeated until a step returns nothing."}
+  - {term: Repeatable Read, see: isolation, def: "In Postgres, snapshot isolation: one snapshot per transaction, 40001 on write-write conflicts. Still allows write skew."}
+  - {term: Replica lag, see: scaling, def: "How far a standby's replayed state trails the primary. Causes stale reads; read-your-writes needs routing or LSN waits."}
+  - {term: Replication slot, see: mvcc-wal, def: "Makes the primary keep WAL (and old row versions for logical slots) until a consumer reads it. An abandoned slot fills the disk."}
+  - {term: ROLLUP, see: aggregation, def: "`GROUP BY ROLLUP (a, b)` adds subtotal and grand-total rows; `grouping()` tells them apart from real NULLs."}
+  - {term: Row-level security, see: schema-design, def: "Per-row policies (`CREATE POLICY … USING (tenant_id = …)`) enforced by the database; a safety net for multi-tenant tables."}
+  - {term: Sargable, see: query-planning, def: "A predicate an index can serve: the indexed column alone on one side (`created_at >= $1`), not wrapped in functions or casts."}
+  - {term: search_path, see: setup-ddl, def: "The list of schemas Postgres searches for unqualified table names, left to right."}
+  - {term: Semi-join, see: joins, def: "Rows of A with at least one match in B, each returned once: `EXISTS` or `IN`."}
+  - {term: Serializable (SSI), see: isolation, def: "Postgres's strongest level: tracks read-write dependencies and aborts one transaction (40001) when the outcome couldn't happen serially. Never blocks more; needs retries."}
+  - {term: Serialization failure, see: isolation, def: "SQLSTATE 40001: the transaction conflicted and must be retried from the start, reads included."}
+  - {term: Sessionization, see: patterns, def: "Splitting events into visits by inactivity gaps: flag rows where `at - lag(at)` exceeds the gap, then running-sum the flags."}
+  - {term: SKIP LOCKED, see: locking, def: "Makes `FOR UPDATE` skip rows other transactions have locked instead of waiting. The basis of queue tables in Postgres."}
+  - {term: Snapshot, see: isolation, def: "The set of transactions considered committed for a query or transaction; decides which row versions are visible."}
+  - {term: Three-valued logic, see: nulls-types, def: "Comparisons with NULL are unknown, not false; WHERE keeps only true rows. Use `IS NULL`, `IS DISTINCT FROM`."}
+  - {term: timestamptz, see: nulls-types, def: "An instant, stored as UTC and displayed in the session time zone. Converting it to a date or hour needs a zone."}
+  - {term: TOAST, see: schema-design, def: "Out-of-line, compressed storage for large values (over ~2 KB), fetched only when the column is read."}
+  - {term: Upsert, see: writes, def: "Insert-or-update in one atomic statement: `INSERT … ON CONFLICT (key) DO UPDATE`."}
+  - {term: UUIDv7, see: schema-design, def: "A time-ordered UUID (`uuidv7()` in PG 18): globally unique like v4 but B-tree friendly. Reveals creation time."}
+  - {term: VACUUM, see: mvcc-wal, def: "Removes dead row versions no snapshot can see, freezes old ones and updates the visibility map. Doesn't shrink files."}
+  - {term: Visibility map, see: mvcc-wal, def: "A per-table bitmap of pages whose rows are visible to everyone; lets index-only scans and vacuum skip pages."}
+  - {term: WAL, see: mvcc-wal, def: "Write-ahead log: every change is logged and flushed before commit returns. Drives crash recovery, replication and PITR."}
+  - {term: Window frame, see: windows, def: "The rows of the partition a window function sees for the current row. With ORDER BY the default is RANGE … CURRENT ROW, which includes ties."}
+  - {term: Window function, see: windows, def: "Computes over related rows without collapsing them: `rank()`, `lag()`, `sum() OVER (…)`."}
+  - {term: Write skew, see: isolation, def: "Two transactions read overlapping data, write different rows, and together break a rule. Allowed by snapshot isolation; stopped by Serializable or constraints."}
+  - {term: XID wraparound, see: mvcc-wal, def: "32-bit transaction ids eventually wrap. Unfrozen old rows would appear to be in the future, so Postgres forces vacuums and ultimately stops writes."}
+  - {term: xmin horizon, see: mvcc-wal, def: "The oldest transaction id any snapshot still needs. VACUUM can't remove versions newer than it; long transactions and slots hold it back."}

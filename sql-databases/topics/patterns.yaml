@@ -1,0 +1,192 @@
+id: patterns
+name: Classic Query Patterns
+signal: ["“top N per …”", "“latest / first … for each”", "streaks, consecutive days, “gaps”", "sessions, visits, activity bursts", "funnels, retention, medians"]
+idea: >-
+  A handful of shapes cover most interview queries, and nearly all of them are window functions plus one trick. Top-N per group ranks within a partition;
+  gaps and islands subtract a row number from a sequence to get a constant per run; sessionization flags “new session” rows with LAG and
+  numbers them with a running sum. Recognize the shape first, then write it.
+
+diagram:
+  type: table
+  partition: false
+  caption: "gaps and islands: one user's active days → runs of consecutive days"
+  cols: [day]
+  rows: [["2026-03-01"], ["2026-03-02"], ["2026-03-03"], ["2026-03-05"], ["2026-03-06"], ["2026-03-09"]]
+  frames:
+    - title: Active days
+      expr: "SELECT d FROM days ORDER BY d"
+      win: [0, 1, 2, 3, 4, 5]
+      note: "Find the runs of consecutive days: 1–3, 5–6, and 9 on its own."
+    - title: row_number()
+      expr: "row_number() OVER (ORDER BY d)"
+      col: rn
+      out: ["1", "2", "3", "4", "5", "6"]
+      win: [0, 1, 2, 3, 4, 5]
+      note: "Inside a run, the day and the row number both go up by exactly 1."
+    - title: day − row_number
+      expr: "d - row_number() OVER (ORDER BY d)::int AS island"
+      col: island
+      out: ["2026-02-28", "2026-02-28", "2026-02-28", "2026-03-01", "2026-03-01", "2026-03-03"]
+      win: [0, 1, 2]
+      note: "So their difference is constant within a run and jumps at every gap. It's a meaningless date, but a perfect group key."
+    - title: GROUP BY island
+      expr: "SELECT min(d), max(d), count(*) FROM … GROUP BY island"
+      col: run
+      out: ["Mar 1 → 3 (3 days)", "", "", "Mar 5 → 6 (2 days)", "", "Mar 9 (1 day)"]
+      win: [3, 4]
+      note: "Group by the key and take min, max and count. The same trick works on integer sequences (ids, ticket numbers) and with `dense_rank` when a day can repeat."
+
+tables:
+  - title: Pattern → technique
+    cols: [Pattern, Technique, Note]
+    rows:
+      - ["Top N per group", "`rank()` / `row_number() OVER (PARTITION BY g ORDER BY x DESC)`, then `WHERE r <= N` outside", "`rank` keeps ties; `LATERAL … LIMIT N` per group with an index"]
+      - ["Latest row per key", "`DISTINCT ON (key) … ORDER BY key, at DESC`", "Postgres-only; the ORDER BY must start with the DISTINCT ON keys"]
+      - ["Deduplicate, keep one", "`row_number() OVER (PARTITION BY dup_cols ORDER BY id)`, delete `rn > 1`", "Or `DELETE … USING` a self-join (see Writing Data)"]
+      - ["Gaps and islands", "`value - row_number()` as a group key", "Use `dense_rank` if values repeat"]
+      - ["Sessionization", "flag `at - lag(at) >= gap`, then running `sum(flag)` as session id", "First row's LAG is NULL: treat it as a new session"]
+      - ["Pivot", "`count(*) FILTER (WHERE col = 'x') AS x` per value", "Columns must be known when you write the query"]
+      - ["Funnel", "`count(DISTINCT user_id) FILTER (WHERE step = …)`", "For ordered funnels, compare each user's first time at each step"]
+      - ["Retention / cohorts", "cohort = `date_trunc('week', first_seen)`; activity week − cohort week; count distinct users", "Build per-user first_seen in a CTE first"]
+      - ["Median, percentiles", "`percentile_cont(0.5) WITHIN GROUP (ORDER BY x)`", "`percentile_disc` returns an actual value; both sort the whole group"]
+
+snippets:
+  - task: Latest row per key (DISTINCT ON)
+    sql: |
+      SELECT DISTINCT ON (user_id) user_id, type, at
+      FROM events
+      ORDER BY user_id, at DESC;
+    out:
+      cols: [user_id, type, at]
+      rows:
+        - [1, add_to_cart, "2026-03-12 11:40:00+00"]
+        - [2, checkout, "2026-03-10 08:04:00+00"]
+        - [3, checkout, "2026-03-20 09:29:00+00"]
+        - [5, checkout, "2026-04-05 07:49:00+00"]
+        - [8, view, "2026-03-15 11:30:00+00"]
+  - task: Gaps and islands
+    sql: |
+      WITH days(d) AS (
+        VALUES (date '2026-03-01'), ('2026-03-02'), ('2026-03-03'),
+               ('2026-03-05'), ('2026-03-06'), ('2026-03-09')
+      ), grouped AS (
+        SELECT d, d - (row_number() OVER (ORDER BY d))::int AS island
+        FROM days
+      )
+      SELECT min(d) AS first_day, max(d) AS last_day, count(*) AS days
+      FROM grouped
+      GROUP BY island
+      ORDER BY first_day;
+    out:
+      cols: [first_day, last_day, days]
+      rows:
+        - [2026-03-01, 2026-03-03, 3]
+        - [2026-03-05, 2026-03-06, 2]
+        - [2026-03-09, 2026-03-09, 1]
+  - task: Funnel counts
+    sql: |
+      SELECT count(DISTINCT user_id) FILTER (WHERE type = 'view')        AS viewed,
+             count(DISTINCT user_id) FILTER (WHERE type = 'add_to_cart') AS carted,
+             count(DISTINCT user_id) FILTER (WHERE type = 'checkout')    AS checked_out
+      FROM events;
+    out:
+      cols: [viewed, carted, checked_out]
+      rows: [[5, 4, 4]]
+  - task: Median vs mean
+    sql: |
+      SELECT dept,
+             percentile_cont(0.5) WITHIN GROUP (ORDER BY salary) AS median,
+             avg(salary)::int AS mean
+      FROM employees
+      GROUP BY dept
+      ORDER BY dept;
+    out:
+      cols: [dept, median, mean]
+      rows:
+        - [eng, 160000, 154000]
+        - [exec, 250000, 250000]
+        - [ops, 110000, 116667]
+        - [sales, 95000, 113333]
+
+pitfalls:
+  - "**ROW_NUMBER when ties matter.** “Top 2 earners” with `row_number` picks one of two people tied for second at random. Ask whether ties are in; use `rank` or `dense_rank` if so."
+  - "**Filtering the window in the same SELECT.** `WHERE rank() OVER (…) <= 2` is an error. Rank in a subquery or CTE, filter outside."
+  - "**Sessionizing without a partition.** LAG over all users compares one user's event with another's. `PARTITION BY user_id ORDER BY at`."
+  - "**Gaps and islands on timestamps.** Subtract row numbers from a **day** (or an integer), not a timestamp; and if a day can appear twice, deduplicate first or use `dense_rank`."
+  - "**DISTINCT ON without a full ORDER BY.** The row kept per key is whichever comes first in the ORDER BY; leave out the tiebreak and it's arbitrary."
+  - "**Percentiles on huge groups.** `percentile_cont` sorts every value in the group. For dashboards, use approximate sketches (t-digest extensions) or pre-aggregate."
+
+mysql:
+  - "No `DISTINCT ON`: use `ROW_NUMBER() … = 1` in a subquery."
+  - "No `percentile_cont`: compute a median with `ROW_NUMBER` and `COUNT` (middle row or average of the two middle rows)."
+  - "Date minus a number: `DATE_SUB(d, INTERVAL rn DAY)` for gaps and islands."
+
+problems:
+  - id: top-two-salaries
+    title: Top two salaries per department
+    variant: canonical
+    statement: >-
+      The two highest-paid employees in each department; if people tie, include everyone tied. Columns `dept`, `name`, `salary`,
+      ordered by department, then salary (highest first), then name.
+    hint: "Number within each department, but the numbering must give tied salaries the same number."
+    solution: |
+      SELECT dept, name, salary
+      FROM (
+        SELECT dept, name, salary,
+               rank() OVER (PARTITION BY dept
+                            ORDER BY salary DESC) AS r
+        FROM employees
+      ) ranked
+      WHERE r <= 2
+      ORDER BY dept, salary DESC, name;
+    expect:
+      cols: [dept, name, salary]
+      rows:
+        - [eng, Grace, 190000]
+        - [eng, Ken, 160000]
+        - [eng, Linus, 160000]
+        - [exec, Ada, 250000]
+        - [ops, Radia, 130000]
+        - [ops, Frances, 110000]
+        - [ops, Hedy, 110000]
+        - [sales, Margaret, 150000]
+        - [sales, Alan, 95000]
+        - [sales, Edsger, 95000]
+    insight: >-
+      `rank` keeps both people tied for second in every department; `row_number` would silently drop Ken or Linus. `dense_rank() <= 2` answers a different question,
+      the top two distinct salaries: if two people tied for first, it would also return the next salary down, while `rank` stops at the two. Say which one you're answering.
+    mysql: "Same query on 8.0."
+
+  - id: sessions-per-user
+    title: Visits per user
+    variant: disguise
+    statement: >-
+      Marketing wants the number of **visits** per user from `events`. A visit ends when the user is inactive for 30 minutes or more.
+      Columns `user_id`, `sessions`, ordered by `user_id`.
+    hint: "Mark each event that starts a new visit: compare it with the same user's previous event. Then count the marks."
+    solution: |
+      WITH marked AS (
+        SELECT user_id,
+               CASE WHEN at - lag(at) OVER w
+                         < interval '30 minutes'
+                    THEN 0 ELSE 1 END AS starts_session
+        FROM events
+        WINDOW w AS (PARTITION BY user_id ORDER BY at)
+      )
+      SELECT user_id, sum(starts_session) AS sessions
+      FROM marked
+      GROUP BY user_id
+      ORDER BY user_id;
+    expect:
+      cols: [user_id, sessions]
+      rows:
+        - [1, 3]
+        - [2, 2]
+        - [3, 2]
+        - [5, 3]
+        - [8, 2]
+    insight: >-
+      Sessionization. A user's first event has a NULL LAG, so the comparison is NULL and the CASE falls to ELSE: a new session, which is right.
+      Emma's 35-minute gap splits one evening into two visits; Hugo's 70-minute gap does the same. To label each event with its session,
+      take a running `sum(starts_session) OVER (PARTITION BY user_id ORDER BY at)` instead of the total.
+    mysql: "`TIMESTAMPDIFF(MINUTE, LAG(at) OVER w, at) < 30` instead of the interval comparison."

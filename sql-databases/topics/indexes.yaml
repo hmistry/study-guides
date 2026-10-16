@@ -1,0 +1,172 @@
+id: indexes
+name: Indexes
+signal: ["“this query is slow, why?”", "lookups by a non-key column (email, status, tenant)", "`ORDER BY … LIMIT` pagination", "rules like “one active X per Y”", "write throughput dropped after a release"]
+idea: >-
+  A B-tree index is a sorted copy of some columns plus a pointer to each row. It turns a scan into a log-depth descent
+  and returns rows in order, so `ORDER BY … LIMIT` can stop early. Column order decides which queries it serves: equality columns
+  first, then one range or sort column. Every index taxes every write and competes for cache, so each one has to earn its place.
+
+diagram:
+  type: plan
+  caption: "the same query on 10M orders under three indexes (illustrative EXPLAIN ANALYZE numbers)"
+  frames:
+    - title: No index
+      query: "SELECT * FROM orders WHERE user_id = 42 AND status = 'paid' ORDER BY created_at DESC LIMIT 20;"
+      plan:
+        - {op: Limit, est: 20, act: 20, ms: "1,840"}
+        - {d: 1, op: Sort, detail: "Sort Key: created_at DESC · top-N heapsort", est: "2,100", act: "1,950"}
+        - {d: 2, op: Seq Scan, on: orders, detail: "Filter: user_id = 42 AND status = 'paid' · Rows Removed by Filter: 9,998,050", est: "2,100", act: "1,950", mark: bad}
+      note: "Reads every page of the table to find 1,950 rows, then sorts them to keep 20. Cost grows with the table, not with the answer."
+    - title: Index on (user_id)
+      query: "CREATE INDEX ON orders (user_id);"
+      plan:
+        - {op: Limit, est: 20, act: 20, ms: "6.1"}
+        - {d: 1, op: Sort, detail: "Sort Key: created_at DESC · top-N heapsort", est: "2,100", act: "1,950"}
+        - {d: 2, op: Bitmap Heap Scan, on: orders, detail: "Filter: status = 'paid' · Rows Removed by Filter: 640 · Heap Blocks: 2,480", est: "2,100", act: "1,950", mark: bad}
+        - {d: 3, op: Bitmap Index Scan, on: orders_user_id_idx, detail: "Index Cond: user_id = 42", est: "2,600", act: "2,590"}
+      note: "Finds the user's 2.6K rows quickly, but still fetches every one from the heap (random I/O), filters status there, and sorts. Fine today, slow for heavy users."
+    - title: Index on (user_id, status, created_at)
+      query: "CREATE INDEX ON orders (user_id, status, created_at);"
+      plan:
+        - {op: Limit, est: 20, act: 20, ms: "0.09"}
+        - {d: 1, op: Index Scan Backward, on: orders_user_id_status_created_at_idx, detail: "Index Cond: user_id = 42 AND status = 'paid'", est: 20, act: 20, mark: good}
+      note: "Equality columns first, then the sort column: matching rows sit together in the index, already in order. The scan walks backwards for DESC and stops after 20 rows. No sort node, 20 heap fetches."
+
+numbers:
+  - {k: B-tree depth, v: "3–4 levels for 100M+ rows"}
+  - {k: Page size, v: "8 KB Postgres · 16 KB InnoDB"}
+  - {k: Seq vs random page cost, v: "1 vs 4 by default (set ~1.1 on SSD)"}
+  - {k: Index vs seq scan, v: "index wins below ~1–10% of rows, depending on correlation"}
+  - {k: Cost per index, v: "+1 write per INSERT and per non-HOT UPDATE"}
+
+tables:
+  - title: Postgres index types
+    cols: [Type, Serves, Use for, Watch out]
+    rows:
+      - ["**B-tree** (default)", "`= < > BETWEEN IN IS NULL`, ORDER BY, `LIKE 'abc%'`", "Almost everything; UNIQUE and PRIMARY KEY", "Column order; `LIKE` prefix needs C collation or `text_pattern_ops`"]
+      - ["**Hash**", "`=` only", "Very long keys where only equality matters", "No ranges, no ordering, can't be UNIQUE"]
+      - ["**GIN**", "Contains / overlaps: `@>`, `?`, `&&`, `@@`", "JSONB, arrays, full-text search, `pg_trgm` for `LIKE '%x%'`", "Slower writes (pending list), large"]
+      - ["**GiST**", "Overlap, containment, nearest neighbour (`<->`)", "Ranges, geometry (PostGIS), exclusion constraints", "Lossy: rows are rechecked"]
+      - ["**BRIN**", "Min / max per block range", "Huge append-only tables ordered by time", "Useless when physical order doesn't follow the column; ~0.1% the size of a B-tree"]
+  - title: Which index for this predicate?
+    cols: [Query shape, Index]
+    rows:
+      - ["`WHERE tenant_id = $1 AND created_at > $2 ORDER BY created_at`", "`(tenant_id, created_at)`: equality, then range and sort"]
+      - ["`WHERE lower(email) = $1`", "Expression index `(lower(email))`"]
+      - ["`WHERE status = 'pending'` (0.1% of rows)", "Partial: `(created_at) WHERE status = 'pending'`"]
+      - ["`SELECT qty FROM order_items WHERE product_id = $1`", "Covering: `(product_id) INCLUDE (qty)`, an index-only scan"]
+      - ["`WHERE doc @> '{\"plan\": \"pro\"}'`", "`GIN (doc jsonb_path_ops)`"]
+      - ["`WHERE name ILIKE '%ann%'`", "`GIN (name gin_trgm_ops)` with the pg_trgm extension"]
+      - ["`WHERE a = $1 OR b = $2`", "Separate indexes on `a` and `b` (BitmapOr), or rewrite as UNION"]
+
+snippets:
+  - task: Composite index serving filter + sort
+    sql: "CREATE INDEX orders_user_status_created_idx ON orders (user_id, status, created_at);"
+    note: "One index serves `user_id = ?`, `user_id = ? AND status = ?`, and either sort direction on `created_at` after both equalities. Mixed directions (`ORDER BY a ASC, b DESC`) need them declared in the index."
+  - task: Covering index (index-only scan)
+    sql: "CREATE INDEX order_items_product_idx ON order_items (product_id) INCLUDE (qty, unit_price);"
+    note: "INCLUDE columns are stored in the leaf pages but aren't part of the key: they can't be searched, only returned."
+  - task: Expression index on a timestamptz date
+    sql: "CREATE INDEX events_day_utc_idx ON events (((at AT TIME ZONE 'UTC')::date));"
+    note: "`(at::date)` is rejected: functions in an index expression must be IMMUTABLE, and casting a timestamptz to a date depends on the session time zone. Pin the zone. Queries must repeat the exact expression."
+  - task: Build without blocking writes
+    sql: "CREATE INDEX CONCURRENTLY orders_created_idx ON orders (created_at);"
+    tx: false
+    note: "Production default. Two table scans, slower, and can't run inside a transaction. On failure it leaves an INVALID index that still slows writes: drop it and retry."
+  - task: Find unused indexes
+    sql: |
+      SELECT relname AS table_name, indexrelname AS index_name, idx_scan,
+             pg_size_pretty(pg_relation_size(indexrelid)) AS size
+      FROM pg_stat_user_indexes
+      WHERE idx_scan = 0
+      ORDER BY pg_relation_size(indexrelid) DESC;
+    note: "Counters are per server since the last stats reset: check replicas too before dropping, and keep indexes that back UNIQUE constraints."
+
+pitfalls:
+  - "**Wrong column order.** `(created_at, user_id)` can't serve `WHERE user_id = ? ORDER BY created_at`. Equality columns first, then the range or sort column. A range condition ends the usable prefix: with `(a, b)` and `a > ?`, `b` is only a filter."
+  - "**Wrapping the column.** `lower(email) = …`, `created_at::date = …` and implicit casts (a text column compared to a number) skip a plain index. Rewrite as a half-open range (`created_at >= $d AND created_at < $d + 1`) or index the expression."
+  - "**Leading wildcards.** `LIKE '%foo'` can't use a B-tree at all, and `LIKE 'foo%'` uses one only with C collation or `text_pattern_ops`. Use a trigram GIN index for contains-search."
+  - "**Unindexed foreign keys.** Postgres indexes the referenced side (it's a PK) but not the referencing column. Deleting or updating a parent row then scans the child table under lock. Index `orders(user_id)`."
+  - "**Low-selectivity indexes.** An index on a boolean or a 3-value status is rarely used, and when it is, it's slower than scanning. A partial index on the rare value is smaller and actually helps."
+  - "**Plain CREATE INDEX on a live table** blocks all writes for the whole build. Use `CONCURRENTLY` and check `pg_index.indisvalid` afterwards."
+
+depth:
+  - "**Index-only scans depend on VACUUM.** The heap is skipped only for pages marked all-visible in the visibility map. On a heavily updated table EXPLAIN shows `Heap Fetches` in the thousands until autovacuum catches up. Covering indexes pay off on tables that are vacuumed often."
+  - "**Indexes kill HOT updates.** An UPDATE that changes no indexed column can be HOT (heap-only tuple): no index writes at all, if the page has room (`fillfactor`). Index a hot column like `last_seen_at` and every update now writes every index and bloats them."
+  - "**Correlation decides index vs seq scan.** The planner prices heap fetches by how closely physical row order follows index order (`pg_stats.correlation`). `created_at` on append-only data range-scans cheaply; random UUIDv4 keys scatter. BRIN exploits correlation at a fraction of the size."
+  - "**One composite beats several singles.** Postgres can combine single-column indexes with BitmapAnd, but that loses ordering, fetches more, and costs more writes. Build composites for the hot queries and keep singles for ad-hoc filters."
+  - "**Unique indexes are integrity tools.** UNIQUE constraints are unique B-trees, and partial or expression unique indexes express rules constraints can't: one open cart per user, case-insensitive emails, one primary address per customer."
+  - "**Maintenance.** B-trees on increasing keys stay compact; random or heavily updated keys bloat. PG 13+ deduplicates repeated keys; `REINDEX CONCURRENTLY` (PG 12+) rebuilds without blocking writes."
+
+mysql:
+  - "InnoDB tables are clustered on the primary key. Secondary indexes store the PK value, not a row pointer, so a wide PK bloats every index, and a secondary lookup is two B-tree descents."
+  - "No partial indexes. Functional indexes exist since 8.0.13; before that, index a generated column."
+  - "No `INCLUDE`: add the columns to the key to cover a query. No GIN, GiST or BRIN; MySQL has FULLTEXT and SPATIAL indexes instead."
+  - "Online builds use `ALTER TABLE … ADD INDEX …, ALGORITHM=INPLACE, LOCK=NONE` rather than CONCURRENTLY."
+
+checks:
+  - q: "`SELECT * FROM events WHERE user_id = $1 AND at >= now() - interval '7 days' ORDER BY at DESC` is slow. Which index?"
+    a: >-
+      `(user_id, at)`. Equality column first, then the column that is both the range and the sort, so the matching rows are contiguous and already ordered.
+      B-trees scan in both directions, so `DESC` in the index definition isn't needed for a single sort column. `(at, user_id)` would scan a week of everyone's events.
+  - q: "There's an index on `orders(created_at)`, yet `WHERE created_at::date = '2026-03-10'` does a seq scan. Why, and how do you fix it?"
+    a: >-
+      The cast wraps the column, so the index on raw `created_at` can't be used. Rewrite as a half-open range:
+      `created_at >= '2026-03-10' AND created_at < '2026-03-11'`. An expression index on `created_at::date` isn't allowed for `timestamptz`
+      (not immutable: it depends on the time zone), and the range is clearer anyway.
+  - q: "After adding an index on `users(last_seen_at)`, writes to `users` got much slower and the table grew fast. What happened?"
+    a: >-
+      `last_seen_at` is updated on every request. Before, those updates were HOT and touched no index. Now every update writes a new entry in every index on the table,
+      and the old entries bloat until vacuum. Fix: drop it, move `last_seen_at` to a narrow side table, or update it less often (only if older than 5 minutes).
+  - q: "EXPLAIN shows `Index Only Scan … Heap Fetches: 48210`. Why isn't it index-only?"
+    a: >-
+      Index-only scans skip the heap only for pages the visibility map marks all-visible. Recent writes clear those bits until VACUUM sets them again.
+      Tune autovacuum for the table (lower `autovacuum_vacuum_scale_factor`, or `autovacuum_vacuum_insert_scale_factor` for append-only tables) or run VACUUM after bulk loads.
+  - q: "When does the planner pick a seq scan despite a usable index, and when is it right?"
+    a: >-
+      When the predicate matches a large share of rows, the table is small, or the matching rows are scattered (low correlation): sequential reads beat
+      many random page fetches. It's right when its row estimate is right. If EXPLAIN ANALYZE shows estimated rows far from actual,
+      fix statistics (ANALYZE, a higher statistics target, extended statistics for correlated columns), not the planner settings.
+
+problems:
+  - id: email-ci-unique
+    title: Case-insensitive unique emails
+    variant: canonical
+    statement: >-
+      Signup must reject `Ana@Example.com` because `ana@example.com` already exists. Add what makes emails unique **ignoring case**,
+      and lets `WHERE lower(email) = lower($1)` use an index. (`users` already has a case-sensitive `UNIQUE (email)`.)
+    hint: "An index can be on an expression, and a unique index enforces uniqueness of whatever it indexes."
+    solution: |
+      CREATE UNIQUE INDEX users_email_lower_key
+        ON users (lower(email));
+    tests:
+      - {sql: "INSERT INTO users (email, name, created_at) VALUES ('Ana@Example.com', 'Ana again', now())", error: unique_violation}
+      - {sql: "INSERT INTO users (email, name, created_at) VALUES ('new@example.com', 'New', now())", ok: true}
+      - {sql: "SELECT id FROM users WHERE lower(email) = 'ana@example.com'", uses_index: true}
+    insight: >-
+      An expression index is used only when the query repeats the same expression. Alternatives: the `citext` type, or a nondeterministic ICU
+      collation (PG 12+), but both change comparison semantics everywhere the column is used. If the original casing doesn't matter, storing emails lowercased is simplest.
+    mysql: "MySQL's default collation (`utf8mb4_0900_ai_ci`) is already case- and accent-insensitive, so a plain `UNIQUE (email)` rejects `Ana@Example.com`, and also treats `é` and `e` as equal."
+
+  - id: one-cart-per-user
+    title: One open cart per user
+    variant: disguise
+    statement: >-
+      A user may have any number of orders, but **at most one** with status `'cart'`. Enforce it in the database: two app servers can race.
+      Gia (user 7) already has a cart.
+    hint: "A UNIQUE constraint covers every row. Which kind of index covers only some rows?"
+    solution: |
+      CREATE UNIQUE INDEX orders_one_cart_per_user
+        ON orders (user_id)
+        WHERE status = 'cart';
+    tests:
+      - {sql: "INSERT INTO orders (user_id, status, created_at) VALUES (7, 'cart', now())", error: unique_violation, note: Gia already has a cart}
+      - {sql: "INSERT INTO orders (user_id, status, created_at) VALUES (1, 'cart', now())", ok: true, note: Ana's first cart}
+      - {sql: "INSERT INTO orders (user_id, status, created_at) VALUES (1, 'paid', now())", ok: true, note: other statuses are unrestricted}
+      - {sql: "INSERT INTO orders (user_id, status, created_at) VALUES (1, 'cart', now())", error: unique_violation, note: Ana's second cart}
+      - {sql: "SELECT id FROM orders WHERE user_id = 7 AND status = 'cart'", uses_index: true}
+    insight: >-
+      A partial unique index enforces uniqueness only among rows matching its predicate, and stays tiny because only carts are in it.
+      An app-side “check, then insert” races under Read Committed; with the index the second insert fails with 23505.
+      Handle it with `INSERT … ON CONFLICT (user_id) WHERE status = 'cart' DO NOTHING`, then read the existing cart.
+    mysql: "No partial indexes. Add a generated column `cart_user_id = IF(status = 'cart', user_id, NULL)` with a UNIQUE index: NULLs never collide."

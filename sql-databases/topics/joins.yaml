@@ -1,0 +1,160 @@
+id: joins
+name: Joins & Set Operations
+signal: ["combine rows from two or more tables", "“…who never …” / “…without any …”", "“including those with zero”", "totals that come out too high after adding a join", "rows in one set but not another"]
+idea: >-
+  Inner joins keep matches; outer joins keep every row of one side and fill the other with NULLs; semi-joins (`EXISTS`) test for a match
+  without multiplying rows; anti-joins (`NOT EXISTS`) find what's missing. Most join bugs are cardinality bugs: know whether each side is
+  one or many per key before you join, and aggregate first when both sides are many.
+
+tables:
+  - title: Which join for which question
+    cols: [Question, Write, Watch out]
+    rows:
+      - ["Rows with a match on both sides", "`JOIN … ON`", "Rows without a match vanish from both sides"]
+      - ["All of A, B where it exists", "`LEFT JOIN b ON …`", "Conditions on `b` belong in ON; in WHERE they turn it back into an inner join"]
+      - ["A that has some B (semi-join)", "`WHERE EXISTS (SELECT 1 FROM b WHERE …)`", "A plain JOIN repeats A once per matching B"]
+      - ["A that has no B (anti-join)", "`WHERE NOT EXISTS (…)` or `LEFT JOIN … WHERE b.id IS NULL`", "`NOT IN (subquery)` returns nothing if the subquery yields a NULL"]
+      - ["Every combination", "`CROSS JOIN`", "n × m rows; useful for calendar × entity grids"]
+      - ["Rows of A, then rows of B", "`UNION ALL`", "`UNION` also deduplicates: a sort or hash, and it can drop legitimate repeats"]
+      - ["Rows in A but not in B", "`EXCEPT` (`INTERSECT` for both)", "Compares whole rows; here NULLs count as equal"]
+
+snippets:
+  - task: Self-join (who referred whom)
+    sql: |
+      SELECT u.name, r.name AS referred_by
+      FROM users u
+      LEFT JOIN users r ON r.id = u.referred_by
+      ORDER BY u.id;
+    out:
+      cols: [name, referred_by]
+      rows:
+        - [Ana, null]
+        - [Ben, Ana]
+        - [Chloe, Ana]
+        - [Dev, Ben]
+        - [Emma, null]
+        - [Farid, null]
+        - [Gia, Chloe]
+        - [Hugo, null]
+  - task: NOT IN meets a NULL
+    sql: |
+      SELECT
+        (SELECT count(*) FROM users
+         WHERE id NOT IN (SELECT referred_by FROM users)) AS not_in,
+        (SELECT count(*) FROM users u
+         WHERE NOT EXISTS (SELECT 1 FROM users r WHERE r.referred_by = u.id)) AS not_exists;
+    out:
+      cols: [not_in, not_exists]
+      rows: [[0, 5]]
+    note: "“Users who referred nobody” is 5 users, but `referred_by` contains NULLs, so `id NOT IN (…, NULL)` is never true. `NOT EXISTS` doesn't have this problem."
+  - task: A filter in ON vs in WHERE
+    sql: |
+      SELECT u.name, o.id AS cart_order
+      FROM users u
+      LEFT JOIN orders o ON o.user_id = u.id AND o.status = 'cart'
+      WHERE u.id >= 6
+      ORDER BY u.id;
+    out:
+      cols: [name, cart_order]
+      rows:
+        - [Farid, null]
+        - [Gia, 13]
+        - [Hugo, null]
+    note: "Move `o.status = 'cart'` into WHERE and Farid and Hugo disappear: their NULL status fails the test, which silently makes it an inner join."
+  - task: Join fan-out
+    sql: |
+      SELECT count(*) AS joined_rows,
+             count(DISTINCT o.id) AS orders,
+             count(DISTINCT e.id) AS events
+      FROM orders o
+      JOIN events e ON e.user_id = o.user_id
+      WHERE o.user_id = 1;
+    out:
+      cols: [joined_rows, orders, events]
+      rows: [[28, 4, 7]]
+    note: "Two one-to-many relations joined on the same key multiply: 4 orders × 7 events = 28 rows. Any `sum()` over that is 7× or 4× too big."
+  - task: EXCEPT (in one set, not the other)
+    sql: |
+      SELECT user_id FROM events WHERE type = 'view'
+      EXCEPT
+      SELECT user_id FROM events WHERE type = 'checkout'
+      ORDER BY user_id;
+    out:
+      cols: [user_id]
+      rows: [[8]]
+    note: "Set operations deduplicate unless you add ALL. They match columns by position, not name."
+
+pitfalls:
+  - "**Filtering the outer side in WHERE.** `LEFT JOIN orders o … WHERE o.status = 'paid'` drops every user without a paid order: NULL fails the test. Put conditions on the optional side in the ON clause."
+  - "**`NOT IN` with a nullable subquery.** One NULL makes `x NOT IN (…)` unknown for every row, and the query returns nothing. Use `NOT EXISTS`."
+  - "**Fan-out inflating sums.** Joining orders to items and to events, or to two child tables at once, repeats rows. Aggregate each child in a subquery first, then join the one-row-per-key results."
+  - "**DISTINCT as a band-aid.** It hides fan-out in row counts, costs a sort or hash, and can't fix sums: two different orders with the same total collapse into one."
+  - "**NATURAL JOIN and USING.** NATURAL joins on every same-named column: add `created_at` to both tables and the join silently changes meaning. Spell out ON."
+  - "**Joining on mismatched types.** `text` ids joined to `bigint` ids force a cast on one side, which disables its index. Fix the column type."
+
+mysql:
+  - "No FULL OUTER JOIN: emulate it with `LEFT JOIN … UNION ALL` the unmatched rows of a `RIGHT JOIN`."
+  - "`INTERSECT` and `EXCEPT` exist only since 8.0.31."
+  - "Before 8.0.17, `NOT EXISTS` and `NOT IN` subqueries often ran once per outer row; that's where the “always use LEFT JOIN … IS NULL” advice comes from. Modern versions plan them as anti-joins."
+
+problems:
+  - id: never-paid
+    title: Users who never paid
+    variant: canonical
+    statement: "List the users who have **no paid order** (any other status doesn't count). Return `id` and `name`, ordered by `id`."
+    hint: "You want users for whom a matching row does not exist, and the status test belongs inside that existence check."
+    solution: |
+      SELECT u.id, u.name
+      FROM users u
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM orders o
+        WHERE o.user_id = u.id
+          AND o.status = 'paid'
+      )
+      ORDER BY u.id;
+    expect:
+      cols: [id, name]
+      rows:
+        - [7, Gia]
+        - [8, Hugo]
+    insight: >-
+      An anti-join. Gia has an order (a cart), so “users with no orders” would miss her: the status filter must sit inside the subquery.
+      `LEFT JOIN orders o ON o.user_id = u.id AND o.status = 'paid' WHERE o.id IS NULL` is equivalent and gets the same Hash Anti Join plan.
+      `NOT IN (SELECT user_id …)` works here only because `user_id` is NOT NULL; don't rely on that.
+    mysql: "Identical SQL. On MySQL before 8.0.17, prefer the LEFT JOIN form for speed."
+
+  - id: units-sold
+    title: Units sold per product, zeros included
+    variant: disguise
+    statement: >-
+      For **every** product, the total quantity sold in paid orders, with 0 for products that never sold.
+      Return `id`, `name`, `units`, ordered by `id`.
+    hint: "Two traps: where the paid filter goes, and whether you join before or after summing."
+    solution: |
+      SELECT p.id, p.name, coalesce(s.units, 0) AS units
+      FROM products p
+      LEFT JOIN (
+        SELECT i.product_id, sum(i.qty) AS units
+        FROM order_items i
+        JOIN orders o ON o.id = i.order_id
+        WHERE o.status = 'paid'
+        GROUP BY i.product_id
+      ) s ON s.product_id = p.id
+      ORDER BY p.id;
+    expect:
+      cols: [id, name, units]
+      rows:
+        - [1, Mechanical keyboard, 2]
+        - [2, Wireless mouse, 4]
+        - [3, Monitor 27in, 3]
+        - [4, USB-C hub, 3]
+        - [5, Laptop stand, 2]
+        - [6, Desk lamp, 3]
+        - [7, Webcam, 1]
+        - [8, Monitor arm, 0]
+    insight: >-
+      Aggregate the many side first, then LEFT JOIN one row per product. Writing `LEFT JOIN order_items … LEFT JOIN orders … WHERE o.status = 'paid'`
+      drops the Monitor arm (NULL status) and makes it an inner join; moving the status test into ON keeps it but then counts items of unpaid orders
+      unless the join to orders is inner. The webcam is the check: it appears in a paid, a cancelled and a pending order, but only 1 unit counts.
+    mysql: "Same query; `IFNULL` or `COALESCE` both work."

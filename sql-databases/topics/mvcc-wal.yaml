@@ -1,0 +1,164 @@
+id: mvcc-wal
+name: MVCC, WAL & VACUUM
+signal: ["a table keeps growing while its row count is flat", "“autovacuum runs constantly” or never finishes", "a forgotten open transaction or replication slot", "transaction ID wraparound warnings", "write spikes, checkpoints, crash recovery, `synchronous_commit`"]
+idea: >-
+  An UPDATE writes a new row version and marks the old one dead; each transaction picks the versions its snapshot can see, so readers never block writers.
+  The price is cleanup: VACUUM removes dead versions nobody can see any more and freezes old ones, and anything holding an old snapshot stops it.
+  Durability comes from the write-ahead log: a commit is safe once its WAL is flushed, and data pages catch up at checkpoints.
+
+diagram:
+  type: table
+  partition: false
+  caption: "one product row through two updates; xids 741 < 790 < 802 < 815"
+  cols: [ctid, xmin, price]
+  rows:
+    - ["(0,1)", "741", "120.00"]
+    - ["(0,9)", "802", "108.00"]
+    - ["(0,10)", "815", "97.20"]
+  frames:
+    - title: INSERT
+      expr: "INSERT INTO products … VALUES ('Mechanical keyboard', …, 120.00);  -- xid 741"
+      col: state
+      cur: 0
+      out: ["xmax 0 · live", "—", "—"]
+      note: "Every row version carries `xmin`, the transaction that created it, and `xmax`, the one that deleted or replaced it (0 = nobody). `ctid` is its physical address: (page, slot)."
+    - title: UPDATE
+      expr: "UPDATE products SET price = 108.00 WHERE id = 1;  -- xid 802"
+      col: state
+      cur: 1
+      win: [0]
+      out: ["xmax 802 · dead once 802 commits", "xmax 0 · live", "—"]
+      note: "The update doesn't overwrite: it writes a new version and stamps the old one's `xmax`. No indexed column changed and page 0 had room, so it's a **HOT** update: indexes still point at (0,1), which links to (0,9)."
+    - title: An old snapshot
+      expr: "-- xid 790 began before 802 committed:  SELECT price FROM products WHERE id = 1;  → 120.00"
+      col: state
+      cur: 0
+      out: ["visible to 790", "invisible to 790 (802 wasn't committed in its snapshot)", "—"]
+      note: "Transaction 790 still sees the old price, without locks, because 802 wasn't committed when 790's snapshot was taken. That's MVCC, and it's also why (0,1) can't be removed while 790 is open."
+    - title: Second UPDATE
+      expr: "UPDATE products SET price = 97.20 WHERE id = 1;  -- xid 815"
+      col: state
+      cur: 2
+      win: [0, 1]
+      out: ["dead", "dead (xmax 815)", "live"]
+      note: "Each update leaves another dead version behind. A row updated a thousand times between vacuums takes a thousand slots."
+    - title: VACUUM
+      expr: "VACUUM products;  -- after 790 has ended"
+      col: state
+      win: [2]
+      out: ["removed: slot reusable", "removed: slot reusable", "live"]
+      note: "VACUUM removes versions older than every running snapshot (the xmin horizon), marks the space reusable, and updates the visibility map. It doesn't shrink the file; VACUUM FULL and pg_repack do, by rewriting it."
+
+numbers:
+  - {k: Row version header, v: "~23 B + alignment"}
+  - {k: Autovacuum trigger, v: "50 rows + 20% of the table dead (scale_factor 0.2)"}
+  - {k: XID space, v: "2³² ids; wraparound protection at ~2.1B in use"}
+  - {k: autovacuum_freeze_max_age, v: "200M transactions"}
+  - {k: WAL, v: "16 MB segments · checkpoint every 5 min or 1 GB of WAL by default"}
+
+tables:
+  - title: What stops VACUUM from removing dead rows (the xmin horizon)
+    cols: [Holder, Find it, Fix]
+    rows:
+      - ["Long or idle-in-transaction session", "`pg_stat_activity`: old `xact_start`, `state = 'idle in transaction'`", "`idle_in_transaction_session_timeout`, `statement_timeout`; terminate it"]
+      - ["Replication slot nobody consumes (dead replica, stalled CDC)", "`pg_replication_slots`: `active = false`, old `xmin` / `restart_lsn`", "Drop the slot; cap it with `max_slot_wal_keep_size`"]
+      - ["Long queries on a standby with `hot_standby_feedback = on`", "`pg_stat_replication.backend_xmin`", "Shorter queries on the replica, or accept query cancellations instead"]
+      - ["Forgotten prepared transactions (2PC)", "`pg_prepared_xacts`", "`COMMIT PREPARED` / `ROLLBACK PREPARED`"]
+  - title: Cleanup tools
+    cols: [Tool, Lock, Does]
+    rows:
+      - ["autovacuum / `VACUUM`", "SHARE UPDATE EXCLUSIVE (reads and writes continue)", "Removes dead versions, freezes, updates the visibility map; space reused, file not shrunk"]
+      - ["`VACUUM FULL`", "ACCESS EXCLUSIVE for the whole rewrite", "Rewrites the table compactly; an outage on big tables"]
+      - ["`pg_repack` (extension)", "Brief exclusive locks at start and end", "Online rewrite to remove bloat"]
+      - ["`REINDEX CONCURRENTLY`", "Doesn't block writes (PG 12+)", "Rebuilds bloated indexes"]
+
+snippets:
+  - task: See versions inside a page
+    sql: |
+      CREATE EXTENSION IF NOT EXISTS pageinspect;
+      CREATE TABLE t (id int PRIMARY KEY, v int);
+      INSERT INTO t VALUES (1, 10), (2, 20);
+      UPDATE t SET v = 11 WHERE id = 1;
+      SELECT lp, t_ctid,
+             t_xmax <> 0 AS has_xmax,
+             (t_infomask2 & 16384) <> 0 AS hot_updated,
+             (t_infomask2 & 32768) <> 0 AS heap_only
+      FROM heap_page_items(get_raw_page('t', 0));
+    out:
+      cols: [lp, t_ctid, has_xmax, hot_updated, heap_only]
+      rows:
+        - [1, "(0,3)", true, true, false]
+        - [2, "(0,2)", false, false, false]
+        - [3, "(0,3)", false, false, true]
+    note: "Slot 1 is the old version of id 1: its `xmax` is set and its `t_ctid` points to the new version in slot 3. The new version is heap-only (no index entry), because `v` isn't indexed: a HOT update. `pageinspect` needs superuser."
+  - task: Dead rows and the last vacuum per table
+    sql: |
+      SELECT relname, n_live_tup, n_dead_tup, last_autovacuum, last_autoanalyze
+      FROM pg_stat_user_tables
+      ORDER BY n_dead_tup DESC
+      LIMIT 10;
+  - task: Sessions holding back cleanup
+    sql: |
+      SELECT pid, state, now() - xact_start AS xact_age, backend_xmin, left(query, 60) AS query
+      FROM pg_stat_activity
+      WHERE backend_xmin IS NOT NULL
+      ORDER BY age(backend_xmin) DESC;
+  - task: How close to wraparound
+    sql: |
+      SELECT datname, age(datfrozenxid) AS xid_age
+      FROM pg_database
+      ORDER BY xid_age DESC;
+    note: "Alert well before 1 billion. Autovacuum forces anti-wraparound vacuums from 200M (`autovacuum_freeze_max_age`)."
+  - task: Vacuum one table now
+    tx: false
+    sql: VACUUM (VERBOSE, ANALYZE) products;
+  - task: Vacuum a hot table more eagerly
+    sql: |
+      ALTER TABLE orders SET (autovacuum_vacuum_scale_factor = 0.01,
+                              autovacuum_vacuum_cost_limit = 2000);
+    note: "The 20% default means a 1B-row table accumulates 200M dead rows before a vacuum starts. Per-table settings for big, busy tables are normal."
+
+pitfalls:
+  - "**Long transactions anywhere.** One session left open for hours (a debugging psql, a stuck job, `idle in transaction`) stops VACUUM in the whole database, so every busy table bloats. Set `idle_in_transaction_session_timeout` and alert on old `xact_start`."
+  - "**Default autovacuum on big tables.** A 20% threshold is far too lazy for a billion-row table, and the default cost limit throttles vacuum on fast disks. Tune per table."
+  - "**Turning autovacuum off** to “save I/O”. Dead rows and unfrozen XIDs pile up until an emergency anti-wraparound vacuum runs anyway, at the worst time."
+  - "**VACUUM FULL in production** takes ACCESS EXCLUSIVE for the whole rewrite. Use pg_repack, or partition so old data can be dropped."
+  - "**Abandoned replication slots** keep WAL (disk fills) and hold back the xmin horizon (bloat). Monitor `pg_replication_slots`."
+  - "**Mass UPDATEs that touch every row** double the table: each update writes a new version. Batch them with vacuums in between, or rebuild into a new table."
+
+depth:
+  - "**Visibility:** a snapshot records which transactions were running when it was taken. A version is visible if its `xmin` committed before the snapshot and its `xmax` didn't. Commit status lives in the commit log (pg_xact); the first reader sets hint bits on the tuple, which is why the first SELECT after a bulk load writes to disk."
+  - "**HOT updates and fillfactor:** if no indexed column changes and the page has room, the new version stays on the same page with no index writes, and old versions are pruned on the fly. `fillfactor = 80–90` leaves room on update-heavy tables; check `n_tup_hot_upd` vs `n_tup_upd`."
+  - "**Freezing and wraparound:** XIDs are 32-bit and compared modulo 2³², so old rows must be marked frozen (visible to everyone) before they look like they're from the future. Anti-wraparound vacuums can't be cancelled; if freezing falls ~2B behind, Postgres stops assigning XIDs until you vacuum. PG 14+ has a failsafe that skips index cleanup to finish faster. MultiXacts wrap too."
+  - "**WAL and checkpoints:** a commit writes and flushes its WAL records (group commit batches fsyncs); data pages are written later. A checkpoint flushes all dirty pages so recovery can start from it. The first change to each page after a checkpoint logs the full 8 KB page (`full_page_writes`, protecting against torn pages), so WAL volume spikes right after checkpoints. Size `max_wal_size` so checkpoints are timed, not forced."
+  - "**`synchronous_commit = off`** returns before the WAL flush: a crash can lose the last few hundred milliseconds of acknowledged commits, but never corrupts data. It can be set per transaction for low-value writes (analytics events) while payments stay synchronous."
+  - "**One log, many uses:** crash recovery replays WAL; streaming replicas apply it; PITR restores a base backup and replays archived WAL to any moment; logical decoding turns it into change events (CDC)."
+
+mysql:
+  - "InnoDB updates rows in place and keeps old versions in undo logs; a purge thread removes them. A long transaction grows the “history list length”: the same disease as Postgres bloat, in a different place."
+  - "Redo log plus a doublewrite buffer play the roles of WAL and full_page_writes. The binlog (for replication) is a second log, kept consistent with redo via an internal two-phase commit."
+  - "No VACUUM and no XID wraparound. `OPTIMIZE TABLE` rebuilds a table to reclaim space."
+
+checks:
+  - q: "A table holds 5M live rows but takes 60 GB and keeps growing. How do you find the cause and fix it?"
+    a: >-
+      Bloat: dead versions aren't being reclaimed. Check `n_dead_tup` and `last_autovacuum` in `pg_stat_user_tables`, then the xmin horizon: old transactions in
+      `pg_stat_activity`, inactive replication slots, prepared transactions, standby feedback. Remove the blocker, tune autovacuum for the table, and reclaim the space
+      already lost with pg_repack (VACUUM alone won't shrink the file).
+  - q: "Why does one idle connection that ran BEGIN hours ago hurt the whole database?"
+    a: >-
+      Its snapshot might still need any row version created since it started, so VACUUM can't remove dead versions newer than its xmin, in every table. Busy tables bloat,
+      index-only scans stop being index-only, and query plans degrade. If it also holds locks, DDL queues behind it.
+  - q: "The logs warn “database must be vacuumed within 10,000,000 transactions”. What is it and what do you do?"
+    a: >-
+      XID wraparound protection: rows haven't been frozen and the cluster is close to the point where Postgres stops accepting writes. Find what blocked freezing
+      (long transactions, old slots, prepared transactions, autovacuum constantly cancelled or throttled), remove it, and run `VACUUM (FREEZE, VERBOSE)` on the oldest tables
+      by `age(relfrozenxid)`. Don't keep restarting: it doesn't help.
+  - q: "After adding an index on a frequently updated column, the table started bloating. Why?"
+    a: >-
+      Updates to that column can no longer be HOT: every update now needs new index entries and can't be pruned within the page. Dead versions and index entries
+      accumulate until VACUUM. Drop the index if you can, or move the hot column to a narrow side table.
+  - q: "What exactly can you lose with `synchronous_commit = off`?"
+    a: >-
+      Commits acknowledged in roughly the last 3 × `wal_writer_delay` (about 600 ms by default) before a crash of the server. They roll back as if never committed.
+      There's no corruption and no partial transaction. It's a per-transaction choice, so keep it on for money.

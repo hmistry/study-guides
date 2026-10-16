@@ -1,0 +1,155 @@
+id: isolation
+name: Transactions & Isolation
+signal: ["money, stock, seats: read a value, then write based on it", "“two requests at the same time” / double booking", "a rule across rows (“at least one doctor on call”)", "“how did the balance go negative?”", "choosing an isolation level or a retry policy"]
+idea: >-
+  Isolation decides which interleavings of concurrent transactions the database allows. Postgres's default, Read Committed, gives each statement
+  a fresh snapshot. Repeatable Read gives the whole transaction one snapshot and aborts on write-write conflicts. Serializable also aborts on
+  read-write dependency cycles. Stronger levels don't block more, they abort more, so every caller needs a retry loop.
+
+diagram:
+  type: timeline
+  caption: "two sessions, time flowing down; accounts(id 1, balance 100) unless noted"
+  sessions: [T1, T2]
+  frames:
+    - title: Lost update · Read Committed
+      steps:
+        - {t: T1, sql: BEGIN;}
+        - {t: T2, sql: BEGIN;}
+        - {t: T1, sql: "SELECT balance FROM accounts WHERE id = 1;", out: "100", mark: sees}
+        - {t: T2, sql: "SELECT balance FROM accounts WHERE id = 1;", out: "100", mark: sees}
+        - {t: T1, sql: "UPDATE accounts SET balance = 150 WHERE id = 1;", out: "app computed 100 + 50"}
+        - {t: T2, sql: "UPDATE accounts SET balance = 70 WHERE id = 1;", out: "waits for T1's row lock", mark: wait}
+        - {t: T1, sql: COMMIT;}
+        - {t: T2, sql: "(update proceeds)", out: "UPDATE 1"}
+        - {t: T2, sql: COMMIT;, out: "balance = 70: T1's +50 is lost", mark: bad}
+      note: "Both read 100 and write a value computed in the app. The row lock only serializes the two writes, not the read-modify-write, so T2 overwrites T1's committed change."
+    - title: Fix · atomic UPDATE
+      steps:
+        - {t: T1, sql: BEGIN;}
+        - {t: T2, sql: BEGIN;}
+        - {t: T1, sql: "UPDATE accounts SET balance = balance + 50 WHERE id = 1;"}
+        - {t: T2, sql: "UPDATE accounts SET balance = balance - 30 WHERE id = 1;", out: "waits for T1's row lock", mark: wait}
+        - {t: T1, sql: COMMIT;}
+        - {t: T2, sql: "(update proceeds)", out: "re-reads the row: 150 − 30", mark: sees}
+        - {t: T2, sql: COMMIT;, out: "balance = 120 ✓", mark: ok}
+      note: "Let the database do the arithmetic. After a lock wait, Read Committed re-evaluates the UPDATE against the newly committed row, so increments compose. With a precondition, add it to the WHERE (`AND balance >= 30`) and check the row count. `SELECT … FOR UPDATE` before the read works too."
+    - title: Lost update · Repeatable Read
+      steps:
+        - {t: T1, sql: BEGIN ISOLATION LEVEL REPEATABLE READ;}
+        - {t: T2, sql: BEGIN ISOLATION LEVEL REPEATABLE READ;}
+        - {t: T1, sql: "SELECT balance FROM accounts WHERE id = 1;", out: "100", mark: sees}
+        - {t: T2, sql: "SELECT balance FROM accounts WHERE id = 1;", out: "100", mark: sees}
+        - {t: T1, sql: "UPDATE accounts SET balance = 150 WHERE id = 1;"}
+        - {t: T2, sql: "UPDATE accounts SET balance = 70 WHERE id = 1;", out: "waits for T1's row lock", mark: wait}
+        - {t: T1, sql: COMMIT;}
+        - {t: T2, sql: "(update resumes)", out: "ERROR 40001: could not serialize access due to concurrent update", mark: error}
+        - {t: T2, sql: ROLLBACK;, out: "retry from BEGIN: reads 150, writes 120 ✓", mark: ok}
+      note: "Same code, stronger level. T2's snapshot predates T1's commit, so Postgres refuses to overwrite a row changed since the snapshot (first updater wins). The app must retry the whole transaction. MySQL's Repeatable Read does **not** do this: the update succeeds and the +50 is lost."
+    - title: Write skew · Repeatable Read
+      steps:
+        - {t: T1, sql: BEGIN ISOLATION LEVEL REPEATABLE READ;}
+        - {t: T2, sql: BEGIN ISOLATION LEVEL REPEATABLE READ;}
+        - {t: T1, sql: "SELECT count(*) FROM doctors WHERE on_call;", out: "2: Alice can leave", mark: sees}
+        - {t: T2, sql: "SELECT count(*) FROM doctors WHERE on_call;", out: "2: Bob can leave", mark: sees}
+        - {t: T1, sql: "UPDATE doctors SET on_call = false WHERE name = 'alice';"}
+        - {t: T2, sql: "UPDATE doctors SET on_call = false WHERE name = 'bob';", out: "different row: no wait"}
+        - {t: T1, sql: COMMIT;}
+        - {t: T2, sql: COMMIT;, out: "0 doctors on call", mark: bad}
+      note: "Each transaction checks a rule across rows, then writes a **different** row. No row is written twice, so snapshot isolation sees no conflict, and the rule breaks. Double bookings and overdrawn joint accounts have the same shape."
+    - title: Write skew · Serializable
+      steps:
+        - {t: T1, sql: BEGIN ISOLATION LEVEL SERIALIZABLE;}
+        - {t: T2, sql: BEGIN ISOLATION LEVEL SERIALIZABLE;}
+        - {t: T1, sql: "SELECT count(*) FROM doctors WHERE on_call;", out: "2", mark: sees}
+        - {t: T2, sql: "SELECT count(*) FROM doctors WHERE on_call;", out: "2", mark: sees}
+        - {t: T1, sql: "UPDATE doctors SET on_call = false WHERE name = 'alice';"}
+        - {t: T2, sql: "UPDATE doctors SET on_call = false WHERE name = 'bob';"}
+        - {t: T1, sql: COMMIT;, mark: ok}
+        - {t: T2, sql: COMMIT;, out: "ERROR 40001: could not serialize access due to read/write dependencies", mark: error}
+      note: "SSI tracks what each transaction read (predicate locks that never block). Each one read rows the other then changed, a cycle no serial order allows, so one aborts. Retrying T2 sees 1 doctor on call and refuses."
+
+tables:
+  - title: Anomalies by isolation level (Postgres)
+    cols: [Anomaly, What happens, Read Committed, Repeatable Read, Serializable]
+    rows:
+      - ["**Dirty read**", "See another transaction's uncommitted write", "prevented", "prevented", "prevented"]
+      - ["**Non-repeatable read**", "Same row read twice, different values", "possible", "prevented", "prevented"]
+      - ["**Phantom**", "Same predicate re-run, new rows appear", "possible", "prevented (snapshot)", "prevented"]
+      - ["**Lost update**", "Read-modify-write overwrites a concurrent write", "possible", "prevented: 40001", "prevented: 40001"]
+      - ["**Write skew**", "Both read overlapping data, write different rows, break a rule", "possible", "possible", "prevented: 40001"]
+  - title: Postgres vs MySQL (InnoDB)
+    cols: ["", Postgres, MySQL InnoDB]
+    rows:
+      - ["**Default level**", "Read Committed", "Repeatable Read"]
+      - ["**Repeatable Read**", "Snapshot isolation; first updater wins, the other gets 40001", "Snapshot for plain SELECTs; UPDATE and locking reads use the latest committed row, so lost updates slip through"]
+      - ["**Phantoms**", "None under RR (one snapshot)", "None for plain reads; locking reads take gap / next-key locks"]
+      - ["**Serializable**", "SSI: optimistic, no extra blocking, aborts with 40001", "Every plain SELECT becomes `FOR SHARE`: blocking and deadlock-prone"]
+      - ["**Read Uncommitted**", "Behaves as Read Committed", "Real dirty reads"]
+
+snippets:
+  - task: Default level of this server
+    sql: SHOW default_transaction_isolation;
+    out:
+      cols: [default_transaction_isolation]
+      rows: [[read committed]]
+  - task: Raise the level for one transaction
+    tx: false
+    sql: |
+      BEGIN ISOLATION LEVEL REPEATABLE READ;
+      SELECT current_setting('transaction_isolation') AS level;
+      COMMIT;
+    out:
+      cols: [level]
+      rows: [[repeatable read]]
+    note: "Or `BEGIN;` then `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;`, which must come before the transaction's first query."
+  - task: Long read-only report that never aborts
+    sql: "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE;"
+    run: false
+    note: "Waits until it can take a snapshot that no concurrent transaction can invalidate, then runs without serialization failures or predicate-lock overhead."
+  - task: Guard against forgotten open transactions
+    sql: SET idle_in_transaction_session_timeout = '30s';
+    note: "Kills sessions that sit idle inside a transaction, which would otherwise hold locks and block VACUUM. Usually set per role or in the server config."
+
+pitfalls:
+  - "**Assuming Read Committed sees a stable world.** Each statement takes a new snapshot, so two SELECTs in one transaction can disagree, and a report that queries several tables can be internally inconsistent. Use Repeatable Read for multi-statement reads."
+  - "**Read-modify-write in the app.** `SELECT balance`, compute, `UPDATE … SET balance = $new` loses updates under Read Committed. Write `SET balance = balance - 30 WHERE balance >= 30`, or lock first with `FOR UPDATE`."
+  - "**Raising the level without a retry loop.** Repeatable Read and Serializable report conflicts as SQLSTATE 40001 (deadlocks are 40P01). The whole transaction, reads included, must rerun. Without retries you've swapped silent corruption for 500 errors."
+  - "**Side effects inside a transaction that may retry.** Emails, HTTP calls and queue publishes don't roll back. Do them after commit, or write them to an outbox table in the same transaction."
+  - "**Long transactions.** An open transaction, even idle, pins its snapshot: VACUUM can't remove rows it might see, and Serializable keeps tracking its reads. Keep transactions to milliseconds and set `idle_in_transaction_session_timeout`."
+  - "**Check-then-insert for uniqueness.** `SELECT … WHERE email = $1` then `INSERT` races below Serializable. Let a unique index decide and handle 23505, or use `ON CONFLICT`."
+
+depth:
+  - "**Postgres Repeatable Read is snapshot isolation:** stronger than the SQL standard's RR (no phantoms), weaker than Serializable (write skew). Name the anomaly first, then pick the cheapest tool: an atomic statement, a row lock, a constraint, and only then Serializable."
+  - "**How SSI works (PG 9.1+):** reads take SIRead predicate locks that never block; Postgres tracks read-write dependencies and aborts one transaction when two consecutive rw-edges form a dangerous structure. False positives happen, and more with seq scans, because predicate locks escalate to the whole relation. Good indexes mean fewer aborts."
+  - "**Materialize the conflict** instead of going Serializable. Write skew becomes a plain write-write conflict if both transactions lock a shared row (`SELECT … FROM shifts WHERE id = $1 FOR UPDATE`), and double-booking is better stated as an exclusion constraint (`EXCLUDE USING gist (room_id WITH =, during WITH &&)`)."
+  - "**Read Committed re-check (EvalPlanQual):** when an UPDATE waits on a row lock and the row changes, Postgres re-evaluates the WHERE on the new version and proceeds only if it still matches. That makes `SET x = x + 1` safe, but conditions that read other tables (subqueries) still use the old snapshot."
+  - "**Retry design:** retry 40001 and 40P01 a few times (3–5) with jittered backoff, rerun the whole function from BEGIN, and return 409 when retries run out. An idempotency key covers the case where the commit succeeded but the response was lost."
+  - "**Replicas:** a hot standby can't run Serializable transactions (Read Committed and Repeatable Read only), and its snapshots lag the primary. Read-your-writes needs routing to the primary or waiting until the replica has replayed the write's LSN."
+
+mysql:
+  - "Default is Repeatable Read. Plain SELECTs read the snapshot, but UPDATE, DELETE and `SELECT … FOR UPDATE` read the latest committed row, so lost updates with app-computed values are **not** caught. Use atomic updates or `FOR UPDATE`."
+  - "Under RR, InnoDB takes gap and next-key locks on ranges it reads with locking reads or writes, to block phantoms. Inserts into a locked range wait, and deadlocks are more common than in Postgres."
+  - "Deadlocks are error 1213 (SQLSTATE 40001) and roll back the transaction. Lock-wait timeouts are error 1205 (`innodb_lock_wait_timeout`, 50 s by default) and roll back only the statement unless `innodb_rollback_on_timeout` is on."
+
+checks:
+  - q: "Two concurrent withdrawals each run `SELECT balance` and then `UPDATE accounts SET balance = :computed`. Balance 100, withdrawals 30 and 50, Postgres defaults. What final balances are possible, and what's the smallest fix?"
+    a: >-
+      70 or 50: a lost update, whichever writes last wins. The correct 20 happens only when the two don't overlap. Smallest fix:
+      `UPDATE accounts SET balance = balance - :amt WHERE id = :id AND balance >= :amt`, then check that one row was updated (0 means insufficient funds).
+      Alternatively `SELECT … FOR UPDATE` before computing.
+  - q: "You move the withdraw transaction to Repeatable Read. What new failure must the code handle?"
+    a: >-
+      SQLSTATE 40001, “could not serialize access due to concurrent update”, when another transaction committed a change to the same row after this snapshot was taken.
+      Roll back and rerun the whole transaction, including the read, with a small retry cap and backoff.
+  - q: "Room booking: two transactions each check for overlapping bookings, see none, and insert. Which anomaly is it, which level stops it, and what's better?"
+    a: >-
+      Write skew via a phantom: each inserts a row the other's check would have found. Read Committed and Repeatable Read both allow it; Serializable catches it with a 40001.
+      Better: an exclusion constraint, `EXCLUDE USING gist (room_id WITH =, during WITH &&)` (needs `btree_gist`). The database rejects the overlap at any level, without retries.
+  - q: "A nightly report runs 40 queries in one transaction under Read Committed, and its totals don't add up. Why, and how do you fix it without blocking writers?"
+    a: >-
+      Every statement takes a new snapshot, so the queries see different points in time. Run the transaction at Repeatable Read, or `SERIALIZABLE READ ONLY DEFERRABLE`:
+      one snapshot for all 40 queries, and MVCC readers never block writers. Run it on a replica if it's long, because a long snapshot holds back VACUUM on the primary.
+  - q: "Why can Serializable in Postgres abort a transaction that wrote no row anyone else wrote?"
+    a: >-
+      SSI aborts on read-write dependency cycles, not only write-write conflicts. If T1 read data that T2 then changed, and T2 read data that T1 changed,
+      no serial order explains both results, so one is aborted. Reads are tracked with predicate locks, which never block, which is why Serializable rarely waits but can still fail.

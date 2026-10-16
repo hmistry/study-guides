@@ -1,0 +1,195 @@
+id: setup-ddl
+name: Setup & DDL
+signal: ["“set up a database for this service”", "create, alter, or drop tables and columns", "choose column types and defaults", "add a required column to a table that has data", "give a reporting user read-only access"]
+idea: >-
+  A Postgres server (cluster) holds databases; a database holds schemas; a schema holds tables. You connect to exactly one database at a time,
+  and DDL is transactional, so a whole migration can be wrapped in BEGIN … COMMIT and rolled back if any step fails.
+  The decisions that last are types, keys and constraints: they're cheap to get right at CREATE TABLE and expensive to change on a big, busy table.
+
+tables:
+  - title: Types to reach for
+    cols: [Need, Use, Avoid]
+    rows:
+      - ["Surrogate key", "`bigint GENERATED ALWAYS AS IDENTITY` (or `uuid`)", "`int` (2.1B ceiling), `serial` (legacy)"]
+      - ["Money", "`numeric(12,2)`, or `bigint` cents at high volume", "`float8` / `real` (binary rounding), the `money` type (locale-dependent)"]
+      - ["Instants (created_at, events)", "`timestamptz`: stored as UTC, shown in the session zone", "`timestamp` without zone: ambiguous across servers and DST"]
+      - ["Calendar day", "`date`", "a timestamp at midnight"]
+      - ["Strings", "`text`, plus `CHECK (length(x) <= n)` if a limit matters", "`char(n)`: pads with spaces; `varchar(n)` has no speed benefit"]
+      - ["Semi-structured", "`jsonb` (indexable, deduplicated keys)", "`json` (stored as text, reparsed on every read)"]
+      - ["Small fixed set of values", "`text` + `CHECK (status IN (…))`, or a lookup table", "ENUM types: values can be added but not removed or reordered easily"]
+  - title: serial vs identity
+    cols: ["", serial, "identity (PG 10+)"]
+    rows:
+      - ["**Standard**", "Postgres-only shorthand", "SQL standard"]
+      - ["**Explicit ids on insert**", "Allowed silently; the sequence falls behind and later inserts collide", "`ALWAYS` rejects them (428C9); `BY DEFAULT` allows them"]
+      - ["**Permissions**", "Sequence needs its own `GRANT USAGE`", "Tied to the column; no separate grant"]
+      - ["**Copying the table**", "`CREATE TABLE … (LIKE t)` shares the old sequence", "Copied cleanly with `INCLUDING IDENTITY`"]
+
+snippets:
+  - task: Create, connect, drop (shell)
+    shell: true
+    sql: |
+      createdb shop                     # same as CREATE DATABASE shop
+      psql -d shop                      # connect
+      psql -d postgres -f dataset.sql   # run a script file
+      psql "postgresql://app@db.internal:5432/shop?sslmode=require"
+      dropdb --if-exists shop
+  - task: psql meta-commands
+    shell: true
+    sql: |
+      \l              list databases
+      \c practice     connect to another database
+      \dt             list tables
+      \d+ orders      describe one table
+      \dn             list schemas
+      \du             list roles
+      \x auto         expanded display for wide rows
+      \timing on      print each query's time
+      \i file.sql     run a file
+      \e              edit the last query in $EDITOR
+      \q              quit
+  - task: Create and drop a database
+    tx: false
+    sql: |
+      CREATE DATABASE shop;
+      DROP DATABASE shop;
+    note: "Neither can run inside a transaction block. You can't drop the database you're connected to, and the drop fails while anyone else is connected: `DROP DATABASE shop WITH (FORCE)` (PG 13+) disconnects them."
+  - task: Schemas and the search path
+    sql: |
+      CREATE SCHEMA billing;
+      CREATE TABLE billing.invoices (id bigint PRIMARY KEY, total numeric(12, 2));
+      SET search_path TO billing, public;
+      SELECT current_schemas(false) AS search_path;
+    out:
+      cols: [search_path]
+      rows: [["{billing,public}"]]
+    note: "Unqualified names resolve through `search_path`, left to right. Schemas namespace modules or tenants within one database; queries can join across them, unlike across databases."
+  - task: Create a table with keys, defaults and checks
+    sql: |
+      CREATE TABLE coupons (
+        id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        code       text NOT NULL UNIQUE,
+        percent    smallint NOT NULL CHECK (percent BETWEEN 1 AND 100),
+        expires_at timestamptz,
+        created_at timestamptz NOT NULL DEFAULT now()
+      );
+      INSERT INTO coupons (code, percent) VALUES ('SPRING10', 10)
+      RETURNING id, code, percent;
+    out:
+      cols: [id, code, percent]
+      rows: [[1, SPRING10, 10]]
+  - task: Alter a table
+    sql: |
+      ALTER TABLE products ADD COLUMN discontinued boolean NOT NULL DEFAULT false;
+      ALTER TABLE products RENAME COLUMN name TO title;
+      ALTER TABLE products ALTER COLUMN category SET DEFAULT 'misc';
+      ALTER TABLE products DROP COLUMN discontinued;
+    note: "Adding a column with a constant default is metadata-only since PG 11. A volatile default (`now()`, `gen_random_uuid()`) or a type change rewrites the whole table under an exclusive lock."
+  - task: Empty or remove tables
+    sql: |
+      TRUNCATE order_items, orders RESTART IDENTITY CASCADE;
+      DROP TABLE IF EXISTS events CASCADE;
+    note: "TRUNCATE drops the data files instead of deleting row by row: instant, but it takes an ACCESS EXCLUSIVE lock and skips DELETE triggers. CASCADE also empties (or drops) whatever references the table: read what it lists."
+  - task: A read-only role
+    sql: |
+      CREATE ROLE app_ro NOLOGIN;
+      GRANT USAGE ON SCHEMA public TO app_ro;
+      GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_ro;
+      ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO app_ro;
+      CREATE ROLE reporting LOGIN PASSWORD 'change-me' IN ROLE app_ro;
+    note: "Grant to group roles, log in as member roles. `GRANT … ON ALL TABLES` covers existing tables only; `ALTER DEFAULT PRIVILEGES` covers tables created later (by the role running it)."
+  - task: Inspect columns from SQL
+    sql: |
+      SELECT column_name, data_type, is_nullable
+      FROM information_schema.columns
+      WHERE table_name = 'orders'
+      ORDER BY ordinal_position;
+    out:
+      cols: [column_name, data_type, is_nullable]
+      rows:
+        - [id, bigint, "NO"]
+        - [user_id, bigint, "NO"]
+        - [status, text, "NO"]
+        - [created_at, timestamp with time zone, "NO"]
+
+pitfalls:
+  - "**Dropping the database you're in.** `DROP DATABASE` fails while any session is connected, including yours. Connect to `postgres` first; add `WITH (FORCE)` to disconnect the rest."
+  - "**Explicit ids with `serial` or BY DEFAULT identity.** Bulk-loading rows with their ids leaves the sequence behind, and the next normal insert fails on a duplicate key. Use GENERATED ALWAYS, or `setval()` the sequence after the load."
+  - "**`int` primary keys.** 2.1 billion arrives sooner than expected on event-like tables, and widening a key column on a big table rewrites it and every index under an exclusive lock. Default to `bigint`."
+  - "**Quoted identifiers.** `CREATE TABLE \"Users\"` makes the name case-sensitive forever, so every query must quote it. Stick to lowercase snake_case."
+  - "**Adding NOT NULL to a table with rows.** `ADD COLUMN x text NOT NULL` fails without a default, and `SET NOT NULL` scans the whole table under an exclusive lock. Add nullable, backfill, then enforce (see the second problem)."
+  - "**DDL on a busy table.** Most `ALTER TABLE` forms need ACCESS EXCLUSIVE: they wait behind running queries, and every new query queues behind them. Set `lock_timeout` first (see Locking & Concurrency)."
+
+mysql:
+  - '`AUTO_INCREMENT` instead of identity. `SHOW DATABASES`, `SHOW TABLES`, `DESCRIBE t` instead of `\l`, `\dt`, `\d t`.'
+  - "A DATABASE and a SCHEMA are the same thing in MySQL: there's no extra namespace level."
+  - "DDL isn't transactional: each statement commits implicitly, so a migration that fails halfway leaves its earlier steps applied."
+  - "CHECK constraints are enforced only since 8.0.16; earlier versions parsed and silently ignored them."
+
+problems:
+  - id: create-reviews
+    title: A reviews table
+    variant: canonical
+    statement: >-
+      Create `reviews`: an `id` the database always generates, `user_id` and `product_id` that must exist, a required `rating` from 1 to 5,
+      an optional `body`, and `created_at` defaulting to now. One review per user per product. Deleting a product deletes its reviews.
+    hint: "Every rule here is a constraint: NOT NULL, CHECK, UNIQUE across two columns, and a foreign key with an ON DELETE action."
+    solution: |
+      CREATE TABLE reviews (
+        id         bigint GENERATED ALWAYS AS IDENTITY
+                   PRIMARY KEY,
+        user_id    bigint NOT NULL REFERENCES users (id),
+        product_id bigint NOT NULL
+                   REFERENCES products (id) ON DELETE CASCADE,
+        rating     smallint NOT NULL
+                   CHECK (rating BETWEEN 1 AND 5),
+        body       text,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        UNIQUE (user_id, product_id)
+      );
+    tests:
+      - {sql: "INSERT INTO reviews (user_id, product_id, rating) VALUES (1, 1, 5)", ok: true}
+      - {sql: "INSERT INTO reviews (user_id, product_id, rating) VALUES (1, 1, 4)", error: unique_violation, note: second review of the same product}
+      - {sql: "INSERT INTO reviews (user_id, product_id, rating) VALUES (2, 1, 6)", error: check_violation}
+      - {sql: "INSERT INTO reviews (user_id, product_id, rating) VALUES (2, 99, 4)", error: foreign_key_violation}
+      - {sql: "INSERT INTO reviews (user_id, product_id, rating) VALUES (2, 1, NULL)", error: not_null_violation}
+      - {sql: "INSERT INTO reviews (id, user_id, product_id, rating) VALUES (100, 2, 2, 3)", error: generated_always, note: ids come from the database only}
+      - {sql: "INSERT INTO reviews (user_id, product_id, rating) VALUES (3, 8, 4)", ok: true}
+      - {sql: "DELETE FROM products WHERE id = 8", ok: true, note: takes its review with it}
+    check: "SELECT user_id, product_id, rating, created_at IS NOT NULL AS stamped FROM reviews ORDER BY id"
+    expect:
+      cols: [user_id, product_id, rating, stamped]
+      rows: [[1, 1, 5, true]]
+    insight: >-
+      Put every rule you can in the schema: the app has bugs and other writers (scripts, admins, a second service) won't run its validation.
+      `ON DELETE CASCADE` fits owned children like reviews; for orders you'd rather `RESTRICT` (the default) so a product with sales can't vanish.
+      Postgres doesn't index `user_id` or `product_id` for the foreign keys; the UNIQUE index covers lookups by `user_id`, so add one on `product_id`.
+    mysql: "Same DDL with `BIGINT AUTO_INCREMENT PRIMARY KEY`, which can't reject explicit ids. CHECK needs 8.0.16+."
+
+  - id: required-sku
+    title: A required SKU on a table with data
+    variant: disguise
+    statement: >-
+      Products need a `sku`: required and unique. The table already has rows. Backfill existing products as `'SKU-'` plus the id
+      zero-padded to 4 digits (`SKU-0001`), and make sure new products can't be added without a SKU.
+    hint: "You can't add a NOT NULL column with no default to a table that has rows, and a constant default would break UNIQUE. Order the steps."
+    solution: |
+      ALTER TABLE products ADD COLUMN sku text;
+      UPDATE products
+        SET sku = 'SKU-' || lpad(id::text, 4, '0');
+      ALTER TABLE products ALTER COLUMN sku SET NOT NULL;
+      ALTER TABLE products ADD CONSTRAINT products_sku_key
+        UNIQUE (sku);
+    tests:
+      - {sql: "INSERT INTO products (name, category, price) VALUES ('Cable', 'peripherals', 9)", error: not_null_violation}
+      - {sql: "INSERT INTO products (name, category, price, sku) VALUES ('Cable', 'peripherals', 9, 'SKU-0001')", error: unique_violation}
+      - {sql: "INSERT INTO products (name, category, price, sku) VALUES ('Cable', 'peripherals', 9, 'SKU-0009')", ok: true}
+    check: "SELECT count(*) AS products, count(DISTINCT sku) AS skus, min(sku), max(sku) FROM products"
+    expect:
+      cols: [products, skus, min, max]
+      rows: [[9, 9, SKU-0001, SKU-0009]]
+    insight: >-
+      Add nullable, backfill, then enforce. On a large live table each step needs care: backfill in batches of a few thousand rows so locks and WAL stay small;
+      instead of `SET NOT NULL` (a full scan under ACCESS EXCLUSIVE), add `CHECK (sku IS NOT NULL) NOT VALID`, `VALIDATE` it (weaker lock), and then
+      `SET NOT NULL` uses the check and skips the scan (PG 12+). For UNIQUE, `CREATE UNIQUE INDEX CONCURRENTLY`, then `ADD CONSTRAINT … UNIQUE USING INDEX`.
+    mysql: "MySQL rewrites the table for most of these steps unless the change qualifies for `ALGORITHM=INSTANT` / `INPLACE`; on big tables teams use gh-ost or pt-online-schema-change."

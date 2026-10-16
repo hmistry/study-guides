@@ -1,0 +1,170 @@
+id: scaling
+name: Running Postgres at Scale
+signal: ["“too many connections” / connection storms", "read traffic outgrowing one server", "tables in the billions of rows; data retention", "schema changes on a live, busy table", "“how would you shard this?”, failover, backups"]
+idea: >-
+  Scale Postgres in order of cost: fix queries and indexes, pool connections, scale up, add read replicas, partition big tables, and only then shard.
+  Every step adds a failure mode: poolers break session state, replicas lag, partitions want the key in every query, and shards push cross-shard joins
+  and transactions onto the application. Changes to live tables go through lock timeouts and expand-contract migrations.
+
+numbers:
+  - {k: Per connection, v: "one backend process, ~5–10 MB+"}
+  - {k: Useful active connections, v: "~2–4 × CPU cores"}
+  - {k: Replica lag, v: "ms normally; minutes under heavy writes or long replays"}
+  - {k: Partitions, v: "hundreds fine; thousands cost planning time"}
+  - {k: Major upgrade, v: "pg_upgrade --link: minutes of downtime"}
+
+tables:
+  - title: The scaling ladder
+    cols: [Step, Buys, Costs]
+    rows:
+      - ["Query and index tuning", "Often 10–100×", "Engineering time; the cheapest step"]
+      - ["Connection pooling (PgBouncer)", "Thousands of clients on a few hundred backends", "Session state limits in transaction mode"]
+      - ["Vertical scaling", "2–10× (CPU, RAM, faster disks)", "Price, and a ceiling"]
+      - ["Read replicas", "Read throughput; isolation for reports", "Stale reads (lag); routing; failover complexity"]
+      - ["Partitioning", "Manageable huge tables; instant retention (drop a partition); pruning", "Partition key in queries; unique keys must include it"]
+      - ["Sharding (Citus, app-level)", "Write throughput and storage beyond one node", "Cross-shard joins and transactions, resharding, operations"]
+  - title: PgBouncer pool modes
+    cols: [Mode, Server connection held for, Breaks]
+    rows:
+      - ["session", "The client's whole session", "Nothing, but little multiplexing"]
+      - ["transaction", "One transaction", "Session `SET`, session advisory locks, `LISTEN`, temp tables and `WITH HOLD` cursors across transactions; named prepared statements unless PgBouncer 1.21+ with `max_prepared_statements`"]
+      - ["statement", "One statement", "Multi-statement transactions"]
+  - title: Zero-downtime schema changes
+    cols: [Change, Risky way, Safe way]
+    rows:
+      - ["Add a column", "With a volatile default (rewrite)", "Nullable or constant default (instant), then backfill in batches"]
+      - ["Add an index", "`CREATE INDEX` (blocks writes)", "`CREATE INDEX CONCURRENTLY`"]
+      - ["Add NOT NULL / FK / CHECK", "Directly (scan under exclusive lock)", "`NOT VALID`, then `VALIDATE` (see Constraints)"]
+      - ["Rename a column", "`RENAME` while old code still runs", "Expand-contract: add new, dual-write, backfill, switch reads, drop old"]
+      - ["Change a column type", "`ALTER … TYPE` (rewrite under ACCESS EXCLUSIVE)", "New column + backfill + switch; `varchar(n)` → `text` is instant"]
+      - ["Drop a column", "Before the code stops using it", "Deploy code that ignores it, then drop"]
+      - ["Any DDL", "No timeout", "`SET lock_timeout = '2s'` and retry (see Locking)"]
+
+snippets:
+  - task: Partition by time
+    sql: |
+      CREATE TABLE events_p (LIKE events) PARTITION BY RANGE (at);
+      CREATE TABLE events_2026_03 PARTITION OF events_p
+        FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
+      CREATE TABLE events_2026_04 PARTITION OF events_p
+        FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
+      INSERT INTO events_p SELECT * FROM events;
+      SELECT tableoid::regclass AS partition, count(*)
+      FROM events_p GROUP BY 1 ORDER BY 1;
+    out:
+      cols: [partition, count]
+      rows:
+        - [events_2026_03, 22]
+        - [events_2026_04, 2]
+    note: "Rows route to their partition automatically. Queries filtering on `at` scan only matching partitions (pruning); queries that don't, scan all of them."
+  - task: Retention by dropping a partition
+    tx: false
+    since: PG 14
+    sql: |
+      CREATE TABLE logs (at timestamptz NOT NULL, msg text) PARTITION BY RANGE (at);
+      CREATE TABLE logs_2026_03 PARTITION OF logs FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
+      ALTER TABLE logs DETACH PARTITION logs_2026_03 CONCURRENTLY;
+      DROP TABLE logs_2026_03;
+    note: "Deleting a month of rows means hours of DELETE, WAL and vacuum; detaching and dropping a partition takes milliseconds. `pg_partman` creates future partitions and retires old ones."
+  - task: Expand-contract rename, step 1
+    sql: |
+      ALTER TABLE users ADD COLUMN full_name text;
+      UPDATE users SET full_name = name WHERE full_name IS NULL;  -- batch this on big tables
+    note: "Then: deploy code that writes both columns, backfill the rest, switch reads to `full_name`, stop writing `name`, and finally drop it, each step its own deploy."
+  - task: Replica lag
+    sql: SELECT now() - pg_last_xact_replay_timestamp() AS replica_lag;
+    out:
+      cols: [replica_lag]
+      rows: [[null]]
+    note: "Run on a standby; on a primary it's NULL, as here. On the primary, `pg_stat_replication` shows `write_lag`, `flush_lag` and `replay_lag` per replica."
+  - task: Base backup and point-in-time recovery (shell)
+    shell: true
+    sql: |
+      pg_basebackup -D /backups/base -X stream -P      # physical copy of the cluster
+      # postgresql.conf: archive_mode = on, archive_command ships each WAL segment
+      # restore: copy the base backup, set restore_command and recovery_target_time,
+      # create recovery.signal, start: Postgres replays WAL up to that moment
+      pgbackrest --stanza=main backup                   # what most teams use instead
+
+pitfalls:
+  - "**One connection per app thread.** 40 app instances × 50 threads is 2,000 backends, mostly idle, each a process with its own memory. Put PgBouncer (transaction mode) in front and keep server connections near a few × cores."
+  - "**Reading your own write from a replica.** The user saves, the next page reads a lagging replica, and the change is “gone”. Route a session's reads to the primary for a few seconds after it writes, or wait for the replica to replay the write's LSN."
+  - "**Partitioning without the partition key in queries.** Every query then scans every partition, slower than one big table. Unique and primary keys must include the partition key."
+  - "**Sharding too early, or on the wrong key.** Cross-shard queries and transactions become application problems. Shard by the key nearly every query includes (tenant_id), and plan for one tenant outgrowing a shard."
+  - "**Failover without fencing.** Promoting a replica while the old primary still accepts writes is split brain. Use Patroni (or a managed service) with a consensus store, not a script."
+  - "**Backups never restored.** A backup you haven't restored is a hope. Restore regularly and measure how long it takes (that's your RTO)."
+
+depth:
+  - "**Pooling math.** Throughput is bounded by cores and I/O, not connections: past ~2–4 active connections per core, more just adds contention. Little's law sizes the pool: connections ≈ requests/s × seconds per transaction. Transaction-mode pooling needs `SET LOCAL` (e.g. `SET LOCAL app.tenant_id`) instead of session state."
+  - "**Replication modes.** Streaming replication is asynchronous by default (a failover can lose the last commits). `synchronous_standby_names = 'ANY 1 (r1, r2)'` makes commits wait for one replica: RPO 0 at the cost of commit latency. `synchronous_commit = remote_apply` also makes the write visible on the replica before the commit returns."
+  - "**Standby queries vs replay.** Long queries on a replica conflict with replay of vacuum on the primary: either they're cancelled (`max_standby_streaming_delay`) or, with `hot_standby_feedback = on`, the primary keeps dead rows for them and bloats."
+  - "**Partitioning mechanics.** Pruning happens at plan time and at execution time (for parameters); partition-wise joins and aggregates help when both sides share the key. Create future partitions ahead of time, and index the parent so every partition gets the index."
+  - "**Sharding with Citus:** pick a distribution column (tenant_id); tables distributed on it are co-located, so joins and transactions within a tenant stay on one node; small shared tables become reference tables copied to every node. App-level sharding needs a directory (tenant → shard) and a story for moving tenants."
+  - "**Backups and upgrades.** Continuous WAL archiving + base backups give PITR with RPO near the archive interval; pg_dump is for small databases and migrations, not disaster recovery. Major upgrades: `pg_upgrade --link` (minutes of downtime) or logical replication into the new version and a switchover (seconds)."
+
+mysql:
+  - "Connections are threads, cheaper than Postgres processes, but pools still matter; ProxySQL pools and routes reads to replicas."
+  - "Replication is binlog-based (row format), with semi-sync for no-loss failover; Group Replication / InnoDB Cluster for HA; Vitess for sharding."
+  - "Partitioned tables: unique keys must include the partition column, and foreign keys aren't supported at all."
+  - "Online schema changes use `ALGORITHM=INSTANT` / `INPLACE` where possible, otherwise gh-ost or pt-online-schema-change."
+
+checks:
+  - q: "40 app instances with pools of 20 connections exhaust `max_connections = 500`, but database CPU is mostly idle. What do you change?"
+    a: >-
+      The connections are idle most of the time; the database doesn't need 800 of them. Put PgBouncer in transaction mode between the app and Postgres, point each
+      instance's pool at it, and give PgBouncer a server pool of a few × cores. Fix any session state the app relies on (`SET` → `SET LOCAL`, session advisory locks, prepared statements on old PgBouncer).
+  - q: "A user saves a profile change, reloads, and sees the old value. Reads go to replicas. What are your options?"
+    a: >-
+      Read-your-writes: route that user's reads to the primary for a short window after a write (a cookie or session flag); or record the commit's LSN
+      (`pg_current_wal_lsn()`) and read from a replica only once `pg_last_wal_replay_lsn()` has passed it; or use `synchronous_commit = remote_apply` for those writes,
+      accepting slower commits.
+  - q: "`events` has 4 billion rows and must keep 90 days. Nightly deletes take hours and bloat the table. Redesign?"
+    a: >-
+      Partition by day or week on `at` and drop (or detach and archive) whole partitions past 90 days: milliseconds, no dead rows, no vacuum debt. Create partitions ahead
+      with pg_partman, keep the primary key as `(id, at)`, and make sure queries filter on `at` so they prune.
+  - q: "Rename a column used by a live service, with zero downtime. Steps?"
+    a: >-
+      Expand-contract: add the new column; deploy code that writes both; backfill in batches; deploy code that reads the new column; stop writing the old one;
+      drop it. Each step is backward compatible with the previous deploy, so rolling deploys and rollbacks are safe. A view or generated column can bridge readers temporarily.
+  - q: "When would you shard a multi-tenant Postgres, and on what?"
+    a: >-
+      After tuning, pooling, vertical scaling and replicas can't keep up with writes or storage on one node. Shard on `tenant_id`: almost every query is per tenant,
+      so it stays on one shard with local joins and transactions. Keep global data as reference tables, and plan for big tenants: isolate them on their own nodes.
+
+problems:
+  - id: monthly-partitions
+    title: A monthly-partitioned audit log
+    variant: canonical
+    statement: >-
+      Create `audit_log(id bigint, at timestamptz, action text)`, all required, partitioned by month with partitions for March and April 2026,
+      and a primary key. Rows outside those months must be rejected (no default partition).
+    hint: "Declare the parent with PARTITION BY, then each partition with FOR VALUES. Try a primary key on `id` alone and read the error."
+    solution: |
+      CREATE TABLE audit_log (
+        id     bigint NOT NULL,
+        at     timestamptz NOT NULL,
+        action text NOT NULL,
+        PRIMARY KEY (id, at)
+      ) PARTITION BY RANGE (at);
+      CREATE TABLE audit_log_2026_03
+        PARTITION OF audit_log
+        FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
+      CREATE TABLE audit_log_2026_04
+        PARTITION OF audit_log
+        FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
+    tests:
+      - {sql: "INSERT INTO audit_log VALUES (1, '2026-03-10 12:00Z', 'login')", ok: true}
+      - {sql: "INSERT INTO audit_log VALUES (2, '2026-04-30 23:59Z', 'logout')", ok: true}
+      - {sql: "INSERT INTO audit_log VALUES (3, '2026-05-01 00:00Z', 'login')", error: check_violation, note: no partition for May}
+      - {sql: "INSERT INTO audit_log VALUES (1, '2026-03-10 12:00Z', 'again')", error: unique_violation}
+    check: "SELECT tableoid::regclass AS partition, count(*) FROM audit_log GROUP BY 1 ORDER BY 1"
+    expect:
+      cols: [partition, count]
+      rows:
+        - [audit_log_2026_03, 1]
+        - [audit_log_2026_04, 1]
+    insight: >-
+      A primary key on `id` alone is rejected: unique indexes are per partition, so uniqueness can only be enforced for keys that include the partition column.
+      If `id` must be globally unique, generate it from a single sequence and accept that the database can't prove it. A row with no matching partition fails with 23514;
+      a `DEFAULT` partition would catch it, but then adding a new partition must scan the default. Upper bounds are exclusive, so midnight on May 1 belongs to May.
+    mysql: "`PARTITION BY RANGE (UNIX_TIMESTAMP(at))` with `PARTITION p2026_03 VALUES LESS THAN (…)`; the same rule applies: every unique key must include the partition column."

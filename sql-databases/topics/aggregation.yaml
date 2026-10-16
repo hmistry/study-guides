@@ -1,0 +1,174 @@
+id: aggregation
+name: Aggregation
+signal: ["“how many / how much per …”", "several counts side by side (a pivot)", "“only groups with more than …”", "subtotals and a grand total", "averages that have to be “per order” or “per customer”"]
+idea: >-
+  GROUP BY collapses rows into one per group, and every selected column must be grouped or aggregated. Aggregates skip NULLs, except `count(*)`.
+  `FILTER (WHERE …)` computes many conditional aggregates in one pass, and HAVING filters groups after aggregation.
+  Most wrong answers aggregate at the wrong grain: decide what one row of the result means before writing the query.
+
+tables:
+  - title: Aggregates and NULLs
+    cols: [Expression, "Over rows 5, NULL, 7", Over zero rows]
+    rows:
+      - ["`count(*)`", "3", "0"]
+      - ["`count(x)`", "2 (NULL skipped)", "0"]
+      - ["`sum(x)` / `avg(x)`", "12 / 6", "NULL, not 0: wrap in `coalesce(…, 0)`"]
+      - ["`array_agg(x)`", "`{5,NULL,7}` (keeps NULLs)", "NULL"]
+      - ["`string_agg(x::text, ',')`", "`5,7` (skips NULLs)", "NULL"]
+      - ["`bool_and(x > 0)` / `bool_or`", "true", "NULL"]
+
+snippets:
+  - task: Three ways to count
+    sql: |
+      SELECT count(*) AS all_rows,
+             count(country) AS with_country,
+             count(DISTINCT country) AS countries
+      FROM users;
+    out:
+      cols: [all_rows, with_country, countries]
+      rows: [[8, 7, 4]]
+  - task: Pivot with FILTER
+    sql: |
+      SELECT count(*) FILTER (WHERE status = 'paid')      AS paid,
+             count(*) FILTER (WHERE status = 'cancelled') AS cancelled,
+             count(*) FILTER (WHERE status = 'pending')   AS pending,
+             count(*) FILTER (WHERE status = 'cart')      AS cart
+      FROM orders;
+    out:
+      cols: [paid, cancelled, pending, cart]
+      rows: [[11, 2, 1, 1]]
+  - task: Groups with a condition (HAVING)
+    sql: |
+      SELECT u.name, count(*) AS paid_orders
+      FROM orders o
+      JOIN users u ON u.id = o.user_id
+      WHERE o.status = 'paid'
+      GROUP BY u.id, u.name
+      HAVING count(*) >= 3
+      ORDER BY paid_orders DESC;
+    out:
+      cols: [name, paid_orders]
+      rows:
+        - [Ana, 4]
+        - [Ben, 3]
+    note: "WHERE filters rows before grouping (cheap); HAVING filters groups after. Grouping by `u.id` too keeps two users who share a name apart."
+  - task: Subtotals and a grand total (ROLLUP)
+    sql: |
+      SELECT CASE WHEN grouping(p.category) = 1 THEN 'all' ELSE p.category END AS category,
+             sum(i.qty) AS units
+      FROM order_items i
+      JOIN orders o ON o.id = i.order_id AND o.status = 'paid'
+      JOIN products p ON p.id = i.product_id
+      GROUP BY ROLLUP (p.category)
+      ORDER BY grouping(p.category), p.category;
+    out:
+      cols: [category, units]
+      rows:
+        - [displays, 3]
+        - [furniture, 5]
+        - [peripherals, 10]
+        - [all, 18]
+    note: "`grouping()` tells a subtotal row's NULL apart from a real NULL value. `CUBE` and `GROUPING SETS` give other combinations."
+  - task: Concatenate a group
+    sql: |
+      SELECT category, string_agg(name, ', ' ORDER BY name) AS products
+      FROM products
+      GROUP BY category
+      ORDER BY category;
+    out:
+      cols: [category, products]
+      rows:
+        - [displays, Monitor 27in]
+        - [furniture, "Desk lamp, Laptop stand, Monitor arm"]
+        - [peripherals, "Mechanical keyboard, USB-C hub, Webcam, Wireless mouse"]
+  - task: Aggregates over no rows
+    sql: |
+      SELECT sum(qty) AS total, coalesce(sum(qty), 0) AS total_or_zero, count(*) AS n
+      FROM order_items
+      WHERE order_id = 999;
+    out:
+      cols: [total, total_or_zero, n]
+      rows: [[null, 0, 0]]
+
+pitfalls:
+  - "**Wrong grain.** `avg(qty * unit_price)` over item rows is the average line, not the average order. Build the per-order (or per-customer) rows in a subquery, then average those."
+  - "**Summing after a fan-out join.** Joining a second child table repeats rows and multiplies sums. Aggregate each child separately (see Joins)."
+  - "**`sum()` of nothing is NULL.** A user with no orders gets NULL revenue, and NULL + 10 is NULL. `coalesce(sum(x), 0)` where 0 is the right answer."
+  - "**Grouping by a non-unique label.** `GROUP BY name` merges two different Anas. Group by the key; Postgres then lets you select other columns of that table (functional dependency on the PK)."
+  - "**`count(DISTINCT x)` at scale** needs a sort or hash of every value and doesn't parallelize well. Dashboards over billions of rows use HyperLogLog (`hll` extension) or pre-aggregated rollup tables."
+  - "**HAVING for row filters.** `HAVING status = 'paid'` either errors or filters too late; row conditions go in WHERE."
+
+mysql:
+  - "`ONLY_FULL_GROUP_BY` (default since 5.7) rejects non-grouped columns. With it off, MySQL returns a value from an arbitrary row of the group."
+  - "No FILTER clause: write `COUNT(CASE WHEN status = 'paid' THEN 1 END)` or `SUM(status = 'paid')`."
+  - "`GROUP BY category WITH ROLLUP` instead of `ROLLUP (category)`; `GROUPING()` since 8.0."
+  - "`GROUP_CONCAT` instead of `string_agg`, silently truncated at `group_concat_max_len` (1024 bytes by default)."
+
+problems:
+  - id: users-by-country
+    title: Users and payers per country
+    variant: canonical
+    statement: >-
+      Per country: the number of users and how many of them have at least one paid order. Show unknown countries as `'unknown'`.
+      Columns `country`, `users`, `paying`; most users first, then by country.
+    hint: "Join each user to at most one row that says “has paid”, then count a column that is NULL for the others."
+    solution: |
+      SELECT coalesce(u.country, 'unknown') AS country,
+             count(*) AS users,
+             count(p.user_id) AS paying
+      FROM users u
+      LEFT JOIN (
+        SELECT DISTINCT user_id
+        FROM orders
+        WHERE status = 'paid'
+      ) p ON p.user_id = u.id
+      GROUP BY 1
+      ORDER BY users DESC, country;
+    expect:
+      cols: [country, users, paying]
+      rows:
+        - [US, 3, 2]
+        - [FR, 2, 1]
+        - [DE, 1, 1]
+        - [IN, 1, 1]
+        - [unknown, 1, 1]
+    insight: >-
+      `count(p.user_id)` counts only users the join matched, while `count(*)` counts all. The `DISTINCT` subquery matters: joining orders directly
+      would count Ana four times. `GROUP BY 1` groups by the coalesced expression, so NULL and 'unknown' land together.
+    mysql: "Same query. MySQL also accepts `GROUP BY country` meaning the alias, but then the alias and the column share a name: be explicit."
+
+  - id: avg-order-value
+    title: Average order value per customer
+    variant: disguise
+    statement: >-
+      For each user with paid orders: the number of paid orders and the average paid **order** value, rounded to 2 decimals.
+      Columns `name`, `orders`, `avg_order`; highest average first.
+    hint: "What is one row when you take the average: an item, or an order?"
+    solution: |
+      WITH totals AS (
+        SELECT o.user_id, o.id,
+               sum(i.qty * i.unit_price) AS total
+        FROM orders o
+        JOIN order_items i ON i.order_id = o.id
+        WHERE o.status = 'paid'
+        GROUP BY o.user_id, o.id
+      )
+      SELECT u.name, count(*) AS orders,
+             round(avg(t.total), 2) AS avg_order
+      FROM totals t
+      JOIN users u ON u.id = t.user_id
+      GROUP BY u.id, u.name
+      ORDER BY avg_order DESC;
+    expect:
+      cols: [name, orders, avg_order]
+      rows:
+        - [Emma, 1, 600.00]
+        - [Ana, 4, 153.75]
+        - [Chloe, 1, 140.00]
+        - [Farid, 1, 80.00]
+        - [Dev, 1, 75.00]
+        - [Ben, 3, 70.00]
+    insight: >-
+      Two levels of aggregation: items to orders, then orders to users. Aggregating item rows directly gives Ana an “average” of 123.00 over 5 lines
+      and counts 5 orders. When an answer depends on grain, say the grain out loud in the interview (“one row per order”).
+    mysql: "Same query (CTEs need MySQL 8.0)."

@@ -1,0 +1,209 @@
+id: query-planning
+name: Query Planning & EXPLAIN
+signal: ["“this query got slow” / “it's fast in psql but slow from the app”", "reading an EXPLAIN plan", "deep pagination", "estimates wildly off after a data change", "which query to optimize first"]
+idea: >-
+  The planner picks scans, join order and join algorithms by estimated cost, and costs come from **row estimates** built on table statistics.
+  Most bad plans are bad estimates: correlated columns, stale stats, skewed values. In `EXPLAIN (ANALYZE, BUFFERS)`, find the lowest node where estimated
+  and actual rows diverge; that is where the plan went wrong. Fix the estimate or the query shape before reaching for settings.
+
+diagram:
+  type: plan
+  caption: "users in Paris and their orders: 2M orders (illustrative EXPLAIN ANALYZE numbers)"
+  frames:
+    - title: Misestimate → nested loop
+      query: "SELECT … FROM users u JOIN orders o ON o.user_id = u.id WHERE u.city = 'Paris' AND u.country = 'FR';"
+      plan:
+        - {op: Nested Loop, est: 40, act: "52,000", ms: "4,870", mark: bad}
+        - {d: 1, op: Index Scan, on: users_city_idx, detail: "Index Cond: city = 'Paris' · Filter: country = 'FR'", est: 40, act: "52,000", mark: bad}
+        - {d: 1, op: Index Scan, on: orders_user_id_idx, detail: "Index Cond: user_id = u.id · loops=52,000", est: 5, act: 4}
+      note: "The planner multiplies the selectivity of `city = 'Paris'` and `country = 'FR'` as if independent and expects 40 users. Real answer: 52,000. A nested loop is perfect for 40 outer rows and terrible for 52,000 index probes."
+    - title: After CREATE STATISTICS
+      query: "CREATE STATISTICS users_geo (dependencies) ON city, country FROM users; ANALYZE users;"
+      plan:
+        - {op: Hash Join, detail: "Hash Cond: o.user_id = u.id", est: "51,800", act: "52,000", ms: "610", mark: good}
+        - {d: 1, op: Seq Scan, on: orders, est: "2,000,000", act: "2,000,000"}
+        - {d: 1, op: Hash, detail: "Buckets: 65,536 · Memory Usage: 4,100 kB"}
+        - {d: 2, op: Bitmap Heap Scan, on: users, detail: "Recheck Cond: city = 'Paris' · Filter: country = 'FR'", est: "51,800", act: "52,000"}
+        - {d: 3, op: Bitmap Index Scan, on: users_city_idx, detail: "Index Cond: city = 'Paris'", est: "52,500", act: "52,400"}
+      note: "Extended statistics teach the planner that city implies country. With the right estimate it builds a hash table of the 52K users and streams orders past it once."
+    - title: Reading a node
+      query: "EXPLAIN (ANALYZE, BUFFERS) …"
+      plan:
+        - {op: Index Scan, on: orders_user_id_idx, detail: "actual time=0.012..0.020 rows=4 loops=52,000 · Buffers: shared hit=208,000 read=1,150", est: 5, act: 4}
+      note: "`rows` and `time` are **per loop**: this node returned 4 × 52,000 = 208,000 rows and took about 0.02 ms × 52,000 ≈ 1 s. `shared hit` pages came from Postgres's cache, `read` from the OS or disk. High `read` counts mean I/O, not CPU."
+
+numbers:
+  - {k: Page costs, v: "seq_page_cost 1 · random_page_cost 4 (≈1.1 on SSD)"}
+  - {k: Statistics sample, v: "300 × default_statistics_target (100) = 30,000 rows"}
+  - {k: Auto-ANALYZE, v: "after ~10% of rows change"}
+  - {k: work_mem, v: "4 MB default, per sort / hash node, per query"}
+  - {k: Generic plans, v: "prepared statements may switch after 5 runs"}
+
+tables:
+  - title: Scan types
+    cols: [Node, Reads, Chosen when]
+    rows:
+      - ["**Seq Scan**", "Every page, in order", "A large share of rows, or a small table"]
+      - ["**Index Scan**", "Index, then a heap page per row (random I/O)", "Few rows, or rows needed in index order"]
+      - ["**Index Only Scan**", "Index only (heap for pages not all-visible)", "All needed columns are in the index and the table is well vacuumed"]
+      - ["**Bitmap Index + Heap Scan**", "Index into a page bitmap, then heap pages in physical order", "Medium selectivity; combining indexes with AND / OR"]
+  - title: Join algorithms
+    cols: [Join, How, Best when, Risk]
+    rows:
+      - ["**Nested Loop**", "For each outer row, look up inner rows (ideally by index)", "Few outer rows", "Disaster when the outer estimate is far too low"]
+      - ["**Hash Join**", "Build a hash table on the smaller side, probe with the other", "Large unsorted inputs, equality joins", "Spills to disk in batches when the hash exceeds work_mem"]
+      - ["**Merge Join**", "Walk two inputs sorted on the join key", "Both sides already sorted (indexes) or huge", "Sorting first can cost more than it saves"]
+  - title: Sargable rewrites
+    cols: [Can't use the index, Can]
+    rows:
+      - ["`WHERE created_at::date = '2026-03-20'`", "`WHERE created_at >= '2026-03-20' AND created_at < '2026-03-21'`"]
+      - ["`WHERE price * 1.2 > 100`", "`WHERE price > 100 / 1.2`"]
+      - ["`WHERE lower(email) = $1`", "An expression index on `lower(email)`, or store it normalized"]
+      - ["`WHERE coalesce(deleted_at, 'infinity') > now()`", "`WHERE deleted_at IS NULL OR deleted_at > now()`"]
+      - ["`WHERE user_ref = 42` on a `text` column", "Compare like with like: `user_ref = '42'`, or fix the column type"]
+      - ["`OFFSET 100000 LIMIT 20`", "Keyset: `WHERE (at, id) < ($at, $id) ORDER BY at DESC, id DESC LIMIT 20`"]
+
+snippets:
+  - task: Small tables get seq scans
+    sql: "EXPLAIN (COSTS OFF) SELECT * FROM orders WHERE id = 3;"
+    out:
+      cols: [QUERY PLAN]
+      rows:
+        - [Seq Scan on orders]
+        - ["  Filter: (id = 3)"]
+    note: "15 rows fit in one page: reading it beats an index descent. Don't judge plans on a dev database; plans depend on table size and statistics."
+  - task: Measure for real
+    sql: |
+      EXPLAIN (ANALYZE, BUFFERS)
+      SELECT u.name, count(*)
+      FROM orders o JOIN users u ON u.id = o.user_id
+      GROUP BY u.name;
+    note: "ANALYZE runs the query. For writes, wrap it: `BEGIN; EXPLAIN ANALYZE UPDATE …; ROLLBACK;`. Add `SETTINGS` (PG 12+) to show non-default planner settings."
+  - task: Teach the planner about correlated columns
+    sql: |
+      CREATE STATISTICS orders_user_status (dependencies, ndistinct)
+        ON user_id, status FROM orders;
+      ANALYZE orders;
+  - task: More detailed statistics for one column
+    sql: |
+      ALTER TABLE orders ALTER COLUMN status SET STATISTICS 1000;
+      ANALYZE orders;
+    note: "More most-common values and histogram buckets for a skewed column, at the cost of slower ANALYZE and planning."
+  - task: Log slow plans automatically
+    sql: |
+      LOAD 'auto_explain';
+      SET auto_explain.log_min_duration = '500ms';
+      SET auto_explain.log_analyze = on;
+    note: "In production, preload it via `session_preload_libraries` and keep `log_analyze` sampled: it adds timing overhead to every query."
+  - task: Find the queries that cost the most
+    run: false
+    sql: |
+      SELECT calls, round(total_exec_time) AS total_ms,
+             round(mean_exec_time, 1) AS mean_ms, rows, left(query, 60) AS query
+      FROM pg_stat_statements
+      ORDER BY total_exec_time DESC
+      LIMIT 10;
+    note: "Needs `shared_preload_libraries = 'pg_stat_statements'` and a restart. Sort by **total** time: a 2 ms query run 10M times a day matters more than a 5 s report run once."
+
+pitfalls:
+  - "**EXPLAIN without ANALYZE** shows estimates only, which is exactly what's suspect. EXPLAIN ANALYZE executes the statement, so roll back writes."
+  - "**Reading per-loop numbers as totals.** Inside a nested loop, `rows` and `time` are averages per loop; multiply by `loops`."
+  - "**Tuning on a toy database.** A 1,000-row dev table gets different plans from a 100M-row production table. Test with production-like statistics and sizes."
+  - "**Fixing plans with global settings.** `enable_nestloop = off` or a huge `work_mem` in postgresql.conf fixes one query and breaks others. Use them to diagnose, then fix statistics, indexes or the query; set per query with `SET LOCAL` if you must."
+  - "**Stale statistics after big changes.** A bulk load or a large delete leaves estimates wrong until auto-ANALYZE runs. Run `ANALYZE` after migrations and loads. After `pg_upgrade` before PG 18, statistics are empty: run `vacuumdb --analyze-in-stages`."
+  - "**Deep OFFSET pagination** reads and throws away every skipped row. Page with a keyset (the second problem)."
+
+depth:
+  - "**Estimates drive everything.** Cost ≈ pages × page cost + rows × CPU cost, and both come from row estimates. Statistics per column hold the most common values, a histogram, n_distinct and correlation; the planner assumes columns are independent unless you add extended statistics (dependencies, ndistinct, mcv; on expressions since PG 14)."
+  - "**Prepared statements and generic plans.** After five executions Postgres may switch to a plan that ignores parameter values. With skewed data (`status = 'pending'` is rare, `'paid'` is everywhere) the generic plan can be wrong for one of them. `plan_cache_mode = force_custom_plan` for those queries."
+  - "**Fast in psql, slow from the app:** usually a generic plan, a parameter type mismatch (the driver sends `numeric` or `text` and an index on `bigint` is skipped), a different `search_path`, or the app runs it inside a long transaction. auto_explain shows the plan the app actually got."
+  - "**Memory spills:** `Sort Method: external merge Disk: 1200MB` or a Hash with `Batches: 16` means work_mem was too small for that node. Raise it for that query (`SET LOCAL work_mem = '256MB'`), remembering it applies per node and per parallel worker."
+  - "**JIT can hurt OLTP.** For queries with high estimated cost, JIT compilation can add 50–200 ms; EXPLAIN shows a `JIT:` section. Raise `jit_above_cost` or turn JIT off for short queries."
+  - "**Join order search** is exhaustive up to `join_collapse_limit` (8) tables, then genetic (GEQO from 12). Very large joins can get erratic plans; CTEs with MATERIALIZED or explicit JOIN order (with the limit lowered) pin it."
+
+mysql:
+  - "`EXPLAIN ANALYZE` since 8.0.18 (tree format; `EXPLAIN FORMAT=TREE` for estimates). Hash joins exist only since 8.0.18; before that, every join was a nested loop."
+  - "No extended statistics: use histograms (`ANALYZE TABLE t UPDATE HISTOGRAM ON col`). Index statistics are sampled per index (`innodb_stats_persistent_sample_pages`)."
+  - "Optimizer hints in comments (`/*+ INDEX(t idx) */`) and `FORCE INDEX` are available; Postgres has none built in (the `pg_hint_plan` extension adds them)."
+  - "The performance schema's `events_statements_summary_by_digest` plays the role of pg_stat_statements."
+
+checks:
+  - q: "EXPLAIN ANALYZE shows a Nested Loop whose outer node estimated 3 rows but returned 80,000. What's going on and what do you try?"
+    a: >-
+      A misestimate on the outer side made a nested loop look cheap; it then ran 80,000 inner probes. Look at that outer node's conditions: correlated columns
+      (add `CREATE STATISTICS … (dependencies)`), stale stats (`ANALYZE`), a skewed value (raise the column's statistics target), or a function the planner can't
+      estimate (a default 0.5% selectivity guess). Fix the estimate and the planner picks a hash join on its own.
+  - q: "A query runs in 20 ms in psql and 3 s from the application. Name likely causes."
+    a: >-
+      The app uses a prepared statement that switched to a generic plan; the driver binds a parameter with a different type, defeating an index; the app runs with
+      different settings (`search_path`, `work_mem`, a role-level setting); or it's waiting on locks inside a long transaction rather than executing.
+      Enable auto_explain or check `pg_stat_activity.wait_event` to see which.
+  - q: "A plan shows `Sort Method: external merge Disk: 1.2GB`. What are your options?"
+    a: >-
+      The sort didn't fit in work_mem. Raise work_mem for this query only; add an index that returns rows already in order (then no sort, and maybe early stop with LIMIT);
+      or sort fewer rows by filtering or aggregating first.
+  - q: "Why is `OFFSET 100000 LIMIT 20` slow even with an index on the sort column?"
+    a: >-
+      The executor still walks and discards the first 100,000 index entries (and their heap rows) to return 20. Keyset pagination starts from the last seen key:
+      `WHERE (at, id) < ($last_at, $last_id) ORDER BY at DESC, id DESC LIMIT 20`, constant cost per page and stable when rows are inserted.
+  - q: "You open pg_stat_statements to find what to optimize. Sort by which column, and why?"
+    a: >-
+      `total_exec_time`: it's calls × mean, the share of database time each query consumes. Then look at `rows` per call and `shared_blks_read` to see whether it's
+      returning too much or reading from disk. Mean time alone over-weights rare reports.
+
+problems:
+  - id: sargable-day
+    title: Orders on one day, index-friendly
+    variant: canonical
+    statement: >-
+      With an index on `orders (created_at)` (see Setup), list the **paid** orders placed on 2026-03-20 UTC: `id`, `user_id`, by id.
+      The plan must be able to use `orders_created_at_idx`.
+    hint: "Don't transform the indexed column. Transform the constant into a range instead."
+    setup: "CREATE INDEX orders_created_at_idx ON orders (created_at);"
+    uses_index: orders_created_at_idx
+    solution: |
+      SELECT id, user_id
+      FROM orders
+      WHERE created_at >= timestamptz '2026-03-20 00:00Z'
+        AND created_at <  timestamptz '2026-03-21 00:00Z'
+        AND status = 'paid'
+      ORDER BY id;
+    expect:
+      cols: [id, user_id]
+      rows:
+        - [10, 3]
+        - [11, 6]
+    insight: >-
+      `created_at::date = '2026-03-20'` gives the same rows but wraps the column in a cast, so the index on `created_at` can't be used; and in another session
+      time zone it's a different day. The half-open range (`>=` start, `<` next day) is sargable, exact at the boundary (order 11 at 22:10 is included,
+      midnight of the 21st is not) and independent of the session zone because the literals carry `Z`.
+    mysql: "Same rewrite: `WHERE DATE(created_at) = …` also defeats MySQL indexes (unless you add a functional index on `(DATE(created_at))`)."
+
+  - id: keyset-page
+    title: The next page, without OFFSET
+    variant: disguise
+    statement: >-
+      Ana's activity feed shows her events newest first, 3 per page, with an index on `events (user_id, at, id)` (see Setup).
+      Page 1 ended at the event with `at = 2026-03-03 09:59Z` and `id = 5`. Return page 2: `id`, `type`, `at`.
+      The plan must use `events_user_at_idx`.
+    hint: "Instead of counting rows to skip, start right after the last row you showed. Ties on `at` need the id too."
+    setup: "CREATE INDEX events_user_at_idx ON events (user_id, at, id);"
+    uses_index: events_user_at_idx
+    solution: |
+      SELECT id, type, at
+      FROM events
+      WHERE user_id = 1
+        AND (at, id) < (timestamptz '2026-03-03 09:59Z', 5)
+      ORDER BY at DESC, id DESC
+      LIMIT 3;
+    expect:
+      cols: [id, type, at]
+      rows:
+        - [4, view, "2026-03-03 09:50:00+00"]
+        - [3, checkout, "2026-03-01 09:14:00+00"]
+        - [2, add_to_cart, "2026-03-01 09:05:00+00"]
+    insight: >-
+      Keyset (seek) pagination: the row comparison `(at, id) < (…)` continues exactly after the last row, and with the index on `(user_id, at, id)` the scan
+      starts there and stops after 3 entries, whatever the page number. OFFSET would read and discard every earlier row, and shows duplicates or gaps when
+      new events arrive between page loads. The trade-off: no “jump to page 50”, only next / previous.
+    mysql: "MySQL supports row constructors too, but historically didn't use indexes well for them; write `at < ? OR (at = ? AND id < ?)`."

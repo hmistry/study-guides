@@ -1,0 +1,111 @@
+# Cheat Sheet: one row per written topic, in catalog order (build-enforced), then syntax groups.
+# Every syntax row runs in the build (rolled back) unless it has run: false.
+topics:
+  - id: setup-ddl
+    when: "Creating databases, tables, columns, roles"
+    move: "`bigint` identity keys, `timestamptz`, `numeric` money, `text`; wrap migrations in BEGIN … COMMIT"
+    gotcha: "Adding NOT NULL to a table with rows: add nullable, backfill, then enforce"
+  - id: joins
+    when: "Combining tables; “never”, “without”, “including zero”"
+    move: "`NOT EXISTS` for anti-joins; optional-side filters in ON; aggregate children before joining"
+    gotcha: "`NOT IN` + a NULL returns nothing; two 1:N joins multiply sums"
+  - id: aggregation
+    when: "Counts and totals per group, pivots, subtotals"
+    move: "Decide the grain first; `count(*) FILTER (WHERE …)` for pivots; `ROLLUP` for totals"
+    gotcha: "`sum()` of no rows is NULL; `count(col)` skips NULLs"
+  - id: nulls-types
+    when: "Missing values, ratios, money, days and time zones"
+    move: "`IS DISTINCT FROM`, `coalesce`, `numeric`, half-open time ranges, `AT TIME ZONE 'Zone/Name'`"
+    gotcha: "`7 / 2 = 3`; `::date` on a timestamptz uses the session zone"
+  - id: subqueries
+    when: "Compare with an aggregate; top-N for each row; named steps"
+    move: "`LEFT JOIN LATERAL (… ORDER BY … LIMIT n) ON true`; CTEs for readability; `WITH x AS (DELETE … RETURNING *)`"
+    gotcha: "Scalar subquery returning 2 rows errors; CTEs are inlined since PG 12 unless MATERIALIZED"
+  - id: windows
+    when: "Rank, running total, previous row, share of group, keep every row"
+    move: "`fn() OVER (PARTITION BY … ORDER BY … ROWS …)`; filter in an outer query"
+    gotcha: "Default frame with ORDER BY is RANGE (ties share); WHERE runs before windows"
+  - id: recursive
+    when: "Hierarchies, chains, graph walks, unknown depth"
+    move: "Anchor `UNION ALL` recursive step joined to the previous level; carry depth and path"
+    gotcha: "No cycle guard = runaway query; add `CYCLE` (PG 14+) or a path / depth check"
+  - id: patterns
+    when: "Top-N per group, latest per key, streaks, sessions, funnels, medians"
+    move: "`rank() … <= N`; `DISTINCT ON`; `day - row_number()` islands; LAG + running sum for sessions"
+    gotcha: "`row_number` drops ties; LAG without PARTITION BY mixes users"
+  - id: writes
+    when: "Upserts, counters, syncs, dedup, backfills, purges"
+    move: "`ON CONFLICT … DO UPDATE SET x = t.x + EXCLUDED.x`; `RETURNING`; `DELETE … USING`; batch big changes"
+    gotcha: "ON CONFLICT needs an exact unique index; UPDATE … FROM with duplicate sources picks one silently"
+  - id: schema-design
+    when: "Designing tables, keys, tenancy, flexible attributes"
+    move: "Model from access patterns; `bigint` or UUIDv7 keys; `(tenant_id, id)` keys; JSONB for sparse attributes"
+    gotcha: "EAV, polymorphic FKs, comma lists; snapshots (price paid) aren't denormalization"
+  - id: constraints
+    when: "Rules that must always hold: uniqueness, references, no overlaps"
+    move: "NOT NULL, CHECK, UNIQUE, FK, `EXCLUDE USING gist`; `NOT VALID` + `VALIDATE` on live tables"
+    gotcha: "CHECK can't see other rows; NULLs don't collide in UNIQUE; index FK columns yourself"
+  - id: indexes
+    when: "Slow lookups, ORDER BY … LIMIT, uniqueness rules"
+    move: "Composite: equality columns, then range / sort column; partial and expression indexes"
+    gotcha: "Functions or casts on the column skip the index; every index slows writes and kills HOT"
+  - id: query-planning
+    when: "Slow queries, bad plans, deep pagination, picking what to optimize"
+    move: "`EXPLAIN (ANALYZE, BUFFERS)`; find where estimated ≠ actual rows; `CREATE STATISTICS`; keyset pagination"
+    gotcha: "Per-loop numbers; generic plans for prepared statements; tuning on a toy database"
+  - id: isolation
+    when: "Read-then-write on money, stock, seats; rules across rows"
+    move: "Atomic `UPDATE … SET x = x - n WHERE x >= n`; constraints; Serializable + retry on 40001"
+    gotcha: "Read Committed loses app-computed updates; RR still allows write skew"
+  - id: locking
+    when: "Deadlocks, job queues, migrations on busy tables, long edits"
+    move: "Lock in a fixed order; `FOR UPDATE SKIP LOCKED`; `lock_timeout` on DDL; version column for long edits"
+    gotcha: "A waiting ALTER blocks every later query; session advisory locks leak through poolers"
+  - id: mvcc-wal
+    when: "Bloat, vacuum trouble, wraparound warnings, WAL and checkpoints"
+    move: "Find the xmin horizon (old transactions, slots); tune autovacuum per table; keep HOT updates possible"
+    gotcha: "One idle-in-transaction session stops cleanup everywhere; VACUUM doesn't shrink files"
+  - id: scaling
+    when: "Connection limits, read scale, huge tables, live migrations, sharding"
+    move: "PgBouncer (transaction mode); replicas with read-your-writes; time partitions; expand-contract"
+    gotcha: "Unique keys must include the partition key; failover needs fencing; untested backups"
+
+syntax:
+  - group: Setup & DDL
+    rows:
+      - {task: Fresh database, sql: "DROP DATABASE IF EXISTS shop WITH (FORCE); CREATE DATABASE shop;", run: false}
+      - {task: Describe a table (psql), sql: "\\d+ orders", run: false}
+      - {task: Create a table, sql: "CREATE TABLE notes (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, body text NOT NULL, created_at timestamptz NOT NULL DEFAULT now());"}
+      - {task: Add a column, sql: "ALTER TABLE orders ADD COLUMN note text;"}
+      - {task: Drop if present, sql: "DROP TABLE IF EXISTS notes CASCADE;"}
+      - {task: Read-only access, sql: "CREATE ROLE ro NOLOGIN; GRANT SELECT ON ALL TABLES IN SCHEMA public TO ro;"}
+  - group: Querying
+    rows:
+      - {task: Anti-join, sql: "SELECT * FROM users u WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id);"}
+      - {task: Conditional counts, sql: "SELECT count(*) FILTER (WHERE status = 'paid') AS paid, count(*) AS total FROM orders;"}
+      - {task: Latest row per key, sql: "SELECT DISTINCT ON (user_id) * FROM events ORDER BY user_id, at DESC;"}
+      - {task: Top 1 for each row, sql: "SELECT u.name, o.id FROM users u LEFT JOIN LATERAL (SELECT id FROM orders WHERE user_id = u.id ORDER BY created_at DESC LIMIT 1) o ON true;"}
+      - {task: Rank within groups, sql: "SELECT name, rank() OVER (PARTITION BY dept ORDER BY salary DESC) FROM employees;"}
+      - {task: Previous row, sql: "SELECT id, lag(created_at) OVER (PARTITION BY user_id ORDER BY created_at) FROM orders;"}
+      - {task: Running total, sql: "SELECT order_id, sum(qty) OVER (ORDER BY order_id, product_id ROWS UNBOUNDED PRECEDING) FROM order_items;"}
+      - {task: A row per day, sql: "SELECT d::date FROM generate_series(timestamptz '2026-03-01', timestamptz '2026-03-07', interval '1 day') AS d;"}
+      - {task: Walk a tree, sql: "WITH RECURSIVE t AS (SELECT id FROM employees WHERE id = 2 UNION ALL SELECT e.id FROM employees e JOIN t ON e.manager_id = t.id) SELECT * FROM t;"}
+      - {task: Local day of an instant, sql: "SELECT (created_at AT TIME ZONE 'Asia/Tokyo')::date FROM orders;"}
+      - {task: NULL-safe comparison, sql: "SELECT * FROM users WHERE country IS DISTINCT FROM 'US';"}
+  - group: Writing
+    rows:
+      - {task: Upsert, sql: "INSERT INTO users (email, name, created_at) VALUES ('ana@example.com', 'Ana', now()) ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name RETURNING id;"}
+      - {task: Update from a list, sql: "UPDATE products p SET price = v.price FROM (VALUES (1, 99.00)) AS v(id, price) WHERE p.id = v.id;"}
+      - {task: Delete duplicates, sql: "DELETE FROM events e USING events k WHERE k.user_id = e.user_id AND k.type = e.type AND k.at = e.at AND k.id < e.id;"}
+      - {task: Claim work, sql: "SELECT id FROM orders WHERE status = 'pending' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED;"}
+      - {task: Atomic decrement with a guard, sql: "UPDATE products SET price = price - 5 WHERE id = 1 AND price >= 5 RETURNING price;"}
+  - group: Operations
+    rows:
+      - {task: Real plan, sql: "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders WHERE user_id = 1;"}
+      - {task: Index without blocking writes, sql: "CREATE INDEX CONCURRENTLY orders_user_idx ON orders (user_id);", run: false}
+      - {task: DDL with a timeout, sql: "SET LOCAL lock_timeout = '2s'; ALTER TABLE orders ADD COLUMN note text;"}
+      - {task: Add a FK online, sql: "ALTER TABLE orders ADD CONSTRAINT orders_user_fk FOREIGN KEY (user_id) REFERENCES users (id) NOT VALID; ALTER TABLE orders VALIDATE CONSTRAINT orders_user_fk;"}
+      - {task: Who blocks whom, sql: "SELECT pid, pg_blocking_pids(pid), left(query, 50) FROM pg_stat_activity WHERE cardinality(pg_blocking_pids(pid)) > 0;"}
+      - {task: Dead rows per table, sql: "SELECT relname, n_dead_tup, last_autovacuum FROM pg_stat_user_tables ORDER BY n_dead_tup DESC;"}
+      - {task: Wraparound age, sql: "SELECT datname, age(datfrozenxid) FROM pg_database ORDER BY 2 DESC;"}
+      - {task: Serializable transaction, sql: "BEGIN ISOLATION LEVEL SERIALIZABLE;", run: false}

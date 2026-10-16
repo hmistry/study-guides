@@ -1,0 +1,203 @@
+id: locking
+name: Locking & Concurrency
+signal: ["“deadlock detected” in the logs", "a job queue or work distribution in Postgres", "a migration that took the site down", "a user edits a record for minutes", "only one worker / cron may run this"]
+idea: >-
+  Readers and writers don't block each other (MVCC), but writers block writers on the same row, and DDL blocks everyone on the table.
+  Row locks live in the row itself and are released at commit. Deadlocks come from locking in different orders; outages come from lock queues,
+  where one waiting ALTER TABLE makes every later query wait behind it. Keep lock-holding transactions short and ordered, and give DDL a timeout.
+
+diagram:
+  type: timeline
+  caption: "time flows down; T1, T2, T3 are separate sessions"
+  sessions: [T1, T2]
+  frames:
+    - title: Deadlock
+      steps:
+        - {t: T1, sql: BEGIN;}
+        - {t: T2, sql: BEGIN;}
+        - {t: T1, sql: "UPDATE accounts SET balance = balance - 10 WHERE id = 1;", out: "locks row 1"}
+        - {t: T2, sql: "UPDATE accounts SET balance = balance - 20 WHERE id = 2;", out: "locks row 2"}
+        - {t: T1, sql: "UPDATE accounts SET balance = balance + 10 WHERE id = 2;", out: "waits for T2", mark: wait}
+        - {t: T2, sql: "UPDATE accounts SET balance = balance + 20 WHERE id = 1;", out: "waits for T1: a cycle", mark: wait}
+        - {t: T2, sql: "(after deadlock_timeout, 1 s)", out: "ERROR 40P01: deadlock detected; T2 is rolled back", mark: error}
+        - {t: T1, sql: "(update proceeds)", out: "UPDATE 1, then COMMIT", mark: ok}
+      note: "Transfer A→B and transfer B→A lock the same two rows in opposite orders. Fix: always lock in a consistent order (lowest id first, or `SELECT … WHERE id IN (1, 2) ORDER BY id FOR UPDATE` up front), and retry 40P01."
+    - title: Queue with SKIP LOCKED
+      steps:
+        - {t: T1, sql: BEGIN;}
+        - {t: T2, sql: BEGIN;}
+        - {t: T1, sql: "SELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED;", out: "1", mark: sees}
+        - {t: T2, sql: "SELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED;", out: "2: skips the locked job 1, no waiting", mark: sees}
+        - {t: T1, sql: "UPDATE jobs SET status = 'done' WHERE id = 1; COMMIT;", mark: ok}
+        - {t: T2, sql: "UPDATE jobs SET status = 'done' WHERE id = 2; COMMIT;", mark: ok}
+      note: "Plain `FOR UPDATE` would make T2 wait for job 1, so 20 workers would process one job at a time. SKIP LOCKED gives each worker a different row. NOWAIT instead errors (55P03) when the row is locked."
+    - title: DDL lock queue
+      sessions: [T1, T2, T3]
+      steps:
+        - {t: T1, sql: "BEGIN; SELECT count(*) FROM orders JOIN order_items …;", out: "a 10-minute report holds ACCESS SHARE"}
+        - {t: T2, sql: "ALTER TABLE orders ADD COLUMN note text;", out: "needs ACCESS EXCLUSIVE: waits for T1", mark: wait}
+        - {t: T3, sql: "SELECT * FROM orders WHERE id = 5;", out: "queues behind T2's request", mark: bad}
+        - {t: T3, sql: "(every new query on orders)", out: "also queues: the site is down", mark: bad}
+        - {t: T1, sql: COMMIT;}
+        - {t: T2, sql: "(ALTER runs, instantly)", mark: ok}
+      note: "Adding a nullable column is instant, but it first has to **get** the lock. While it waits, every new request on the table queues behind it, even plain SELECTs. A metadata-only migration turns into an outage."
+    - title: Fix · lock_timeout
+      sessions: [T1, T2, T3]
+      steps:
+        - {t: T1, sql: "BEGIN; SELECT count(*) FROM orders JOIN order_items …;", out: "long report"}
+        - {t: T2, sql: "SET lock_timeout = '2s'; ALTER TABLE orders ADD COLUMN note text;", out: "waits for T1…", mark: wait}
+        - {t: T3, sql: "SELECT * FROM orders WHERE id = 5;", out: "queued, at most 2 s", mark: wait}
+        - {t: T2, sql: "(after 2 s)", out: "ERROR 55P03: canceling statement due to lock timeout", mark: error}
+        - {t: T3, sql: "(proceeds)", out: "1 row", mark: ok}
+        - {t: T2, sql: "(retry in a few seconds)", out: "ALTER TABLE", mark: ok}
+      note: "Cap how long DDL may wait and retry in a loop. Also cap `statement_timeout` for reports, and run them on a replica."
+
+tables:
+  - title: Row lock modes
+    cols: [Mode, Taken by, Conflicts with]
+    rows:
+      - ["`FOR KEY SHARE`", "Foreign key checks (inserting a child row)", "`FOR UPDATE` only (deleting the parent or changing its key)"]
+      - ["`FOR SHARE`", "Explicit: “don't change this row until I commit”", "`FOR NO KEY UPDATE`, `FOR UPDATE`"]
+      - ["`FOR NO KEY UPDATE`", "Plain UPDATE of non-key columns", "`FOR SHARE`, `FOR NO KEY UPDATE`, `FOR UPDATE`"]
+      - ["`FOR UPDATE`", "DELETE, key updates, `SELECT … FOR UPDATE`", "Every row lock mode"]
+  - title: Table locks taken by common commands
+    cols: [Command, Lock, Blocks]
+    rows:
+      - ["SELECT", "ACCESS SHARE", "Only ACCESS EXCLUSIVE"]
+      - ["INSERT, UPDATE, DELETE", "ROW EXCLUSIVE", "SHARE and stronger (e.g. plain CREATE INDEX)"]
+      - ["VACUUM, ANALYZE, CREATE INDEX CONCURRENTLY, VALIDATE CONSTRAINT", "SHARE UPDATE EXCLUSIVE", "Other schema changes and vacuums, not reads or writes"]
+      - ["CREATE INDEX", "SHARE", "All writes"]
+      - ["Most ALTER TABLE, DROP, TRUNCATE, VACUUM FULL, CLUSTER", "ACCESS EXCLUSIVE", "Everything, including SELECT"]
+
+snippets:
+  - task: Lock or fail fast
+    sql: SELECT id FROM orders WHERE id = 13 FOR UPDATE NOWAIT;
+    out:
+      cols: [id]
+      rows: [[13]]
+    note: "If another transaction holds the row, this fails at once with 55P03 instead of waiting: good for “someone else is editing this”."
+  - task: An application-level mutex (advisory lock)
+    sql: SELECT pg_try_advisory_xact_lock(42) AS got_it;
+    out:
+      cols: [got_it]
+      rows: [[true]]
+    note: "Locks an arbitrary number, released at commit. Use it to make a cron job run on one node only. Session-level `pg_advisory_lock` survives commits, which leaks across clients behind a transaction-mode pooler."
+  - task: Give DDL a timeout
+    sql: |
+      SET LOCAL lock_timeout = '2s';
+      ALTER TABLE orders ADD COLUMN note text;
+  - task: Who is blocking whom
+    sql: |
+      SELECT pid, pg_blocking_pids(pid) AS blocked_by, state,
+             now() - xact_start AS xact_age, left(query, 60) AS query
+      FROM pg_stat_activity
+      WHERE cardinality(pg_blocking_pids(pid)) > 0;
+    note: "Then `pg_cancel_backend(pid)` stops a query and `pg_terminate_backend(pid)` ends the session."
+
+pitfalls:
+  - "**Locking rows in different orders.** Two transactions updating the same rows in opposite orders deadlock. Sort first: `SELECT … WHERE id = ANY($ids) ORDER BY id FOR UPDATE`, then update."
+  - "**Holding locks across slow work.** A transaction that locks a row and then calls a payment API holds the lock for seconds, and everyone queues. Lock, write, commit; do remote calls outside the transaction."
+  - "**DDL without `lock_timeout`** on busy tables (see the timeline): an instant change can still cause an outage while it waits."
+  - "**`FOR UPDATE` when `FOR NO KEY UPDATE` is enough.** FOR UPDATE also blocks inserts of child rows that reference the locked row (their FK check needs KEY SHARE)."
+  - "**Session advisory locks behind PgBouncer in transaction mode.** The lock stays on a server connection that other clients reuse. Use the `_xact_` variants."
+  - "**Plain FOR UPDATE for work queues.** Workers wait on the same first row and run one at a time. SKIP LOCKED."
+
+depth:
+  - "**Row locks are stored in the tuple header** (`xmax` plus info bits), not in a lock table, so locking a million rows costs no memory but dirties every page touched. Shared row locks held by several transactions use MultiXact ids, which have their own wraparound to watch on hot parent rows."
+  - "**Queues in Postgres** work well up to thousands of jobs per second: claim with `UPDATE … WHERE id = (SELECT … FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING`, commit, then process. Track a lease (`locked_until`) so crashed workers' jobs are retried. High churn makes the table bloat: keep it small, vacuum aggressively, or partition it."
+  - "**Deadlock detection is lazy.** After `deadlock_timeout` (1 s) a waiting backend checks for a cycle and aborts one transaction with 40P01. Most deadlocks are a lock-ordering bug; the retry is the safety net."
+  - "**Optimistic vs pessimistic.** `FOR UPDATE` suits short critical sections inside one request. For edits spanning user think time, use a version column (`UPDATE … WHERE id = $1 AND version = $2`; zero rows means someone else saved first), or compare `xmin`."
+  - "**Lock queues are FIFO by conflict.** A queued ACCESS EXCLUSIVE request blocks later weaker requests that conflict with it, even if they don't conflict with the current holder. That's why the waiting ALTER, not the long SELECT, takes the site down."
+  - "**Hot rows serialize writers.** One inventory row for a flash-sale item or one global counter turns every write into a queue. Split it (N counter rows summed on read), batch updates, or move the hot path to a queue."
+
+mysql:
+  - "InnoDB takes gap and next-key locks under Repeatable Read: `SELECT … FOR UPDATE` on a missing key locks the gap, so two sessions doing “check, then insert” for the same new key deadlock."
+  - "`SKIP LOCKED` and `NOWAIT` exist since 8.0."
+  - "DDL waits on metadata locks (MDL) with the same queueing problem, and `lock_wait_timeout` defaults to one year. Set it to a few seconds for migrations."
+  - "Advisory locks: `GET_LOCK('name', timeout)` / `RELEASE_LOCK('name')`, held per session."
+
+checks:
+  - q: "Two money transfers occasionally fail with 40P01. Why, and how do you stop it?"
+    a: >-
+      Transfer A→B locks A then B; a concurrent B→A locks B then A: a cycle. Lock both accounts in a fixed order (by id) at the start of the transaction,
+      e.g. `SELECT … WHERE id IN ($a, $b) ORDER BY id FOR UPDATE`, then update. Keep a retry on 40P01 anyway.
+  - q: "A migration that only added a nullable column caused a three-minute outage. What happened?"
+    a: >-
+      The ALTER needed ACCESS EXCLUSIVE and queued behind a long-running query (or an idle-in-transaction session). Every query that arrived after it queued
+      behind the ALTER. Use `SET lock_timeout = '2s'` with retries for DDL, and `statement_timeout` / `idle_in_transaction_session_timeout` for the rest.
+  - q: "Twenty workers poll a jobs table with `SELECT … ORDER BY id LIMIT 1 FOR UPDATE`, yet throughput equals one worker. Why, and the fix?"
+    a: >-
+      All of them select the same first row; nineteen wait on its lock. Add `SKIP LOCKED` so each takes the first row nobody holds, and keep the claiming
+      transaction short (claim, commit, then do the work).
+  - q: "A user edits a product form for ten minutes. How do you avoid overwriting someone else's save without holding a lock that long?"
+    a: >-
+      Optimistic locking: read the row with its `version`; save with `UPDATE … SET …, version = version + 1 WHERE id = $1 AND version = $2`.
+      Zero rows updated means someone saved first: show a conflict and let the user merge (the second problem).
+  - q: "Inserting order rows sometimes waits on an update to `users`. How can a child insert be blocked by the parent?"
+    a: >-
+      The FK check takes FOR KEY SHARE on the parent user row. That conflicts with FOR UPDATE, taken by a DELETE of the user, an update of its key,
+      or an explicit `SELECT … FOR UPDATE` on it. Ordinary updates of non-key columns take FOR NO KEY UPDATE and don't conflict. Use NO KEY UPDATE for explicit locks.
+
+problems:
+  - id: claim-next-job
+    title: Claim the next job
+    variant: canonical
+    statement: >-
+      `jobs` (see Setup) is a work queue shared by many workers. Write **one statement** that worker `w1` runs to claim the next due job: the queued job with the
+      oldest `run_at` that is due now, set it to `running` with `locked_by = 'w1'`, and return `id`, `status`, `locked_by`. It must be safe with many workers polling at once.
+    hint: "Pick the row in a subquery that locks it but doesn't wait for rows other workers already hold."
+    setup: |
+      CREATE TABLE jobs (
+        id        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        status    text NOT NULL DEFAULT 'queued',
+        run_at    timestamptz NOT NULL,
+        locked_by text
+      );
+      INSERT INTO jobs (status, run_at) VALUES
+        ('done',   '2026-03-01 08:00Z'),
+        ('queued', '2026-03-01 10:00Z'),
+        ('queued', '2026-03-01 09:00Z'),
+        ('queued', '2099-01-01 00:00Z');
+    solution: |
+      UPDATE jobs
+      SET status = 'running', locked_by = 'w1'
+      WHERE id = (
+        SELECT id FROM jobs
+        WHERE status = 'queued' AND run_at <= now()
+        ORDER BY run_at
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+      )
+      RETURNING id, status, locked_by;
+    expect:
+      cols: [id, status, locked_by]
+      rows: [[3, running, w1]]
+    insight: >-
+      Job 3 is due earliest (09:00); job 4 isn't due; job 1 is done. `FOR UPDATE SKIP LOCKED` in the subquery means a concurrent worker skips job 3 and takes job 2
+      instead of waiting. Without SKIP LOCKED they'd all queue on job 3; with a plain SELECT and no lock, two workers could claim the same job.
+      Commit right after claiming; add a partial index `ON jobs (run_at) WHERE status = 'queued'` so the pick stays cheap as `done` rows pile up.
+    mysql: "MySQL can't select from the table being updated in a subquery: `SELECT id … FOR UPDATE SKIP LOCKED` first, then `UPDATE … WHERE id = ?` in the same transaction."
+
+  - id: optimistic-save
+    title: Save only if unchanged
+    variant: disguise
+    statement: >-
+      Products now carry a `version` (see Setup). An editor loaded product 2 at version 1 and wants to set its price to 42.00. Write the save so that it only
+      succeeds if nobody changed the product since, bumps the version, and returns `id`, `price`, `version` (no row means “conflict”).
+    hint: "Make “nobody changed it” part of the UPDATE's WHERE clause."
+    setup: |
+      ALTER TABLE products ADD COLUMN version int NOT NULL DEFAULT 1;
+      UPDATE products SET price = 38.00, version = 2 WHERE id = 4;
+    solution: |
+      UPDATE products
+      SET price = 42.00, version = version + 1
+      WHERE id = 2 AND version = 1
+      RETURNING id, price, version;
+    expect:
+      cols: [id, price, version]
+      rows: [[2, 42.00, 2]]
+    insight: >-
+      Optimistic concurrency: no lock is held while the user thinks; the check and the write are one atomic statement. A concurrent save that already bumped
+      the version makes this update match zero rows, which the app reports as a conflict. The same statement shape works through an ORM (`@Version` in JPA,
+      `lock_version` in Rails). Without a version column, compare the system column `xmin` the row had when read.
+    mysql: "Same statement; check the affected-rows count instead of RETURNING."

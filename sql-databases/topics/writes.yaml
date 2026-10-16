@@ -1,0 +1,159 @@
+id: writes
+name: Writing Data
+signal: ["“insert, or update if it exists”", "counters and idempotent writes", "sync a table from a feed", "remove duplicates", "backfill or purge millions of rows"]
+idea: >-
+  Writes are where correctness and concurrency meet. `INSERT … ON CONFLICT` is an atomic upsert keyed by a unique index; `RETURNING` hands back
+  what a statement changed without a second query; `UPDATE … FROM` and `DELETE … USING` join to other tables. Big changes go in batches,
+  so locks, WAL and replica lag stay bounded.
+
+tables:
+  - title: Upsert options
+    cols: [Statement, Does, Concurrency]
+    rows:
+      - ["`INSERT … ON CONFLICT (key) DO NOTHING`", "Insert unless the key exists", "Atomic against concurrent inserts; returns no row on conflict"]
+      - ["`INSERT … ON CONFLICT (key) DO UPDATE SET … EXCLUDED.col`", "Insert or update the existing row", "Atomic; locks the existing row; can't touch the same row twice in one statement"]
+      - ["`MERGE INTO t USING s ON … WHEN MATCHED / NOT MATCHED`", "Full sync: insert, update, delete per match (PG 15+)", "Not race-free: concurrent inserts can still raise unique violations"]
+      - ["`UPDATE`, then `INSERT` if 0 rows", "App-side upsert", "Races: two sessions both see 0 rows; needs a retry on 23505"]
+
+snippets:
+  - task: Get generated values back
+    sql: |
+      INSERT INTO products (name, category, price)
+      VALUES ('Cable', 'peripherals', 9.50)
+      RETURNING id, name;
+    out:
+      cols: [id, name]
+      rows: [[9, Cable]]
+  - task: DO NOTHING returns nothing
+    sql: |
+      INSERT INTO users (email, name, created_at)
+      VALUES ('ana@example.com', 'Ana', now())
+      ON CONFLICT (email) DO NOTHING
+      RETURNING id;
+    out:
+      cols: [id]
+      rows: []
+    note: "On conflict, RETURNING yields no row, so “get or create” needs a follow-up SELECT (or `DO UPDATE SET email = EXCLUDED.email` to force a row back, at the cost of a write)."
+  - task: Update from another table (UPDATE … FROM)
+    sql: |
+      UPDATE products p
+      SET price = v.price
+      FROM (VALUES (1, 110.00), (2, 35.00)) AS v(id, price)
+      WHERE p.id = v.id
+      RETURNING p.id, p.name, p.price;
+    out:
+      cols: [id, name, price]
+      rows:
+        - [1, Mechanical keyboard, 110.00]
+        - [2, Wireless mouse, 35.00]
+      order: false
+  - task: Sync from a feed (MERGE)
+    since: PG 15
+    sql: |
+      MERGE INTO products p
+      USING (VALUES ('Webcam', 75.00), ('Ring light', 50.00)) AS s(name, price)
+      ON p.name = s.name
+      WHEN MATCHED THEN UPDATE SET price = s.price
+      WHEN NOT MATCHED THEN INSERT (name, category, price)
+                            VALUES (s.name, 'peripherals', s.price);
+      SELECT name, price FROM products
+      WHERE name IN ('Webcam', 'Ring light')
+      ORDER BY name;
+    out:
+      cols: [name, price]
+      rows:
+        - [Ring light, 50.00]
+        - [Webcam, 75.00]
+  - task: Copy rows into another table
+    sql: |
+      CREATE TABLE orders_archive (LIKE orders INCLUDING ALL);
+      INSERT INTO orders_archive
+      SELECT * FROM orders WHERE status = 'cancelled';
+      SELECT count(*) AS archived FROM orders_archive;
+    out:
+      cols: [archived]
+      rows: [[2]]
+  - task: Delete in batches
+    sql: |
+      DELETE FROM events
+      WHERE id IN (
+        SELECT id FROM events
+        WHERE at < '2026-03-05'
+        ORDER BY id
+        LIMIT 1000
+      );
+    note: "Run it in a loop (one transaction per batch) until it deletes 0 rows, pausing between batches so replicas and autovacuum keep up. For time-partitioned data, dropping a whole partition is instant."
+
+pitfalls:
+  - "**ON CONFLICT needs a matching unique index.** The conflict target must match a unique index or constraint exactly, including a partial index's predicate (`ON CONFLICT (user_id) WHERE status = 'cart'`)."
+  - "**Touching one row twice in an upsert.** If the input has the same key twice, `DO UPDATE` fails (“cannot affect row a second time”). Deduplicate the input first."
+  - "**UPDATE … FROM with several matching source rows** updates the target once with an arbitrary match, without an error. Make the source unique per key. (MERGE raises an error in this case.)"
+  - "**One giant UPDATE or DELETE.** Millions of rows in one transaction hold locks for minutes, write a burst of WAL that replicas lag behind, and leave dead rows for VACUUM. Batch by key range."
+  - "**Assuming ids are gapless.** Failed and rolled-back inserts still consume sequence values. Never use ids as invoice numbers or counts."
+  - "**Read-then-write upserts in the app.** `SELECT`, then `INSERT` if missing, races under concurrency. Let ON CONFLICT do it in one statement."
+
+mysql:
+  - "`INSERT … ON DUPLICATE KEY UPDATE` fires on a conflict with **any** unique key, not a chosen one. Reference the new values as `VALUES(col)` (deprecated) or a row alias (8.0.19+)."
+  - "`REPLACE INTO` deletes and re-inserts: it fires DELETE cascades and gives the row a new auto-increment id."
+  - "No RETURNING and no MERGE. Multi-table updates use `UPDATE a JOIN b ON … SET …`; `DELETE … LIMIT n` works directly."
+
+problems:
+  - id: view-counter-upsert
+    title: View counters in one statement
+    variant: canonical
+    statement: >-
+      `product_views(product_id, views)` (see Setup) holds a counter per product. Record one view of product 1 and one of product 3 in a **single statement**:
+      increment existing counters, create missing ones at 1.
+    hint: "Insert the new counts; on a key conflict, add the incoming value to the stored one."
+    setup: |
+      CREATE TABLE product_views (
+        product_id bigint PRIMARY KEY REFERENCES products (id),
+        views      int NOT NULL
+      );
+      INSERT INTO product_views VALUES (1, 10);
+    solution: |
+      INSERT INTO product_views (product_id, views)
+      VALUES (1, 1), (3, 1)
+      ON CONFLICT (product_id)
+      DO UPDATE SET views = product_views.views
+                            + EXCLUDED.views;
+    check: "SELECT product_id, views FROM product_views ORDER BY product_id"
+    expect:
+      cols: [product_id, views]
+      rows:
+        - [1, 11]
+        - [3, 1]
+    insight: >-
+      `EXCLUDED` is the row that would have been inserted; the bare table name is the existing row. The increment happens under the row lock,
+      so concurrent upserts compose instead of losing counts. For a very hot counter (one row hammered by thousands of writers), the row lock serializes them:
+      shard the counter into N rows and sum on read, or buffer increments and flush periodically.
+    mysql: "`INSERT INTO product_views VALUES (1, 1), (3, 1) AS new ON DUPLICATE KEY UPDATE views = product_views.views + new.views` (8.0.19+)."
+
+  - id: delete-duplicates
+    title: Delete duplicate events
+    variant: disguise
+    statement: >-
+      A retrying client inserted some events twice (see Setup). Delete the duplicates, where a duplicate has the same `user_id`, `type` and `at`,
+      **keeping the earliest** (lowest id) copy of each.
+    hint: "A row should go if another row exists that's identical but has a smaller id."
+    setup: |
+      INSERT INTO events (user_id, type, at) VALUES
+        (1, 'view', '2026-03-01 09:00Z'),
+        (1, 'view', '2026-03-01 09:00Z'),
+        (8, 'view', '2026-03-15 10:20Z');
+    solution: |
+      DELETE FROM events e
+      USING events keep
+      WHERE keep.user_id = e.user_id
+        AND keep.type = e.type
+        AND keep.at = e.at
+        AND keep.id < e.id;
+    check: "SELECT count(*) AS events, count(DISTINCT (user_id, type, at)) AS distinct_events, max(id) AS max_id FROM events"
+    expect:
+      cols: [events, distinct_events, max_id]
+      rows: [[24, 24, 24]]
+    insight: >-
+      A self-join delete: each row with an older twin goes, so triplicates are handled too. The window version is
+      `DELETE FROM events WHERE id IN (SELECT id FROM (SELECT id, row_number() OVER (PARTITION BY user_id, type, at ORDER BY id) AS rn FROM events) d WHERE rn > 1)`.
+      Then stop it recurring: add `UNIQUE (user_id, type, at)` (or an idempotency key) and make the client's insert `ON CONFLICT DO NOTHING`.
+    mysql: "`DELETE e FROM events e JOIN events keep ON … AND keep.id < e.id` (multi-table DELETE syntax)."

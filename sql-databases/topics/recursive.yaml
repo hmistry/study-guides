@@ -1,0 +1,173 @@
+id: recursive
+name: Recursive CTEs
+signal: ["hierarchies: org charts, categories, threaded comments", "“everyone under …” / “the chain up to …”", "paths through a graph", "unknown depth", "generate rows from nothing (a sequence of dates)"]
+idea: >-
+  `WITH RECURSIVE` runs an anchor query once, then repeatedly runs the recursive part against only the rows the previous step produced,
+  stopping when a step returns nothing. The result is everything appended together. Depth and paths are columns you carry yourself,
+  and so is the guard against cycles: real graphs have them, and without a guard the query never ends.
+
+diagram:
+  type: table
+  caption: "WITH RECURSIVE team: everyone under Grace (see the first problem)"
+  cols: [step, name, manager, depth]
+  rows:
+    - [anchor, Linus, Grace, 1]
+    - [anchor, Ken, Grace, 1]
+    - [anchor, Barbara, Grace, 1]
+    - [step 1, Dennis, Linus, 2]
+  frames:
+    - title: Anchor
+      expr: "SELECT id, name, 1 AS depth FROM employees WHERE manager_id = 2"
+      win: [0, 1, 2]
+      note: "The anchor runs once: Grace's direct reports become the first working table."
+    - title: Step 1
+      expr: "SELECT e.id, e.name, t.depth + 1 FROM employees e JOIN team t ON e.manager_id = t.id"
+      cur: 3
+      win: [0, 1, 2]
+      note: "The recursive part joins against the **previous step's rows only** (highlighted), not the whole result. Linus has a report: Dennis, depth 2."
+    - title: Step 2 · stop
+      expr: "SELECT … JOIN team t ON e.manager_id = t.id   -- t is now just Dennis"
+      win: [3]
+      note: "Nobody reports to Dennis, so this step returns no rows and the recursion stops. The result is all four rows (UNION ALL of every step)."
+
+snippets:
+  - task: Print a tree in order
+    sql: |
+      WITH RECURSIVE tree AS (
+        SELECT id, name, ARRAY[name] AS path
+        FROM employees WHERE manager_id IS NULL
+        UNION ALL
+        SELECT e.id, e.name, t.path || e.name
+        FROM employees e JOIN tree t ON e.manager_id = t.id
+      )
+      SELECT repeat('  ', cardinality(path) - 1) || name AS org
+      FROM tree
+      ORDER BY path;
+    out:
+      cols: [org]
+      rows:
+        - [Ada]
+        - ["  Grace"]
+        - ["    Barbara"]
+        - ["    Ken"]
+        - ["    Linus"]
+        - ["      Dennis"]
+        - ["  Margaret"]
+        - ["    Alan"]
+        - ["    Edsger"]
+        - ["  Radia"]
+        - ["    Frances"]
+        - ["    Hedy"]
+    note: "Ordering by the accumulated path gives depth-first order. `SEARCH DEPTH FIRST BY name SET ord` (PG 14+) does the same declaratively."
+  - task: Stop at cycles (CYCLE clause)
+    since: PG 14
+    sql: |
+      WITH RECURSIVE g(src, dst) AS (VALUES (1, 2), (2, 3), (3, 1)),
+      walk(node, depth) AS (
+        SELECT 1, 0
+        UNION ALL
+        SELECT g.dst, w.depth + 1 FROM walk w JOIN g ON g.src = w.node
+      ) CYCLE node SET is_cycle USING path
+      SELECT node, depth, is_cycle FROM walk ORDER BY depth;
+    out:
+      cols: [node, depth, is_cycle]
+      rows:
+        - [1, 0, false]
+        - [2, 1, false]
+        - [3, 2, false]
+        - [1, 3, true]
+    note: "The row that closes the loop is emitted with `is_cycle = true` and not expanded further. Before PG 14: carry an array path and add `WHERE NOT next = ANY(path)`."
+  - task: Generate rows without a table
+    sql: |
+      WITH RECURSIVE n(i) AS (
+        SELECT 1
+        UNION ALL
+        SELECT i + 1 FROM n WHERE i < 5
+      )
+      SELECT string_agg(i::text, ',') AS numbers FROM n;
+    out:
+      cols: [numbers]
+      rows: [["1,2,3,4,5"]]
+    note: "In Postgres, `generate_series` is simpler; the recursive form is the portable one (MySQL has no generate_series)."
+
+pitfalls:
+  - "**No cycle guard.** A single bad row (an employee who manages their own manager, a category that is its own ancestor) makes the query run until it hits memory or `statement_timeout`. Add `CYCLE`, a path check, or at least a depth limit."
+  - "**UNION instead of UNION ALL.** UNION deduplicates each step against everything so far, which can hide a cycle but costs a hash of the whole result every iteration. Use UNION ALL plus an explicit guard."
+  - "**Filtering in the outer query instead of the recursion.** `WHERE depth <= 3` outside still computes the full tree. Put the limit in the recursive part's WHERE."
+  - "**Unindexed parent column.** Each step joins on `manager_id` (or `parent_id`); without an index, every level is a full scan."
+  - "**Type mismatches between anchor and recursive part.** `'Ann'` in the anchor and `t.path || ' > ' || name` in the recursion can disagree (`unknown` vs `text`, `varchar(10)` vs `text`). Cast in the anchor: `name::text`."
+
+mysql:
+  - "`WITH RECURSIVE` needs MySQL 8.0. No CYCLE or SEARCH clauses; recursion stops at `cte_max_recursion_depth` (1000 by default) with an error."
+  - "No arrays for paths: build a delimited string with `CONCAT` and check it with `FIND_IN_SET` or `LOCATE`."
+
+problems:
+  - id: reporting-chain
+    title: Everyone under Grace
+    variant: canonical
+    statement: >-
+      List everyone who reports to Grace directly or indirectly, with their depth (1 = direct report).
+      Columns `name`, `depth`, ordered by depth then name.
+    hint: "Anchor: Grace's direct reports. Recursive step: employees whose manager is in the previous step."
+    solution: |
+      WITH RECURSIVE team AS (
+        SELECT id, name, 1 AS depth
+        FROM employees
+        WHERE manager_id = (SELECT id FROM employees
+                            WHERE name = 'Grace')
+        UNION ALL
+        SELECT e.id, e.name, t.depth + 1
+        FROM employees e
+        JOIN team t ON e.manager_id = t.id
+      )
+      SELECT name, depth
+      FROM team
+      ORDER BY depth, name;
+    expect:
+      cols: [name, depth]
+      rows:
+        - [Barbara, 1]
+        - [Ken, 1]
+        - [Linus, 1]
+        - [Dennis, 2]
+    insight: >-
+      Downward traversal: the join condition points from child to the previous level (`e.manager_id = t.id`). The anchor uses a scalar subquery,
+      which is safe only if names are unique; real code passes the id. Add `WHERE t.depth < 10` in the recursive part if bad data could loop.
+    mysql: "Same query on 8.0."
+
+  - id: referral-chain
+    title: Referral chains
+    variant: disguise
+    statement: >-
+      For every user who was referred by someone, show the full chain back to the original referrer as text, like `Dev ← Ben ← Ana`,
+      and the number of hops. Columns `name`, `chain`, `hops`, ordered by user id.
+    hint: "This one walks **up** the tree. Carry the starting user and the growing string along, and keep the rows where there's nobody left to follow."
+    solution: |
+      WITH RECURSIVE up AS (
+        SELECT id AS start_id, referred_by AS next_id,
+               name::text AS chain, 0 AS hops
+        FROM users
+        WHERE referred_by IS NOT NULL
+        UNION ALL
+        SELECT up.start_id, r.referred_by,
+               up.chain || ' ← ' || r.name, up.hops + 1
+        FROM up
+        JOIN users r ON r.id = up.next_id
+      )
+      SELECT u.name, up.chain, up.hops
+      FROM up
+      JOIN users u ON u.id = up.start_id
+      WHERE up.next_id IS NULL
+      ORDER BY u.id;
+    expect:
+      cols: [name, chain, hops]
+      rows:
+        - [Ben, Ben ← Ana, 1]
+        - [Chloe, Chloe ← Ana, 1]
+        - [Dev, Dev ← Ben ← Ana, 2]
+        - [Gia, Gia ← Chloe ← Ana, 2]
+    insight: >-
+      Every user starts their own walk; each step follows `referred_by` one level up. Intermediate rows (`Dev ← Ben`, still pointing at Ana) are part of the result
+      too, so the outer query keeps only finished walks: `next_id IS NULL`. The `name::text` cast in the anchor fixes the column type for the concatenation.
+      If a referral loop were possible, the walk would never finish: guard with `hops < 50` or `CYCLE next_id SET …`.
+    mysql: "Use `CONCAT(up.chain, ' ← ', r.name)` and cast the anchor with `CAST(name AS CHAR(1000))`: the column type comes from the anchor, so longer chains fail with “Data too long” in strict mode."

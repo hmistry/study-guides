@@ -1,0 +1,191 @@
+id: constraints
+name: Constraints & Integrity
+signal: ["“this must never happen” rules", "double bookings, overlapping ranges", "values that must reference something", "adding a rule to a huge existing table", "reordering items that must stay unique"]
+idea: >-
+  Constraints are the only rules that hold for every writer, at every isolation level, forever. NOT NULL, CHECK, UNIQUE, FOREIGN KEY and EXCLUDE
+  cover most invariants, and unique and exclusion checks also see concurrent uncommitted rows, which no application check can.
+  What they can't express (a sum across rows) needs locking or Serializable. On live tables, add them as NOT VALID, then VALIDATE.
+
+tables:
+  - title: Constraint kinds
+    cols: [Constraint, Enforces, Cost / caveat]
+    rows:
+      - ["**NOT NULL**", "A value is present", "Cheapest; prefer it to `CHECK (x IS NOT NULL)`"]
+      - ["**CHECK**", "A condition on one row: `price > 0`, `ends_at > starts_at`", "Can't look at other rows or tables; a function that does is never rechecked"]
+      - ["**UNIQUE / PRIMARY KEY**", "No duplicate values", "Backed by a unique index; NULLs don't collide unless `NULLS NOT DISTINCT` (PG 15+)"]
+      - ["**FOREIGN KEY**", "The referenced row exists", "Takes a KEY SHARE lock on the parent row; index the child column yourself"]
+      - ["**EXCLUDE**", "No two rows conflict by given operators (overlap)", "GiST index; `btree_gist` for `=` on plain columns"]
+  - title: Foreign key actions
+    cols: [ON DELETE, Effect, Use for]
+    rows:
+      - ["`NO ACTION` (default)", "Error if children exist; checked at end of statement, can be deferred", "Most references"]
+      - ["`RESTRICT`", "Error immediately, never deferred", "History you must not lose (orders → users)"]
+      - ["`CASCADE`", "Delete the children too", "Owned data: line items, sessions, link rows"]
+      - ["`SET NULL` / `SET DEFAULT`", "Detach the children", "Optional relations (an assignee who left)"]
+  - title: Adding constraints to a live table
+    cols: [Constraint, Blocking way, Online way]
+    rows:
+      - ["CHECK", "`ADD CONSTRAINT … CHECK (…)`: full scan under ACCESS EXCLUSIVE", "`ADD … NOT VALID` (instant), then `VALIDATE CONSTRAINT` (reads and writes continue)"]
+      - ["FOREIGN KEY", "`ADD … REFERENCES`: scan, locks both tables", "`NOT VALID`, then `VALIDATE` (index the child column first)"]
+      - ["NOT NULL", "`SET NOT NULL`: full scan under ACCESS EXCLUSIVE", "`CHECK (x IS NOT NULL) NOT VALID`, VALIDATE, then `SET NOT NULL` skips the scan (PG 12+)"]
+      - ["UNIQUE", "`ADD UNIQUE`: builds the index while blocking writes", "`CREATE UNIQUE INDEX CONCURRENTLY`, then `ADD CONSTRAINT … UNIQUE USING INDEX`"]
+
+snippets:
+  - task: Add a CHECK without a long lock
+    sql: |
+      ALTER TABLE products ADD CONSTRAINT price_cap CHECK (price < 10000) NOT VALID;
+      ALTER TABLE products VALIDATE CONSTRAINT price_cap;
+    note: "NOT VALID enforces the rule for new writes immediately; VALIDATE scans existing rows later with a lock that doesn't block reads or writes."
+  - task: Treat NULLs as equal in UNIQUE
+    since: PG 15
+    sql: |
+      CREATE TABLE redemptions (
+        user_id bigint, coupon text,
+        UNIQUE NULLS NOT DISTINCT (user_id, coupon)
+      );
+      INSERT INTO redemptions VALUES (1, NULL);
+      INSERT INTO redemptions VALUES (1, NULL) ON CONFLICT DO NOTHING;
+      SELECT count(*) AS rows FROM redemptions;
+    out:
+      cols: [rows]
+      rows: [[1]]
+    note: "Without `NULLS NOT DISTINCT`, both rows go in: two NULLs are never equal."
+  - task: List a table's constraints
+    sql: |
+      SELECT conname, contype
+      FROM pg_constraint
+      WHERE conrelid = 'orders'::regclass
+        AND contype <> 'n'   -- PG 18 also lists NOT NULLs here
+      ORDER BY conname;
+    out:
+      cols: [conname, contype]
+      rows:
+        - [orders_pkey, p]
+        - [orders_status_check, c]
+        - [orders_user_id_fkey, f]
+    note: "Name constraints deliberately: the name comes back in the error (with SQLSTATE 23505, 23503…), so the app can map it to a message like “email already taken”."
+  - task: A reusable rule (domain)
+    sql: |
+      CREATE DOMAIN email_address AS text
+        CHECK (VALUE ~ '^[^@\s]+@[^@\s]+$');
+      SELECT 'ana@example.com'::email_address AS ok;
+    out:
+      cols: [ok]
+      rows: [[ana@example.com]]
+
+pitfalls:
+  - "**CHECK constraints that call functions reading other tables.** They're only evaluated when this row changes, so they silently go stale when the other table does. That's a trigger plus locking, or a different design."
+  - "**Unindexed foreign key columns.** Deleting or re-keying a parent scans the whole child table, under lock, once per parent row."
+  - "**Adding a constraint the blocking way** on a big table: a full scan while holding ACCESS EXCLUSIVE stops all reads and writes. Use NOT VALID + VALIDATE."
+  - "**Forgetting NULLs in UNIQUE.** `UNIQUE (user_id, coupon)` happily stores many `(1, NULL)` rows."
+  - "**Deferrable unique constraints and upserts.** A DEFERRABLE constraint can't be the arbiter for `ON CONFLICT`; keep a separate non-deferrable index if you need both."
+  - "**Trusting app validation.** Batch scripts, admin consoles and the next service don't run it, and check-then-insert races anyway."
+
+depth:
+  - "**Constraints see the future.** A unique or exclusion check that hits a concurrent **uncommitted** row waits for that transaction and then succeeds or fails. That's why they prevent duplicates and overlaps at Read Committed, where any SELECT-based check races."
+  - "**Cross-row invariants** (allocations ≤ budget, at least one admin) don't fit a constraint. Options: lock the parent row (`SELECT … FROM budgets WHERE id = $1 FOR UPDATE`) before checking; Serializable with retries; or restructure so the rule becomes row-local (store `remaining` on the budget and decrement it with `CHECK (remaining >= 0)`)."
+  - "**Deferrable constraints** check at end of statement (INITIALLY IMMEDIATE) or at commit (INITIALLY DEFERRED). They solve swaps and circular references; the cost is queued checks and losing ON CONFLICT."
+  - "**Foreign key locking.** Inserting a child takes FOR KEY SHARE on the parent row. Ordinary updates of the parent use FOR NO KEY UPDATE, which doesn't conflict, but deleting the parent or changing its key waits. One hot parent row with thousands of child inserts per second creates MultiXact churn."
+  - "**Exclusion constraints generalize UNIQUE**: `EXCLUDE USING gist (room_id WITH =, during WITH &&)` means “no two rows with equal room and overlapping ranges”. The same works for IP ranges, versions valid in time, or one active row per key with a range of validity."
+
+mysql:
+  - "CHECK is enforced from 8.0.16. There are no exclusion constraints and no deferrable constraints: unique checks run row by row, so position swaps need a temporary value."
+  - "Foreign keys exist only on InnoDB, can't reference partitioned tables, and are skipped entirely with `SET foreign_key_checks = 0` (common in imports; nothing re-checks the data afterwards)."
+  - "No NOT VALID: adding a FK or CHECK validates every row at once."
+
+checks:
+  - q: "Bookings must never overlap for a room. The app checks for overlaps before inserting. Why isn't that enough, and what's the database-level fix?"
+    a: >-
+      Two requests can both check, see no overlap, and both insert: a race that no isolation level below Serializable stops. Declare the rule:
+      `EXCLUDE USING gist (room_id WITH =, during WITH &&)` (with the `btree_gist` extension). The second insert waits for the first and then fails with 23P01.
+  - q: "Add a foreign key from a 500M-row table to `users` without downtime. Steps?"
+    a: >-
+      1) `CREATE INDEX CONCURRENTLY` on the child column. 2) With `SET lock_timeout = '2s'`, `ADD CONSTRAINT … FOREIGN KEY … NOT VALID`: a brief lock, new rows checked from now on.
+      3) `VALIDATE CONSTRAINT`: scans existing rows with SHARE UPDATE EXCLUSIVE, which doesn't block reads or writes. Retry step 2 if the lock times out.
+  - q: "A budget's allocations must never exceed its total. Can a CHECK constraint do it?"
+    a: >-
+      No: CHECK sees one row. Either serialize per budget (lock the budget row FOR UPDATE, sum, insert, commit), or make it row-local: keep `remaining` on the budget,
+      decrement it in the same transaction as the insert with `UPDATE budgets SET remaining = remaining - $amt WHERE id = $1`, and let `CHECK (remaining >= 0)` reject overdrafts.
+  - q: "Why does swapping two positions with one UPDATE fail under `UNIQUE (playlist_id, position)`, and what fixes it?"
+    a: >-
+      A non-deferrable unique index is checked row by row: moving item 1 to position 2 collides with the item still at 2. Declare the constraint
+      `DEFERRABLE INITIALLY IMMEDIATE` so it's checked at the end of the statement, after both rows moved (see the second problem).
+  - q: "`orders.user_id`: ON DELETE CASCADE or RESTRICT?"
+    a: >-
+      RESTRICT. Orders are financial history; deleting a user must not silently delete them. Handle account deletion by anonymizing the user row.
+      CASCADE fits owned data with no independent meaning: carts, sessions, link rows.
+
+problems:
+  - id: no-overlapping-bookings
+    title: No overlapping bookings
+    variant: canonical
+    statement: >-
+      `bookings(room_id, during)` (see Setup) stores time ranges. Make the database reject a booking that overlaps another booking of the **same room**.
+      Ranges are half-open, so back-to-back bookings are allowed.
+    hint: "UNIQUE compares with `=`. You need a constraint that compares one column with `=` and another with “overlaps”."
+    setup: |
+      CREATE TABLE bookings (
+        id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        room_id int NOT NULL,
+        during  tstzrange NOT NULL
+      );
+    solution: |
+      CREATE EXTENSION IF NOT EXISTS btree_gist;
+      ALTER TABLE bookings
+        ADD CONSTRAINT bookings_no_overlap
+        EXCLUDE USING gist (room_id WITH =, during WITH &&);
+    tests:
+      - {sql: "INSERT INTO bookings (room_id, during) VALUES (1, '[2026-03-01 10:00Z, 2026-03-01 12:00Z)')", ok: true}
+      - {sql: "INSERT INTO bookings (room_id, during) VALUES (1, '[2026-03-01 11:00Z, 2026-03-01 13:00Z)')", error: exclusion_violation, note: overlaps 11:00–12:00}
+      - {sql: "INSERT INTO bookings (room_id, during) VALUES (1, '[2026-03-01 12:00Z, 2026-03-01 14:00Z)')", ok: true, note: back to back}
+      - {sql: "INSERT INTO bookings (room_id, during) VALUES (2, '[2026-03-01 10:00Z, 2026-03-01 12:00Z)')", ok: true, note: another room}
+      - {sql: "INSERT INTO bookings (room_id, during) VALUES (1, '[2026-03-01 09:00Z, 2026-03-01 15:00Z)')", error: exclusion_violation, note: covers both}
+    check: "SELECT room_id, count(*) AS bookings FROM bookings GROUP BY room_id ORDER BY room_id"
+    expect:
+      cols: [room_id, bookings]
+      rows:
+        - [1, 2]
+        - [2, 1]
+    insight: >-
+      An exclusion constraint is UNIQUE generalized to any operator. It holds under concurrency: a second transaction inserting an overlapping range
+      waits for the first and fails if it commits. `btree_gist` lets GiST handle `=` on the integer `room_id`. PG 18 adds `WITHOUT OVERLAPS` to
+      primary keys and unique constraints for the same idea.
+    mysql: "No exclusion constraints: serialize per room (`SELECT … FROM rooms WHERE id = ? FOR UPDATE`) before checking for overlaps and inserting."
+
+  - id: swap-positions
+    title: Unique positions that can be swapped
+    variant: disguise
+    statement: >-
+      `playlist_items` (see Setup) orders tracks by `position`. Positions must be unique within a playlist, and the app reorders with a single UPDATE that
+      swaps two positions (the first check below). Add the uniqueness rule so that the swap still works.
+    hint: "The rule is plain uniqueness. The question is **when** it's checked."
+    setup: |
+      CREATE TABLE playlist_items (
+        playlist_id int NOT NULL,
+        track       text NOT NULL,
+        position    int NOT NULL
+      );
+      INSERT INTO playlist_items VALUES
+        (1, 'Intro', 1), (1, 'Theme', 2), (1, 'Outro', 3);
+    solution: |
+      ALTER TABLE playlist_items
+        ADD CONSTRAINT playlist_position_key
+        UNIQUE (playlist_id, position)
+        DEFERRABLE INITIALLY IMMEDIATE;
+    tests:
+      - {sql: "UPDATE playlist_items SET position = CASE position WHEN 1 THEN 2 WHEN 2 THEN 1 END WHERE playlist_id = 1 AND position IN (1, 2)", ok: true, note: the swap}
+      - {sql: "INSERT INTO playlist_items VALUES (1, 'Bonus', 3)", error: unique_violation}
+      - {sql: "INSERT INTO playlist_items VALUES (1, 'Bonus', 4)", ok: true}
+    check: "SELECT track, position FROM playlist_items ORDER BY position"
+    expect:
+      cols: [track, position]
+      rows:
+        - [Theme, 1]
+        - [Intro, 2]
+        - [Outro, 3]
+        - [Bonus, 4]
+    insight: >-
+      A plain UNIQUE constraint is checked as each row is updated, so the swap fails halfway with 23505 even though the final state is fine.
+      `DEFERRABLE INITIALLY IMMEDIATE` checks at the end of each statement; `INITIALLY DEFERRED` (or `SET CONSTRAINTS … DEFERRED`) waits until commit,
+      for reorders spread over several statements. The cost: a deferrable constraint can't serve as an ON CONFLICT arbiter.
+    mysql: "No deferrable constraints: move one row to a temporary position (e.g. negative) first, then swap, in one transaction."

@@ -1,0 +1,22 @@
+# Catalog: every topic in display order. A file in topics/ must have an entry here;
+# entries without a file show as "soon".
+partA:   # Setup & querying: exactly 2 verified problems each
+  - {id: setup-ddl, name: Setup & DDL}
+  - {id: joins, name: Joins & Set Operations}
+  - {id: aggregation, name: Aggregation}
+  - {id: nulls-types, name: "NULLs, Types & Dates"}
+  - {id: subqueries, name: "Subqueries, CTEs & LATERAL"}
+  - {id: windows, name: Window Functions}
+  - {id: recursive, name: Recursive CTEs}
+  - {id: patterns, name: Classic Query Patterns}
+  - {id: writes, name: Writing Data}
+
+partB:   # Design & internals: depth + quick checks, 0–2 DDL problems
+  - {id: schema-design, name: Schema Design}
+  - {id: constraints, name: Constraints & Integrity}
+  - {id: indexes, name: Indexes}
+  - {id: query-planning, name: Query Planning & EXPLAIN}
+  - {id: isolation, name: Transactions & Isolation}
+  - {id: locking, name: Locking & Concurrency}
+  - {id: mvcc-wal, name: "MVCC, WAL & VACUUM"}
+  - {id: scaling, name: Running Postgres at Scale}

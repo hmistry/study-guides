@@ -1,0 +1,135 @@
+id: subqueries
+name: Subqueries, CTEs & LATERAL
+signal: ["“compared with the average / the max”", "the latest or top-N row **for each** row of another table", "a query easier to read in named steps", "the result of one step feeds a filter in another", "delete or move rows and report what changed"]
+idea: >-
+  A subquery is a query used as a value (scalar), a set (`IN`, `EXISTS`) or a table (`FROM`). A correlated subquery refers to the outer row and
+  logically runs once per row. `LATERAL` makes a FROM-subquery correlated, which is the cleanest way to say “for each user, their latest 3 orders”.
+  CTEs name steps; since PG 12 they're inlined like subqueries unless referenced twice or marked MATERIALIZED.
+
+tables:
+  - title: Where a subquery can go
+    cols: [Form, Returns, Watch out]
+    rows:
+      - ["Scalar: `(SELECT max(price) FROM products)`", "One value", "Error if it returns 2+ rows; NULL if it returns none"]
+      - ["`x IN (SELECT …)` / `EXISTS (SELECT …)`", "A test per outer row", "`NOT IN` with NULLs (see Joins)"]
+      - ["Derived table: `FROM (SELECT …) AS t`", "A table", "Can't see other FROM items unless LATERAL"]
+      - ["`JOIN LATERAL (SELECT … LIMIT n) t ON true`", "A table per outer row", "Use `LEFT JOIN LATERAL … ON true` to keep rows with no match"]
+      - ["`WITH t AS (…)`", "A named table for the statement", "Inlined (PG 12+) unless `MATERIALIZED`, recursive, or referenced twice"]
+      - ["`WITH t AS (DELETE … RETURNING *)`", "Rows changed by a write", "All sub-statements see the same snapshot: they can't see each other's changes"]
+
+snippets:
+  - task: Scalar subquery per row
+    sql: |
+      SELECT u.name,
+             (SELECT count(*) FROM orders o WHERE o.user_id = u.id) AS orders
+      FROM users u
+      WHERE u.id <= 3
+      ORDER BY u.id;
+    out:
+      cols: [name, orders]
+      rows:
+        - [Ana, 4]
+        - [Ben, 4]
+        - [Chloe, 2]
+    note: "Fine for a few rows or with an index on `orders(user_id)`; for whole tables, a GROUP BY joined once is usually cheaper."
+  - task: Control CTE inlining
+    sql: |
+      WITH big AS MATERIALIZED (
+        SELECT * FROM orders WHERE status = 'paid'
+      )
+      SELECT count(*) FROM big WHERE user_id = 1;
+    out:
+      cols: [count]
+      rows: [[4]]
+    note: "MATERIALIZED computes the CTE once and blocks predicate push-down (the old pre-12 “optimization fence”). `NOT MATERIALIZED` forces inlining even when referenced twice."
+  - task: A write in a CTE
+    sql: |
+      WITH gone AS (
+        DELETE FROM events WHERE user_id = 8 RETURNING id
+      )
+      SELECT count(*) AS deleted FROM gone;
+    out:
+      cols: [deleted]
+      rows: [[3]]
+    note: "Archive-and-delete in one statement: `WITH moved AS (DELETE … RETURNING *) INSERT INTO events_archive SELECT * FROM moved`."
+
+pitfalls:
+  - "**A scalar subquery that can return two rows.** It works in testing and fails in production the first time data has a duplicate (“more than one row returned by a subquery used as an expression”). Aggregate or `LIMIT 1` with an ORDER BY that means something."
+  - "**Plain JOIN LATERAL drops rows.** Users with no orders vanish. Use `LEFT JOIN LATERAL (…) ON true`."
+  - "**Assuming a CTE is computed once.** Since PG 12 a CTE referenced once is inlined; a volatile function in it (`random()`, `nextval`) or an expensive step may run differently than you expect. Say MATERIALIZED when you mean it."
+  - "**Expecting a data-modifying CTE to see its sibling's changes.** All parts of one statement read the same snapshot; the main query sees the old rows, and only RETURNING passes the new ones along."
+  - "**Correlated subqueries without an index.** One subquery per outer row is a nested loop; without an index on the correlated column it's a full scan per row."
+
+mysql:
+  - "CTEs and `LATERAL` need MySQL 8.0 (LATERAL 8.0.14+). MySQL decides on its own whether to merge or materialize derived tables; there's no MATERIALIZED keyword."
+  - "No data-modifying CTEs and no RETURNING (MariaDB has `RETURNING` on DELETE/INSERT)."
+  - "You can't modify a table and select from it in a subquery of the same statement (error 1093); wrap the subquery in a derived table."
+
+problems:
+  - id: latest-paid-order
+    title: Each user's latest paid order
+    variant: canonical
+    statement: >-
+      For **every** user, their most recent paid order's id and its (UTC) date, or NULLs if they have none.
+      Columns `name`, `order_id`, `day`, ordered by user id.
+    hint: "For each user, run a small “top 1” query. Which join lets a subquery see the current user, and keeps users it finds nothing for?"
+    solution: |
+      SELECT u.name, o.id AS order_id,
+             o.created_at::date AS day
+      FROM users u
+      LEFT JOIN LATERAL (
+        SELECT id, created_at
+        FROM orders
+        WHERE user_id = u.id AND status = 'paid'
+        ORDER BY created_at DESC
+        LIMIT 1
+      ) o ON true
+      ORDER BY u.id;
+    expect:
+      cols: [name, order_id, day]
+      rows:
+        - [Ana, 14, 2026-04-02]
+        - [Ben, 12, 2026-03-28]
+        - [Chloe, 10, 2026-03-20]
+        - [Dev, 5, 2026-03-04]
+        - [Emma, 15, 2026-04-05]
+        - [Farid, 11, 2026-03-20]
+        - [Gia, null, null]
+        - [Hugo, null, null]
+    insight: >-
+      LATERAL turns “top N per row” into N index probes per user: with an index on `orders (user_id, status, created_at)` each probe reads one entry.
+      That beats `ROW_NUMBER() … WHERE rn = 1` when there are few users and many orders; with many small groups, the window version (one sort) wins.
+      `DISTINCT ON (user_id) … ORDER BY user_id, created_at DESC` is the Postgres shorthand for the top-1 case.
+    mysql: "`LEFT JOIN LATERAL` works from 8.0.14; older versions use a correlated subquery for each column or a window function."
+
+  - id: above-average-customer
+    title: Customers above the average customer
+    variant: disguise
+    statement: >-
+      Which customers spent more on paid orders than the **average customer** did? Only customers with at least one paid order count toward the average.
+      Columns `name`, `spent`; biggest spender first.
+    hint: "“Average customer” and “average order” are different numbers. Build per-customer totals once, then compare against their average."
+    solution: |
+      WITH spend AS (
+        SELECT o.user_id,
+               sum(i.qty * i.unit_price) AS spent
+        FROM orders o
+        JOIN order_items i ON i.order_id = o.id
+        WHERE o.status = 'paid'
+        GROUP BY o.user_id
+      )
+      SELECT u.name, s.spent
+      FROM spend s
+      JOIN users u ON u.id = s.user_id
+      WHERE s.spent > (SELECT avg(spent) FROM spend)
+      ORDER BY s.spent DESC;
+    expect:
+      cols: [name, spent]
+      rows:
+        - [Ana, 615.00]
+        - [Emma, 600.00]
+    insight: >-
+      The average customer spent 1720 / 6 ≈ 286.67; the average order is 1720 / 11 ≈ 156.36, which would wrongly include Ben (210).
+      The CTE is referenced twice, so Postgres materializes it and computes the totals once. A window version also works:
+      `spent > avg(spent) OVER ()` in a subquery.
+    mysql: "Same query on 8.0."

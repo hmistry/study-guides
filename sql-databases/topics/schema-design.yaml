@@ -1,0 +1,172 @@
+id: schema-design
+name: Schema Design
+signal: ["“design the tables for …”", "choosing primary keys: bigint, UUID, natural", "multi-tenant SaaS data", "attributes that vary per item (JSON?)", "“should we denormalize this?”"]
+idea: >-
+  Normalize until each fact lives in one place, then denormalize only for a measured read path, with a plan for keeping the copies in sync.
+  The choices that are hard to undo are key type and ordering, the tenancy layout, and what is a column versus a JSON field.
+  Start from the access patterns: list the top queries, their cardinalities and the invariants before drawing tables.
+
+numbers:
+  - {k: Key size, v: "bigint 8 B · uuid 16 B, in every index and FK"}
+  - {k: Row overhead, v: "~23 B header + alignment per row version"}
+  - {k: TOAST, v: "values over ~2 KB are compressed or stored out of line"}
+  - {k: Columns per table, v: "max 1600; wide rows cost every update"}
+
+tables:
+  - title: Primary key choices
+    cols: [Key, Size, Insert pattern, Use when]
+    rows:
+      - ["`bigint` identity", "8 B", "Increasing: compact B-tree, writes hit the right edge", "One database generates ids; default choice"]
+      - ["UUIDv4 (`gen_random_uuid()`)", "16 B", "Random: page splits, cache misses, more WAL", "Legacy; prefer v7"]
+      - ["UUIDv7 (`uuidv7()`, PG 18)", "16 B", "Time-ordered: B-tree friendly", "Ids made by clients or many services; safe to expose (but reveals creation time)"]
+      - ["Natural key (code, email)", "varies", "Depends", "Only truly immutable codes (ISO country, currency). Emails and usernames change"]
+      - ["Composite `(tenant_id, id)`", "16 B", "Per tenant", "Multi-tenant: makes cross-tenant references impossible and lines up with sharding"]
+  - title: Normal forms in practice
+    cols: [Rule, Violation smell, Fix]
+    rows:
+      - ["**1NF**: one value per column, no repeating groups", "`tags = 'a,b,c'`; `phone1, phone2, phone3`", "A child table (or an array / JSONB when you never join on it)"]
+      - ["**2NF**: non-key columns depend on the whole key", "`order_items.product_name` depends only on `product_id`", "Keep it in `products`"]
+      - ["**3NF**: no column depends on another non-key column", "`users.zip` and `users.city`", "Look up city from zip, or accept the duplication knowingly"]
+      - ["**Not a violation**: snapshots", "`order_items.unit_price` vs `products.price`", "Price paid is a different fact from today's price: keep both"]
+  - title: Multi-tenant layouts
+    cols: [Layout, Isolation, Scales to, Cost]
+    rows:
+      - ["Shared tables + `tenant_id`", "Row level (app + RLS)", "Millions of tenants; shards by tenant", "Every key, index and query must lead with `tenant_id`"]
+      - ["Schema per tenant", "Namespace", "Hundreds to low thousands", "Catalog bloat; every migration runs N times"]
+      - ["Database per tenant", "Strong; per-tenant backup and restore", "Tens to hundreds per server", "Connections per database; cross-tenant reporting is hard"]
+  - title: Column or JSONB?
+    cols: [Make it a column when, Keep it in JSONB when]
+    rows:
+      - ["You filter, join, sort or aggregate on it", "It's sparse or user-defined (custom fields)"]
+      - ["It needs a type, NOT NULL, CHECK or FK", "It's a payload you store and return whole (webhooks, API responses)"]
+      - ["The planner needs statistics for it", "Its shape changes often and nobody queries inside it"]
+
+snippets:
+  - task: Generated (computed) column
+    sql: |
+      ALTER TABLE order_items
+        ADD COLUMN line_total numeric GENERATED ALWAYS AS (qty * unit_price) STORED;
+      SELECT order_id, product_id, line_total
+      FROM order_items WHERE order_id = 5 ORDER BY product_id;
+    out:
+      cols: [order_id, product_id, line_total]
+      rows:
+        - [5, 2, 40.00]
+        - [5, 4, 35.00]
+    note: "Derived data the database keeps in sync. STORED computes on write, and adding it rewrites the table; PG 18 adds VIRTUAL (computed on read), which becomes the default."
+  - task: Reading JSONB
+    sql: |
+      SELECT doc ->> 'plan' AS plan,
+             (doc -> 'seats')::int + 1 AS seats,
+             doc @> '{"plan": "pro"}' AS is_pro
+      FROM (VALUES ('{"plan": "pro", "seats": 5}'::jsonb)) AS t(doc);
+    out:
+      cols: [plan, seats, is_pro]
+      rows: [[pro, 6, true]]
+    note: "`->` returns JSONB, `->>` returns text. `@>` (containment) is what a GIN index accelerates."
+  - task: Time-ordered UUIDs
+    since: PG 18
+    sql: SELECT uuidv7() < uuidv7() AS time_ordered;
+    out:
+      cols: [time_ordered]
+      rows: [[true]]
+    note: "Before PG 18, generate UUIDv7 in the app or with an extension."
+  - task: Soft delete with unique live emails
+    sql: |
+      ALTER TABLE users ADD COLUMN deleted_at timestamptz;
+      ALTER TABLE users DROP CONSTRAINT users_email_key;
+      CREATE UNIQUE INDEX users_email_live ON users (email) WHERE deleted_at IS NULL;
+  - task: Tenant isolation with row-level security
+    sql: |
+      CREATE TABLE notes (tenant_id bigint NOT NULL, body text);
+      ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+      CREATE POLICY tenant_isolation ON notes
+        USING (tenant_id = current_setting('app.tenant_id')::bigint);
+    note: "Set the tenant per transaction with `SET LOCAL app.tenant_id = '42'` (works with transaction pooling). Table owners and superusers bypass RLS unless `FORCE ROW LEVEL SECURITY`."
+
+pitfalls:
+  - "**Entity-attribute-value tables** (`entity_id, attribute, value text`). Every read becomes a pivot, nothing is typed or constrained, and the planner can't estimate anything. Use JSONB for truly dynamic attributes."
+  - "**Polymorphic foreign keys** (`commentable_type`, `commentable_id`) can't have a real FK. Use one nullable FK column per parent type plus `CHECK (num_nonnulls(post_id, photo_id) = 1)`, or separate link tables."
+  - "**Soft delete everywhere.** Every query needs `deleted_at IS NULL`, unique constraints become partial, and FKs keep pointing at “deleted” rows. Prefer archiving to another table, or anonymizing, unless undelete is a real feature."
+  - "**Stored totals with no sync plan.** `orders.total` drifts from its items the first time someone fixes an item by hand. Compute it, use a generated column or a trigger, or document who owns the copy."
+  - "**Random UUIDv4 keys on big, write-heavy tables**: every insert lands on a random page, so indexes bloat and cache hit rates drop."
+  - "**Comma lists in a text column.** No FK, no index, and `LIKE '%,5,%'` everywhere. Use a link table."
+
+depth:
+  - "**Design from access patterns.** For each top query: what it filters by, how many rows it touches, how often it runs. That decides keys, which indexes exist, and where you denormalize."
+  - "**Snapshots aren't denormalization.** Price paid, shipping address at order time and tax rate applied are facts about the order. Copying them is correct; reading them live from `products` would rewrite history."
+  - "**Tenant id in every key.** Composite keys `(tenant_id, id)` and FKs that include `tenant_id` make cross-tenant references impossible by construction, and match how Citus and app-level sharding distribute data."
+  - "**Split hot columns from wide rows.** Counters and `last_seen_at` updated constantly belong in a narrow 1:1 table: updates stay HOT, and you don't rewrite a 2 KB row to bump an integer."
+  - "**Read models.** Materialized views (`REFRESH MATERIALIZED VIEW CONCURRENTLY` needs a unique index) or summary tables maintained by jobs give fast dashboards with stated staleness, without denormalizing the write model."
+  - "**Plan for deletion and privacy.** Decide early how a user is erased (GDPR): hard delete with cascades, or anonymize the row and keep its key for history. It shapes every FK action."
+
+mysql:
+  - "InnoDB clusters rows by primary key, so random UUID keys hurt even more, and every secondary index carries the PK. `UUID_TO_BIN(uuid, 1)` reorders a v1 UUID's time bits for locality."
+  - "JSON columns are indexed through generated columns or multi-valued indexes (8.0.17+), not GIN."
+  - "No row-level security: tenant scoping lives in the app, views, or a proxy."
+  - "ENUM is common and compact; adding a value at the end is instant in 8.0, other changes rebuild the table."
+
+checks:
+  - q: "A SaaS app keeps every tenant in shared tables. What should keys, foreign keys and indexes look like?"
+    a: >-
+      Lead everything with `tenant_id`: primary keys `(tenant_id, id)`, foreign keys `(tenant_id, parent_id) REFERENCES parent (tenant_id, id)`,
+      and indexes starting with `tenant_id`. Then a row can't reference another tenant's row, every query is scoped by the leading index column,
+      and the table is ready to shard by tenant. Add RLS as a safety net against a missing WHERE.
+  - q: "Product attributes vary by category: shoe size, screen resolution, wattage. Columns, EAV, or JSONB?"
+    a: >-
+      JSONB for the varying attributes, with a GIN index for containment queries (`attrs @> '{"size": 42}'`). Promote attributes that are filtered or sorted on
+      constantly to real columns or expression indexes, so they get types and statistics. Validate shape with CHECK constraints (`jsonb_typeof`) or in the app.
+      EAV gives you the costs of both and the benefits of neither.
+  - q: "Isn't `order_items.unit_price` a duplicate of `products.price` that should be removed?"
+    a: >-
+      No. It records what the customer paid, which is a different fact from today's price. Removing it would make old invoices change whenever the catalog does.
+  - q: "Why might a team choose UUIDv7 over `bigint` identity, and what does it cost?"
+    a: >-
+      Ids can be generated anywhere (clients, many services, offline) without a round trip, datasets merge without collisions, and ids can be exposed
+      without revealing counts. Unlike v4 they're time-ordered, so B-tree inserts stay local. The costs: 16 bytes in every key, index and FK, slightly slower comparisons,
+      and the id leaks its creation time.
+  - q: "Users can be deleted, but emails must stay unique among active users, and old orders must keep pointing at their user. Design it."
+    a: >-
+      Keep the user row and mark it: `deleted_at timestamptz`, with a partial unique index `ON users (email) WHERE deleted_at IS NULL`. Orders keep their FK.
+      For privacy erasure, scrub personal fields (email, name) instead of deleting the row. Use ON DELETE RESTRICT on orders so a hard delete can't silently cascade away history.
+
+problems:
+  - id: tags-many-to-many
+    title: Product tags
+    variant: canonical
+    statement: >-
+      Products can have many tags and a tag many products. Create `tags` (generated `id`, unique `name`) and `product_tags` linking them:
+      no duplicate links, links to missing rows rejected, deleting a product or a tag removes its links, and “products with tag X” must be fast.
+    hint: "The link table's primary key covers lookups by its first column. What about the second?"
+    solution: |
+      CREATE TABLE tags (
+        id   bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name text NOT NULL UNIQUE
+      );
+      CREATE TABLE product_tags (
+        product_id bigint NOT NULL
+                   REFERENCES products (id) ON DELETE CASCADE,
+        tag_id     bigint NOT NULL
+                   REFERENCES tags (id) ON DELETE CASCADE,
+        PRIMARY KEY (product_id, tag_id)
+      );
+      CREATE INDEX product_tags_tag_id_idx
+        ON product_tags (tag_id);
+    tests:
+      - {sql: "INSERT INTO tags (name) VALUES ('sale'), ('new')", ok: true}
+      - {sql: "INSERT INTO tags (name) VALUES ('sale')", error: unique_violation}
+      - {sql: "INSERT INTO product_tags VALUES (1, 1)", ok: true}
+      - {sql: "INSERT INTO product_tags VALUES (1, 1)", error: unique_violation, note: duplicate link}
+      - {sql: "INSERT INTO product_tags VALUES (99, 1)", error: foreign_key_violation}
+      - {sql: "INSERT INTO product_tags VALUES (8, 2)", ok: true}
+      - {sql: "DELETE FROM tags WHERE name = 'new'", ok: true, note: "removes the (8, 2) link"}
+      - {sql: "SELECT product_id FROM product_tags WHERE tag_id = 1", uses_index: product_tags_tag_id_idx}
+    check: "SELECT product_id, tag_id FROM product_tags ORDER BY product_id, tag_id"
+    expect:
+      cols: [product_id, tag_id]
+      rows: [[1, 1]]
+    insight: >-
+      The composite primary key prevents duplicate links and serves “tags of product X”; the reverse question needs its own index on `tag_id`.
+      CASCADE fits link rows, which mean nothing without both ends. The simpler alternative, `products.tags text[]` with a GIN index, is fine when tags
+      are free-form labels: you lose renames, tag metadata and referential integrity.
+    mysql: "Same design; InnoDB creates an index for each FK automatically if none exists."

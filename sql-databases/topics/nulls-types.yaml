@@ -1,0 +1,173 @@
+id: nulls-types
+name: NULLs, Types & Dates
+signal: ["“unknown”, “missing”, “not set” values", "averages or ratios that come out as whole numbers", "money arithmetic", "“per day” in a user's time zone", "days with no activity must still appear"]
+idea: >-
+  NULL means unknown, so comparisons with it are unknown too (three-valued logic), and WHERE keeps only rows that are true.
+  Types decide arithmetic: integer division truncates, floats round in binary, `numeric` is exact. A `timestamptz` is an instant;
+  turning it into a calendar day or hour always needs a time zone, whether you name one or the session supplies it.
+
+tables:
+  - title: NULL in expressions
+    cols: [Expression, Result, Use instead]
+    rows:
+      - ["`NULL = NULL`, `NULL <> 1`", "NULL (unknown), so the row is filtered out", "`IS NULL`, `IS DISTINCT FROM`"]
+      - ["`NULL + 1`, `'a' || NULL`", "NULL", "`coalesce(x, 0)`, `concat()` (skips NULLs)"]
+      - ["`x NOT IN (1, NULL)`", "never true", "`NOT EXISTS`, or filter NULLs out"]
+      - ["`NOT (x > 5)` when x is NULL", "NULL, not true", "test `x IS NULL OR x <= 5` explicitly"]
+      - ["`ORDER BY x`", "NULLs sort last ascending, first descending", "`NULLS FIRST` / `NULLS LAST`"]
+      - ["`UNIQUE (email)` with two NULLs", "allowed: NULLs aren't equal", "`UNIQUE NULLS NOT DISTINCT` (PG 15+)"]
+  - title: Time types
+    cols: [Type, Holds, Gotcha]
+    rows:
+      - ["`timestamptz`", "An instant, stored as UTC", "Displayed and truncated in the session `TimeZone`"]
+      - ["`timestamp`", "A wall-clock reading with no zone", "Two servers in different zones read it differently"]
+      - ["`date`", "A calendar day", "Converting an instant to a date needs a zone"]
+      - ["`interval`", "A duration in months, days and microseconds", "`'2026-01-31' + interval '1 month'` is Feb 28; a day isn't always 24 h across DST"]
+
+snippets:
+  - task: Three-valued logic
+    sql: |
+      SELECT NULL = NULL AS eq,
+             NULL IS NULL AS is_null,
+             NULL IS DISTINCT FROM NULL AS distinct_nulls,
+             1 IS DISTINCT FROM NULL AS distinct_one;
+    out:
+      cols: [eq, is_null, distinct_nulls, distinct_one]
+      rows: [[null, true, false, true]]
+  - task: Integer division and remainders
+    sql: |
+      SELECT 7 / 2 AS int_div,
+             7 / 2.0 AS numeric_div,
+             round(2 / 3::numeric, 3) AS rounded,
+             7 % 2 AS remainder;
+    out:
+      cols: [int_div, numeric_div, rounded, remainder]
+      rows: [[3, 3.5, 0.667, 1]]
+    note: "`count(*) / count(*)` is integer division too: ratios need a cast or a `100.0 *` first."
+  - task: Floats aren't exact
+    sql: |
+      SELECT 0.1::float8 + 0.2::float8 = 0.3 AS float_eq,
+             0.1 + 0.2 = 0.3 AS numeric_eq;
+    out:
+      cols: [float_eq, numeric_eq]
+      rows: [[false, true]]
+    note: "Unadorned decimal literals are `numeric` in Postgres, which is exact. Money in `float8` drifts by cents after enough additions."
+  - task: Safe division and fallbacks
+    sql: |
+      SELECT 10 / NULLIF(0, 0) AS safe_div,
+             coalesce(NULL, NULL, 'fallback') AS first_non_null;
+    out:
+      cols: [safe_div, first_non_null]
+      rows: [[null, fallback]]
+  - task: AT TIME ZONE, both directions
+    sql: |
+      SELECT timestamptz '2026-03-20 22:10Z' AT TIME ZONE 'Asia/Tokyo' AS tokyo_wall_clock,
+             timestamp '2026-03-21 07:10' AT TIME ZONE 'Asia/Tokyo' AS instant;
+    out:
+      cols: [tokyo_wall_clock, instant]
+      rows: [["2026-03-21 07:10:00", "2026-03-20 22:10:00+00"]]
+    note: "On a `timestamptz` it returns Tokyo's wall clock (a `timestamp`). On a `timestamp` it reads the value as Tokyo time and returns the instant. Use zone names, not offsets like `+09`, so DST is handled."
+  - task: Truncating and adding time
+    sql: |
+      SELECT date_trunc('week', timestamptz '2026-03-20 22:10Z') AS week_start,
+             date_trunc('month', timestamp '2026-03-20 12:00') AS month_start,
+             date '2026-01-31' + interval '1 month' AS plus_month,
+             date '2026-03-10' - date '2026-03-01' AS days_between;
+    out:
+      cols: [week_start, month_start, plus_month, days_between]
+      rows: [["2026-03-16 00:00:00+00", "2026-03-01 00:00:00", "2026-02-28 00:00:00", 9]]
+    note: "Weeks start on Monday (ISO). `date_trunc` on a `timestamptz` truncates in the session zone; PG 12+ takes a zone argument: `date_trunc('day', ts, 'Asia/Tokyo')`."
+  - task: Where NULLs sort
+    sql: |
+      SELECT name, country
+      FROM users
+      WHERE id >= 5
+      ORDER BY country NULLS FIRST, name;
+    out:
+      cols: [name, country]
+      rows:
+        - [Farid, null]
+        - [Emma, DE]
+        - [Hugo, FR]
+        - [Gia, US]
+
+pitfalls:
+  - "**`= NULL` in a WHERE clause** matches nothing, without an error. Every nullable comparison needs `IS NULL` or `IS DISTINCT FROM`."
+  - "**Integer division in ratios.** `paid / total` with two integers gives 0 for anything under 100%. Cast one side (`paid::numeric / total`) or multiply by `100.0` first."
+  - "**Truncating instants without naming a zone.** `created_at::date` and `date_trunc('day', created_at)` use the session's `TimeZone`, so the same report differs between a UTC server and a laptop. Say `AT TIME ZONE` explicitly in reports."
+  - "**Between on timestamps.** `created_at BETWEEN '2026-03-01' AND '2026-03-31'` misses everything after midnight on the 31st. Use half-open ranges: `>= '2026-03-01' AND < '2026-04-01'`."
+  - "**Missing days in a time series.** GROUP BY only produces days that have rows. Join to `generate_series` so empty days show as 0."
+  - "**Comparing `char(n)`.** It pads with spaces and trailing-space semantics differ between operators. Use `text`."
+
+mysql:
+  - "NULLs sort first ascending in MySQL (last in Postgres), and there's no `NULLS FIRST/LAST`: order by `x IS NULL` first."
+  - "`/` always returns a decimal (`7 / 2 = 3.5000`); `DIV` is integer division."
+  - "`TIMESTAMP` is stored as UTC and converted by the session `time_zone`; `DATETIME` is a wall clock (like Postgres `timestamp`). `TIMESTAMP` ends in 2038."
+  - "Use `<=>` for NULL-safe equality (Postgres: `IS NOT DISTINCT FROM`)."
+
+problems:
+  - id: revenue-every-day
+    title: Revenue for every day of a week
+    variant: canonical
+    statement: >-
+      Paid revenue for each day from 2026-03-01 to 2026-03-07 (UTC), **including days with no paid orders** as 0.
+      Columns `day`, `revenue`, oldest first.
+    hint: "Start from the list of days, not from the orders."
+    solution: |
+      SELECT d::date AS day,
+             coalesce(sum(i.qty * i.unit_price), 0) AS revenue
+      FROM generate_series(timestamptz '2026-03-01',
+                           timestamptz '2026-03-07',
+                           interval '1 day') AS d
+      LEFT JOIN orders o
+        ON o.status = 'paid'
+       AND o.created_at >= d
+       AND o.created_at < d + interval '1 day'
+      LEFT JOIN order_items i ON i.order_id = o.id
+      GROUP BY d
+      ORDER BY d;
+    expect:
+      cols: [day, revenue]
+      rows:
+        - [2026-03-01, 200.00]
+        - [2026-03-02, 0]
+        - [2026-03-03, 300.00]
+        - [2026-03-04, 75.00]
+        - [2026-03-05, 0]
+        - [2026-03-06, 0]
+        - [2026-03-07, 0]
+    insight: >-
+      The calendar is the driving table; orders join to it. The paid filter sits in the ON clause, or the empty days disappear again.
+      Comparing `created_at` to a half-open range keeps the index on `created_at` usable, unlike `created_at::date = d`.
+      For a business day in another zone, generate the boundaries in that zone: `generate_series(timestamp '2026-03-01', …) AT TIME ZONE 'Asia/Tokyo'`.
+    mysql: "No `generate_series`: use a recursive CTE (`WITH RECURSIVE days AS (SELECT DATE '2026-03-01' AS d UNION ALL SELECT d + INTERVAL 1 DAY FROM days WHERE d < '2026-03-07')`) or a calendar table."
+
+  - id: tokyo-day-shift
+    title: Orders that move day in Tokyo
+    variant: disguise
+    statement: >-
+      The Tokyo office reports by local calendar day. Which **paid** orders fall on a different date in Tokyo than in UTC?
+      Return `order_id`, `utc_day`, `tokyo_day`, ordered by `order_id`. Don't depend on the session's time zone setting.
+    hint: "`AT TIME ZONE` on a `timestamptz` gives the wall-clock time in that zone."
+    solution: |
+      SELECT id AS order_id,
+             (created_at AT TIME ZONE 'UTC')::date AS utc_day,
+             (created_at AT TIME ZONE 'Asia/Tokyo')::date
+               AS tokyo_day
+      FROM orders
+      WHERE status = 'paid'
+        AND (created_at AT TIME ZONE 'UTC')::date
+         <> (created_at AT TIME ZONE 'Asia/Tokyo')::date
+      ORDER BY order_id;
+    expect:
+      cols: [order_id, utc_day, tokyo_day]
+      rows:
+        - [5, 2026-03-04, 2026-03-05]
+        - [11, 2026-03-20, 2026-03-21]
+        - [12, 2026-03-28, 2026-03-29]
+        - [14, 2026-04-02, 2026-04-03]
+    insight: >-
+      Anything after 15:00 UTC is the next day in Tokyo (UTC+9, no DST). Order 12 at exactly 15:00 UTC is midnight in Tokyo, the boundary case.
+      `created_at::date` would silently use the session zone, so the same query gives different answers on different machines.
+      Store instants as `timestamptz`; convert at the edge, and store the user's zone name (not an offset) if reports need it.
+    mysql: "`CONVERT_TZ(created_at, '+00:00', 'Asia/Tokyo')` needs the time zone tables loaded (`mysql_tzinfo_to_sql`); otherwise it returns NULL."

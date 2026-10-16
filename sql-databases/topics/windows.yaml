@@ -1,0 +1,195 @@
+id: windows
+name: Window Functions
+signal: ["“rank / top within each …”", "“running total”, “moving average”", "“compared with the previous / next row”", "“share of the group total” without collapsing rows", "keep every row but add a group-level number"]
+idea: >-
+  A window function computes over a set of rows related to the current row without collapsing them, unlike GROUP BY.
+  `PARTITION BY` picks the group, `ORDER BY` orders it, and the frame picks which rows of the partition count for this row.
+  Windows run after WHERE, GROUP BY and HAVING, so they can wrap aggregates but can't be filtered in the same query level.
+
+diagram:
+  type: table
+  caption: employees in eng and sales, ordered by salary within each department
+  cols: [dept, name, salary]
+  rows:
+    - [eng, Grace, 190000]
+    - [eng, Linus, 160000]
+    - [eng, Ken, 160000]
+    - [eng, Barbara, 140000]
+    - [eng, Dennis, 120000]
+    - [sales, Margaret, 150000]
+    - [sales, Alan, 95000]
+    - [sales, Edsger, 95000]
+  frames:
+    - title: PARTITION BY dept
+      expr: avg(salary) OVER (PARTITION BY dept)
+      cur: 2
+      win: [0, 1, 2, 3, 4]
+      out: ["154000", "154000", "154000", "154000", "154000", "113333", "113333", "113333"]
+      note: "No ORDER BY: the frame is the **whole partition**, so every eng row sees the same five rows and gets the same average. The rows stay; only a column is added."
+    - title: + ORDER BY (default frame)
+      expr: sum(salary) OVER (PARTITION BY dept ORDER BY salary DESC)
+      cur: 1
+      win: [0, 1, 2]
+      out: ["190000", "510000", "510000", "650000", "770000", "150000", "340000", "340000"]
+      note: "Adding ORDER BY makes the default frame `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`. RANGE includes **peers** (rows with the same salary), so Linus already counts Ken: both show 510000. This is the classic running-total surprise."
+    - title: ROWS 1 PRECEDING … 1 FOLLOWING
+      expr: sum(salary) OVER (PARTITION BY dept ORDER BY salary DESC ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
+      cur: 3
+      win: [2, 3, 4]
+      out: ["350000", "510000", "460000", "420000", "260000", "245000", "340000", "190000"]
+      note: "ROWS counts physical rows, ignoring peers: a sliding window of three. The frame never crosses the partition boundary, so Dennis and Margaret only see two rows."
+    - title: LAG(salary)
+      expr: lag(salary) OVER (PARTITION BY dept ORDER BY salary DESC)
+      cur: 6
+      win: [5]
+      out: [NULL, "190000", "160000", "160000", "140000", NULL, "150000", "95000"]
+      note: "LAG and LEAD read one row back or ahead in partition order, ignoring the frame. The first row of each partition gets NULL (or LAG's third argument, the default)."
+
+snippets:
+  - task: ROW_NUMBER vs RANK vs DENSE_RANK on ties
+    sql: |
+      SELECT name, salary,
+             row_number() OVER (ORDER BY salary DESC, id) AS row_number,
+             rank()       OVER (ORDER BY salary DESC)     AS rank,
+             dense_rank() OVER (ORDER BY salary DESC)     AS dense_rank
+      FROM employees
+      WHERE dept = 'eng'
+      ORDER BY salary DESC, id;
+    out:
+      cols: [name, salary, row_number, rank, dense_rank]
+      rows:
+        - [Grace, 190000, 1, 1, 1]
+        - [Linus, 160000, 2, 2, 2]
+        - [Ken, 160000, 3, 2, 2]
+        - [Barbara, 140000, 4, 4, 3]
+        - [Dennis, 120000, 5, 5, 4]
+    note: "RANK leaves a gap after ties (4), DENSE_RANK doesn't (3). ROW_NUMBER needs a unique tiebreaker (`id`) or Linus and Ken can swap between runs."
+  - task: Running total with ties (the RANGE trap)
+    sql: |
+      SELECT name, salary,
+             sum(salary) OVER (ORDER BY salary)     AS peers_share,
+             sum(salary) OVER (ORDER BY salary, id) AS running
+      FROM employees
+      WHERE dept = 'sales'
+      ORDER BY salary, id;
+    out:
+      cols: [name, salary, peers_share, running]
+      rows:
+        - [Alan, 95000, 190000, 95000]
+        - [Edsger, 95000, 190000, 190000]
+        - [Margaret, 150000, 340000, 340000]
+    note: "Same default frame both times. A unique ORDER BY removes peers, so RANGE and ROWS agree. Or write `ROWS UNBOUNDED PRECEDING` explicitly."
+  - task: Share of the group total
+    sql: |
+      SELECT name, salary,
+             round(100.0 * salary / sum(salary) OVER (PARTITION BY dept), 1) AS pct_of_dept
+      FROM employees
+      WHERE dept = 'ops'
+      ORDER BY salary DESC, id;
+    out:
+      cols: [name, salary, pct_of_dept]
+      rows:
+        - [Radia, 130000, 37.1]
+        - [Frances, 110000, 31.4]
+        - [Hedy, 110000, 31.4]
+    note: "`100.0 *` first: `int / int` truncates in Postgres."
+  - task: LAST_VALUE needs a full frame
+    sql: |
+      SELECT name,
+             first_value(name) OVER w AS top,
+             last_value(name)  OVER w AS last_default,
+             last_value(name)  OVER (w ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS bottom
+      FROM employees
+      WHERE dept = 'ops'
+      WINDOW w AS (ORDER BY salary DESC, id)
+      ORDER BY salary DESC, id;
+    out:
+      cols: [name, top, last_default, bottom]
+      rows:
+        - [Radia, Radia, Radia, Hedy]
+        - [Frances, Radia, Frances, Hedy]
+        - [Hedy, Radia, Hedy, Hedy]
+    note: "The default frame ends at the current row, so `last_value` returns the current row. A named `WINDOW` keeps long queries readable and lets the planner share one sort."
+
+pitfalls:
+  - "**Filtering on a window result in WHERE.** `WHERE row_number() OVER (…) = 1` is an error: windows are computed after WHERE. Compute in a CTE or subquery, then filter outside. Postgres has no `QUALIFY` (Snowflake, BigQuery and DuckDB do)."
+  - "**Filtering in the wrong place changes the window.** WHERE runs first, so rows it removes don't exist for LAG or the running sum. Filtering `status = 'paid'` inside versus outside the windowed query gives different “previous order” answers."
+  - "**The default frame with ORDER BY is RANGE, not ROWS.** Peers share a value, so running totals jump at ties and `last_value` returns the current row. Use a unique ORDER BY or an explicit `ROWS` frame."
+  - "**Non-deterministic ordering.** ROW_NUMBER over a non-unique ORDER BY can number ties differently on each run, which breaks dedup (“keep row 1”) and pagination. Always add a unique tiebreaker."
+  - "**Every distinct window spec is another sort.** Three different `OVER (…)` clauses can mean three sorts of the whole input. Share a `WINDOW` clause, and an index on `(partition cols, order cols)` can feed the window already sorted."
+  - "**ROW_NUMBER ≤ N for top-N per group computes every row.** With few groups and an index on the group and sort columns, `LATERAL (… ORDER BY … LIMIT N)` per group reads only N rows each (see Subqueries, CTEs & LATERAL)."
+
+mysql:
+  - "Window functions need MySQL 8.0+. In 5.7 they were emulated with `@variables`, whose evaluation order isn't guaranteed."
+  - "MySQL supports ROWS and RANGE frames but not `GROUPS` or the `EXCLUDE` clause. Neither database has `QUALIFY`."
+  - "`date - date` isn't days in MySQL (it subtracts YYYYMMDD numbers). Use `DATEDIFF(a, b)`."
+
+problems:
+  - id: running-revenue
+    title: Running revenue by day
+    variant: canonical
+    statement: >-
+      Daily revenue from **paid** orders (sum of `qty * unit_price`) and a running total across days.
+      One row per day that had paid orders, oldest first. Columns: `day`, `revenue`, `running_total`.
+    hint: "Aggregate per day first. A window function can wrap an aggregate: `sum(sum(…)) OVER (…)`."
+    solution: |
+      SELECT o.created_at::date AS day,
+             sum(i.qty * i.unit_price) AS revenue,
+             sum(sum(i.qty * i.unit_price))
+               OVER (ORDER BY o.created_at::date)
+               AS running_total
+      FROM orders o
+      JOIN order_items i ON i.order_id = o.id
+      WHERE o.status = 'paid'
+      GROUP BY o.created_at::date
+      ORDER BY day;
+    expect:
+      cols: [day, revenue, running_total]
+      rows:
+        - [2026-03-01, 200.00, 200.00]
+        - [2026-03-03, 300.00, 500.00]
+        - [2026-03-04, 75.00, 575.00]
+        - [2026-03-10, 60.00, 635.00]
+        - [2026-03-12, 90.00, 725.00]
+        - [2026-03-20, 220.00, 945.00]
+        - [2026-03-28, 70.00, 1015.00]
+        - [2026-04-02, 105.00, 1120.00]
+        - [2026-04-05, 600.00, 1720.00]
+    insight: >-
+      Windows run after GROUP BY, so they see one row per day and can wrap the aggregate. The default RANGE frame is fine here
+      because days are unique. Casting `timestamptz` to `date` uses the session time zone: order 11 (22:10 UTC) belongs to 2026-03-21 in Tokyo.
+      Days with no orders are missing; join to `generate_series` to show them as 0.
+    mysql: "Same query in MySQL 8. `DATE(created_at)` instead of `::date`, and MySQL's `TIMESTAMP` converts using the session `time_zone`."
+
+  - id: repeat-within-10-days
+    title: Repeat purchases within 10 days
+    variant: disguise
+    statement: >-
+      Find every paid order placed within 10 days (by calendar date) of the same user's **previous paid order**.
+      Return `order_id`, `user_id` and `days_since_prev`, ordered by `order_id`.
+    hint: "“The previous one” is a row in the same partition, one step back. Decide which rows exist before you look back."
+    solution: |
+      WITH paid AS (
+        SELECT id, user_id, created_at::date AS day,
+               lag(created_at::date) OVER (
+                 PARTITION BY user_id ORDER BY created_at
+               ) AS prev_day
+        FROM orders
+        WHERE status = 'paid'
+      )
+      SELECT id AS order_id, user_id,
+             day - prev_day AS days_since_prev
+      FROM paid
+      WHERE day - prev_day <= 10
+      ORDER BY order_id;
+    expect:
+      cols: [order_id, user_id, days_since_prev]
+      rows:
+        - [3, 1, 2]
+        - [7, 2, 9]
+        - [9, 1, 9]
+    insight: >-
+      Two traps. Filter `status = 'paid'` **before** the window: filtered afterwards, Ben's order 7 compares with his cancelled order 6 (5 days).
+      And a window result can't go in WHERE at the same level, hence the CTE. First orders have a NULL `prev_day`, and `NULL <= 10` is not true,
+      so they drop out without extra code. `date - date` is an integer; `timestamptz - timestamptz` would be an interval.
+    mysql: "Use `DATEDIFF(day, prev_day)`: plain subtraction of dates in MySQL is numeric nonsense."

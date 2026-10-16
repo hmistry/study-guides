@@ -1,0 +1,122 @@
+# Technique Drill: name the topic from the symptom. answer + 3 distractors are topic ids (build-checked).
+items:
+  - prompt: "Find the customers who have never placed an order."
+    answer: joins
+    distractors: [aggregation, subqueries, patterns]
+    why: "An anti-join: `WHERE NOT EXISTS (…)`. Avoid `NOT IN` when the subquery column can be NULL."
+  - prompt: "Revenue per customer jumped sevenfold after someone joined the events table into the report."
+    answer: joins
+    distractors: [aggregation, windows, query-planning]
+    why: "Join fan-out: two one-to-many children joined on the same key multiply rows. Aggregate each child before joining."
+  - prompt: "Show each order next to the date of the same customer's previous order."
+    answer: windows
+    distractors: [subqueries, patterns, joins]
+    why: "`lag(created_at) OVER (PARTITION BY user_id ORDER BY created_at)`: the previous row in the customer's partition."
+  - prompt: "List the top 3 products per category by units sold, keeping ties."
+    answer: patterns
+    distractors: [aggregation, indexes, recursive]
+    why: "Top-N per group: `rank() OVER (PARTITION BY category ORDER BY units DESC) <= 3`, filtered in an outer query."
+  - prompt: "Everyone in a manager's organization, at any depth."
+    answer: recursive
+    distractors: [joins, windows, schema-design]
+    why: "Unknown depth means a recursive CTE: anchor on the manager's reports, then repeatedly join the previous level."
+  - prompt: "Daily revenue for March, with days that had no sales shown as 0."
+    answer: nulls-types
+    distractors: [aggregation, joins, windows]
+    why: "Drive the query from a calendar (`generate_series`) and LEFT JOIN the sales, with `coalesce(sum(…), 0)`."
+  - prompt: "A conversion-rate column comes back as 0 for almost every campaign."
+    answer: nulls-types
+    distractors: [aggregation, windows, query-planning]
+    why: "Integer division: `conversions / visits` truncates. Cast one side to numeric or multiply by `100.0` first."
+  - prompt: "Record a page view: increment the product's counter, or create it at 1 if missing, in one statement."
+    answer: writes
+    distractors: [locking, isolation, constraints]
+    why: "`INSERT … ON CONFLICT (product_id) DO UPDATE SET views = t.views + EXCLUDED.views`: an atomic upsert."
+  - prompt: "Two app servers occasionally create two open carts for the same user."
+    answer: indexes
+    distractors: [isolation, locking, writes]
+    why: "A partial unique index, `ON orders (user_id) WHERE status = 'cart'`, makes the second insert fail no matter the timing."
+  - prompt: "Meeting-room bookings sometimes overlap even though the app checks for conflicts first."
+    answer: constraints
+    distractors: [locking, indexes, query-planning]
+    why: "Check-then-insert races. An exclusion constraint, `EXCLUDE USING gist (room_id WITH =, during WITH &&)`, rejects the overlap at commit time."
+  - prompt: "Two simultaneous withdrawals leave an account balance that's too high."
+    answer: isolation
+    distractors: [constraints, writes, mvcc-wal]
+    why: "A lost update from read-modify-write in the app. Use `SET balance = balance - $amt WHERE balance >= $amt`, a row lock, or Repeatable Read with retries."
+  - prompt: "Two money transfers occasionally fail with “deadlock detected”."
+    answer: locking
+    distractors: [isolation, mvcc-wal, scaling]
+    why: "They lock the same two rows in opposite orders. Lock in a consistent order (by id) and retry 40P01."
+  - prompt: "Twenty queue workers together process jobs no faster than one."
+    answer: locking
+    distractors: [scaling, indexes, query-planning]
+    why: "They all wait on the same first row's lock. `FOR UPDATE SKIP LOCKED` lets each take a different job."
+  - prompt: "A migration that only added a nullable column caused a three-minute outage."
+    answer: locking
+    distractors: [setup-ddl, mvcc-wal, query-planning]
+    why: "The ALTER queued for ACCESS EXCLUSIVE behind a long query, and every new query queued behind the ALTER. Set `lock_timeout` and retry."
+  - prompt: "A table holds 5 million rows but takes 60 GB on disk and keeps growing."
+    answer: mvcc-wal
+    distractors: [indexes, scaling, schema-design]
+    why: "Bloat: dead row versions aren't being vacuumed, usually because an old transaction or replication slot holds back the xmin horizon."
+  - prompt: "The logs warn that the database must be vacuumed within 10 million transactions."
+    answer: mvcc-wal
+    distractors: [scaling, isolation, locking]
+    why: "XID wraparound protection. Find what blocks freezing (old transactions, slots, prepared transactions) and vacuum the oldest tables."
+  - prompt: "A query takes 20 ms in psql and 3 seconds from the application."
+    answer: query-planning
+    distractors: [indexes, scaling, locking]
+    why: "Often a generic plan for a prepared statement or a parameter type mismatch. auto_explain shows the plan the app actually got."
+  - prompt: "EXPLAIN ANALYZE shows a node estimated at 40 rows that returned 52,000."
+    answer: query-planning
+    distractors: [indexes, mvcc-wal, joins]
+    why: "A misestimate, often from correlated columns. Fix the statistics (`CREATE STATISTICS`, ANALYZE) and the join choice fixes itself."
+  - prompt: "`WHERE created_at::date = $1` ignores the index on created_at."
+    answer: indexes
+    distractors: [nulls-types, mvcc-wal, writes]
+    why: "The cast wraps the column. Rewrite as a half-open range on the raw column, which is sargable."
+  - prompt: "Updates got slower and the table started bloating right after an index on `last_seen_at` was added."
+    answer: indexes
+    distractors: [writes, scaling, query-planning]
+    why: "Indexing a constantly updated column ends HOT updates: every update now writes every index. Drop it or move the column to a side table."
+  - prompt: "“Too many connections” errors, while database CPU sits mostly idle."
+    answer: scaling
+    distractors: [locking, mvcc-wal, query-planning]
+    why: "Idle connections exhaust the limit. Put PgBouncer in transaction mode in front and size the server pool to the cores."
+  - prompt: "Users don't see their own profile change when the page reloads right after saving."
+    answer: scaling
+    distractors: [isolation, mvcc-wal, locking]
+    why: "The reload read a lagging replica. Route a user's reads to the primary briefly after a write, or wait for the replica to pass the write's LSN."
+  - prompt: "Deleting events older than 90 days takes hours every night and bloats the table."
+    answer: scaling
+    distractors: [writes, mvcc-wal, indexes]
+    why: "Partition by time and drop whole partitions: milliseconds, no dead rows."
+  - prompt: "Product attributes differ by category: shoe size, wattage, screen resolution."
+    answer: schema-design
+    distractors: [constraints, indexes, setup-ddl]
+    why: "JSONB for the varying attributes (GIN-indexed), with frequently filtered ones promoted to columns. Avoid EAV tables."
+  - prompt: "Add a required, unique SKU to a products table that already has a million rows."
+    answer: setup-ddl
+    distractors: [writes, schema-design, recursive]
+    why: "Add the column nullable, backfill in batches, then enforce NOT NULL and UNIQUE (online: NOT VALID check, unique index CONCURRENTLY)."
+  - prompt: "Which customers spent more than the average customer?"
+    answer: subqueries
+    distractors: [aggregation, windows, patterns]
+    why: "Per-customer totals in a CTE, compared with `(SELECT avg(spent) FROM spend)`. The average order is a different, smaller number."
+  - prompt: "Count visits per user, where a visit ends after 30 minutes without activity."
+    answer: patterns
+    distractors: [aggregation, nulls-types, recursive]
+    why: "Sessionization: flag events whose gap from the previous one (LAG) is 30 minutes or more, then sum the flags."
+  - prompt: "Remove the duplicate rows a retrying client inserted, keeping the first copy."
+    answer: writes
+    distractors: [patterns, constraints, joins]
+    why: "`DELETE … USING` a self-join on the duplicate columns with `keep.id < e.id`, then add a unique constraint so it can't recur."
+  - prompt: "A nightly report runs 40 queries in one transaction, and its totals don't add up."
+    answer: isolation
+    distractors: [mvcc-wal, query-planning, aggregation]
+    why: "Read Committed takes a new snapshot per statement. Run the report at Repeatable Read (or `SERIALIZABLE READ ONLY DEFERRABLE`)."
+  - prompt: "Page 5,000 of an activity feed is slow while page 1 is instant."
+    answer: query-planning
+    distractors: [indexes, scaling, windows]
+    why: "OFFSET reads and discards every earlier row. Keyset pagination continues from the last seen `(at, id)`."
