@@ -1,0 +1,6 @@
+# Scratch folders
+delete/
+__pycache__/
+
+*.log
+.DS_Store
