@@ -1,0 +1,108 @@
+id: dp-1d
+name: DP — 1D
+signal: ["count ways / min cost / max value", "take or skip at each index", "fewest coins / steps to reach n", answer builds on a few smaller answers]
+idea: >-
+  Define dp[i] as the answer for prefix (or amount) i, write it in terms of smaller states, and fill in increasing order so every dependency is ready.
+  If dp[i] looks back a fixed number of steps, keep only those as variables — O(1) space.
+  Time = states × choices per state: usually O(n) or O(n · k).
+diagram:
+  type: grid
+  caption: "dp[i] = max(dp[i−1], dp[i−2] + nums[i])"
+  frames:
+    - {rows: [[2, 7, 9, 3, 1], [2, 7, 11, "", ""]], labels: [nums, dp], cols: [0, 1, 2, 3, 4], win: [[1, 0], [1, 1], [0, 2]], hit: [[1, 2]], note: "dp[2] = max(7, 2 + 9) = 11 → take house 2"}
+    - {rows: [[2, 7, 9, 3, 1], [2, 7, 11, 11, 12]], labels: [nums, dp], cols: [0, 1, 2, 3, 4], win: [[1, 2], [1, 3], [0, 4]], hit: [[1, 4]], note: "dp[4] = max(11, 11 + 1) = 12 → answer"}
+template:
+  python: |
+    dp = [INIT] * (n + 1)
+    dp[0] = BASE                     # smallest case, by definition
+    for i in range(1, n + 1):
+        dp[i] = best(dp[i - c] + cost(c) for c in choices if c <= i)
+    return dp[n]
+
+    # reads only dp[i-1], dp[i-2] → two variables
+    prev2 = prev1 = 0
+    for x in a:
+        prev2, prev1 = prev1, step(prev1, prev2, x)
+  ruby: |
+    dp = Array.new(n + 1, INIT)
+    dp[0] = BASE                     # smallest case, by definition
+    (1..n).each do |i|
+      dp[i] = choices.select { |c| c <= i }.map { |c| dp[i - c] + cost(c) }.max
+    end
+    dp[n]
+
+    # reads only dp[i-1], dp[i-2] → two variables
+    prev2 = prev1 = 0
+    a.each { |x| prev2, prev1 = prev1, step(prev1, prev2, x) }
+pitfalls:
+  - "Say the state in words first (\"dp[a] = fewest coins summing to a\"). Most wrong recurrences come from a fuzzy state."
+  - "For min problems, mark impossible with infinity (`float('inf')` / `Float::INFINITY`) and map it to −1 at the end. Using 0 for impossible would mean \"free\"."
+  - "Loop order decides what you count. Coins outer, amount inner → combinations (Coin Change II). Amount outer, coins inner → ordered sequences (Combination Sum IV)."
+  - "Top-down (`@cache` / a memo hash) is fine and often quicker to write. Python's recursion limit is ~1000 deep, so go bottom-up for n ≥ 10³."
+  - "Rolling variables: update with a simultaneous assignment (`a, b = b, f(a, b)`) so nothing is overwritten before it's read."
+
+problems:
+  - id: house-robber
+    title: House Robber
+    difficulty: Medium
+    variant: canonical
+    statement: Houses in a row hold `nums[i]` money. You can't rob two adjacent houses. Return the maximum you can rob.
+    example: "nums = [2, 7, 9, 3, 1]  →  12   (2 + 9 + 1)"
+    hint: At each house you rob it or you don't. What does each choice leave you, in terms of earlier answers?
+    insight: dp[i] = max(dp[i−1], dp[i−2] + nums[i]) — skip or take. Only two earlier values matter, so two variables replace the table.
+    complexity: O(n) time · O(1) space
+    fn: rob
+    tests:
+      - {args: [[2, 7, 9, 3, 1]], out: 12, note: "example"}
+      - {args: [[1, 2, 3, 1]], out: 4, note: "alternate houses"}
+      - {args: [[2, 1, 1, 2]], out: 4, note: "best skips two in a row"}
+      - {args: [[5]], out: 5, note: "single house"}
+      - {args: [[0, 0]], out: 0, note: "nothing to rob"}
+    solution:
+      python: |
+        def rob(nums):
+            prev2 = prev1 = 0               # best up to i-2, i-1
+            for x in nums:
+                prev2, prev1 = prev1, max(prev1, prev2 + x)
+            return prev1
+      ruby: |
+        def rob(nums)
+          prev2 = prev1 = 0               # best up to i-2, i-1
+          nums.each { |x| prev2, prev1 = prev1, [prev1, prev2 + x].max }
+          prev1
+        end
+
+  - id: coin-change
+    title: Coin Change
+    difficulty: Medium
+    variant: state = amount, any coin last
+    statement: Return the fewest coins from `coins` (unlimited supply of each) that sum to `amount`, or -1 if it can't be done.
+    example: "coins = [1, 2, 5], amount = 11  →  3   (5 + 5 + 1)"
+    hint: Greedy fails for coins [1, 3, 4], amount 6. If you knew the answer for every smaller amount, which coin went last?
+    insight: dp[a] = 1 + min over coins of dp[a − c]. The state is the amount, not a position in `coins` — any coin can be the last one.
+    complexity: O(amount · len(coins)) time · O(amount) space
+    fn: coin_change
+    tests:
+      - {args: [[1, 2, 5], 11], out: 3, note: "example"}
+      - {args: [[1, 3, 4], 6], out: 2, note: "greedy would give 3"}
+      - {args: [[2], 3], out: -1, note: "impossible"}
+      - {args: [[1], 0], out: 0, note: "amount 0"}
+      - {args: [[186, 419, 83, 408], 6249], out: 20, note: "large amount"}
+    solution:
+      python: |
+        def coin_change(coins, amount):
+            INF = float("inf")
+            dp = [0] + [INF] * amount        # dp[a] = fewest coins summing to a
+            for a in range(1, amount + 1):
+                for c in coins:
+                    if c <= a:
+                        dp[a] = min(dp[a], dp[a - c] + 1)
+            return dp[amount] if dp[amount] != INF else -1
+      ruby: |
+        def coin_change(coins, amount)
+          dp = [0] + [Float::INFINITY] * amount   # dp[a] = fewest coins summing to a
+          (1..amount).each do |a|
+            coins.each { |c| dp[a] = [dp[a], dp[a - c] + 1].min if c <= a }
+          end
+          dp[amount] == Float::INFINITY ? -1 : dp[amount]
+        end

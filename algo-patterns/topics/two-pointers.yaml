@@ -1,0 +1,156 @@
+id: two-pointers
+name: Two Pointers
+signal: [sorted array, pair / triplet sums to target, in-place with O(1) space, palindrome or reverse]
+idea: >-
+  Two indices move through the array based on a comparison, so each step permanently rules out candidates.
+  Converging pointers (from both ends) need sorted or symmetric input; same-direction pointers (slow writer, fast reader)
+  compact or partition in place. Either way, O(n²) pair checks become one O(n) pass with O(1) space.
+diagram:
+  caption: "sum > target → R−−   ·   sum < target → L++"
+  frames:
+    - {values: [1, 3, 4, 6, 8, 11], marks: {L: 0, R: 5}, note: "1 + 11 = 12 > 10 → R−−"}
+    - {values: [1, 3, 4, 6, 8, 11], marks: {L: 0, R: 4}, note: "1 + 8 = 9 < 10 → L++"}
+    - {values: [1, 3, 4, 6, 8, 11], marks: {L: 2, R: 3}, hit: [2, 3], note: "… 4 + 6 = 10 ✓"}
+template:
+  python: |
+    # converging — sorted input
+    l, r = 0, len(a) - 1
+    while l < r:
+        if found(a[l], a[r]):
+            return ...
+        if too_small(a[l], a[r]):
+            l += 1
+        else:
+            r -= 1
+
+    # same direction — slow writer, fast reader
+    w = 0
+    for x in a:
+        if keep(x):
+            a[w] = x
+            w += 1
+  ruby: |
+    # converging — sorted input
+    l, r = 0, a.length - 1
+    while l < r
+      return ... if found(a[l], a[r])
+      too_small(a[l], a[r]) ? l += 1 : r -= 1
+    end
+
+    # same direction — slow writer, fast reader
+    w = 0
+    a.each do |x|
+      next unless keep(x)
+      a[w] = x
+      w += 1
+    end
+pitfalls:
+  - Converging only works when moving a pointer has a predictable effect — sorted (or symmetric) input. Unsorted → sort first (O(n log n)), or use a hash map if you must return original indices.
+  - Loop on `l < r`, not `l <= r` — a pair needs two distinct elements.
+  - Every iteration must move at least one pointer, or the loop never ends.
+  - After sorting, skip equal neighbours (both the anchor and the inner pointer) or you'll emit duplicate answers.
+  - "k-Sum generalizes: fix k − 2 values with loops and two-pointer the rest → O(nᵏ⁻¹)."
+
+problems:
+  - id: two-sum-ii
+    title: Two Sum II — Sorted Input
+    difficulty: Easy
+    variant: canonical
+    statement: Sorted array `numbers`; find two numbers that add to `target`. Return their 1-indexed positions. Exactly one answer exists; use O(1) extra space.
+    example: "numbers = [2, 7, 11, 15], target = 9  →  [1, 2]"
+    hint: Start at both ends. If the sum is too big, which pointer can make it smaller?
+    insight: Sorted order means every comparison discards one element for good — no pair is ever checked twice.
+    complexity: O(n) time · O(1) space
+    fn: two_sum
+    tests:
+      - {args: [[2, 7, 11, 15], 9], out: [1, 2], note: "example"}
+      - {args: [[2, 3, 4], 6], out: [1, 3], note: "answer at both ends"}
+      - {args: [[-1, 0], -1], out: [1, 2], note: "negatives, n = 2"}
+      - {args: [[1, 2, 3, 4, 4, 9, 56, 90], 8], out: [4, 5], note: "duplicate values"}
+    solution:
+      python: |
+        def two_sum(numbers, target):
+            l, r = 0, len(numbers) - 1
+            while l < r:
+                s = numbers[l] + numbers[r]
+                if s == target:
+                    return [l + 1, r + 1]
+                if s < target:
+                    l += 1
+                else:
+                    r -= 1
+            return []
+      ruby: |
+        def two_sum(numbers, target)
+          l, r = 0, numbers.length - 1
+          while l < r
+            s = numbers[l] + numbers[r]
+            return [l + 1, r + 1] if s == target
+            s < target ? l += 1 : r -= 1
+          end
+          []
+        end
+
+  - id: three-sum
+    title: 3Sum
+    difficulty: Medium
+    variant: sort, then two pointers inside a loop
+    statement: Return all unique triplets in `nums` that sum to 0. No duplicate triplets in the output.
+    example: "nums = [-1, 0, 1, 2, -1, -4]  →  [[-1, -1, 2], [-1, 0, 1]]"
+    hint: Fix one number, and the rest is Two Sum II — once the array is sorted.
+    insight: Sorting enables the two-pointer scan and puts duplicates side by side, so skipping them is a one-line check.
+    complexity: O(n²) time · O(1) extra space (excluding sort and output)
+    fn: three_sum
+    compare: unordered
+    tests:
+      - {args: [[-1, 0, 1, 2, -1, -4]], out: [[-1, -1, 2], [-1, 0, 1]], note: "example"}
+      - {args: [[0, 1, 1]], out: [], note: "no answer"}
+      - {args: [[0, 0, 0, 0]], out: [[0, 0, 0]], note: "all equal — dedupe"}
+      - {args: [[-2, 0, 1, 1, 2]], out: [[-2, 0, 2], [-2, 1, 1]], note: "two answers, same anchor"}
+      - {args: [[1, 2]], out: [], note: "fewer than 3 elements"}
+    solution:
+      python: |
+        def three_sum(nums):
+            nums = sorted(nums)
+            res = []
+            for i in range(len(nums) - 2):
+                if i > 0 and nums[i] == nums[i - 1]:
+                    continue                 # skip duplicate anchor
+                if nums[i] > 0:
+                    break                    # everything after is positive
+                l, r = i + 1, len(nums) - 1
+                while l < r:
+                    s = nums[i] + nums[l] + nums[r]
+                    if s < 0:
+                        l += 1
+                    elif s > 0:
+                        r -= 1
+                    else:
+                        res.append([nums[i], nums[l], nums[r]])
+                        l += 1
+                        while l < r and nums[l] == nums[l - 1]:
+                            l += 1           # skip duplicate second value
+            return res
+      ruby: |
+        def three_sum(nums)
+          nums = nums.sort
+          res = []
+          (0...nums.length - 2).each do |i|
+            next if i > 0 && nums[i] == nums[i - 1]   # skip duplicate anchor
+            break if nums[i] > 0                      # everything after is positive
+            l, r = i + 1, nums.length - 1
+            while l < r
+              s = nums[i] + nums[l] + nums[r]
+              if s < 0
+                l += 1
+              elsif s > 0
+                r -= 1
+              else
+                res << [nums[i], nums[l], nums[r]]
+                l += 1
+                l += 1 while l < r && nums[l] == nums[l - 1]   # skip duplicate second value
+              end
+            end
+          end
+          res
+        end

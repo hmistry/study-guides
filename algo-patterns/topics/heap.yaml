@@ -1,0 +1,191 @@
+id: heap
+name: Heap / Top-K
+signal: ["k largest / smallest / most frequent", k-th largest, merge k sorted, "running median; next task by earliest time"]
+idea: >-
+  A heap gives the min in O(1) and push / pop in O(log n). For top-k, keep a size-k min-heap of the best so far: its root is the k-th best, and anything worse is rejected in O(1).
+  For k-way merges, the heap holds one candidate per source.
+  O(n log k) instead of O(n log n) for a full sort.
+helper:
+  python: |
+    # nothing to provide: heapq is built in (min-heap on a list)
+  ruby: |
+    # Ruby has no heap in core. Min-heap on <=>; push [-x, …] for a max-heap.
+    class MinHeap
+      def initialize
+        @a = []
+      end
+
+      def size = @a.size
+      def empty? = @a.empty?
+      def peek = @a[0]
+
+      def push(x)
+        @a << x
+        i = @a.size - 1
+        while i > 0 && (@a[(i - 1) / 2] <=> @a[i]) > 0     # sift up
+          up = (i - 1) / 2
+          @a[up], @a[i] = @a[i], @a[up]
+          i = up
+        end
+        self
+      end
+
+      def pop
+        top = @a[0]
+        last = @a.pop
+        return top if @a.empty?
+        @a[0] = last
+        i = 0
+        loop do                                           # sift down
+          l, r, m = 2 * i + 1, 2 * i + 2, i
+          m = l if l < @a.size && (@a[l] <=> @a[m]) < 0
+          m = r if r < @a.size && (@a[r] <=> @a[m]) < 0
+          break if m == i
+          @a[m], @a[i] = @a[i], @a[m]
+          i = m
+        end
+        top
+      end
+    end
+diagram:
+  type: tree
+  caption: "size-k min-heap · root = k-th largest"
+  frames:
+    - tree: {v: 1, mark: top, c: [{v: 3}, {v: 2}]}
+      note: "k = 3 after [3, 2, 1] · 5 > top → pop 1, push 5"
+    - tree: {v: 4, hit: true, mark: k-th, c: [{v: 5}, {v: 6}]}
+      note: "after 5, 6, 4: root 4 = 3rd largest"
+template:
+  python: |
+    import heapq
+
+    heap = []
+    for x in stream:
+        if len(heap) < k:
+            heapq.heappush(heap, x)
+        elif x > heap[0]:               # beats the weakest of the top k
+            heapq.heapreplace(heap, x)  # pop + push, one sift
+    # heap[0] is the k-th largest
+
+    # k-way merge: (value, source, index) — index breaks ties
+    heap = [(s[0], i, 0) for i, s in enumerate(sources) if s]
+    heapq.heapify(heap)
+    while heap:
+        x, i, j = heapq.heappop(heap)
+        out.append(x)
+        if j + 1 < len(sources[i]):
+            heapq.heappush(heap, (sources[i][j + 1], i, j + 1))
+  ruby: |
+    heap = MinHeap.new                  # see Provided
+    stream.each do |x|
+      if heap.size < k
+        heap.push(x)
+      elsif x > heap.peek               # beats the weakest of the top k
+        heap.pop
+        heap.push(x)
+      end
+    end
+    # heap.peek is the k-th largest
+
+    # k-way merge: [value, source, index] — index breaks ties
+    heap = MinHeap.new
+    sources.each_with_index { |s, i| heap.push([s[0], i, 0]) unless s.empty? }
+    until heap.empty?
+      x, i, j = heap.pop
+      out << x
+      heap.push([sources[i][j + 1], i, j + 1]) if j + 1 < sources[i].size
+    end
+pitfalls:
+  - "Top-k largest → min-heap of size k (the root is the weakest survivor). A max-heap of all n items is O(n log n), no better than sorting."
+  - "Python's `heapq` is min-only. Push `-x` for a max-heap and `(-count, word)` for most frequent. `heapreplace` = pop then push; `heappushpop` = push then pop."
+  - "Tuples compare field by field. On equal values Python compares the next field, and `ListNode`s raise `TypeError`. Put a unique index second: `(val, i, node)`."
+  - "Ruby has no heap in core and LeetCode has no gems, so know the ~30-line array heap under Provided: parent (i − 1) / 2, children 2i + 1 and 2i + 2, sift up on push, sift down on pop."
+  - "`heapify` is O(n), not O(n log n). If the interviewer pushes, quickselect finds the k-th largest in O(n) average."
+
+problems:
+  - id: kth-largest
+    title: Kth Largest Element in an Array
+    difficulty: Medium
+    variant: canonical
+    statement: Return the k-th largest element of `nums` (k-th in sorted order, so duplicates count separately). Do better than sorting.
+    example: "nums = [3, 2, 1, 5, 6, 4], k = 2  →  5"
+    hint: You only need the k largest seen so far. Which of them is in danger of being pushed out?
+    insight: A size-k min-heap holds the top k; its root is the weakest of them — the answer — and each new element is checked against it in O(1).
+    complexity: O(n log k) time · O(k) space
+    fn: find_kth_largest
+    tests:
+      - {args: [[3, 2, 1, 5, 6, 4], 2], out: 5, note: "example"}
+      - {args: [[3, 2, 3, 1, 2, 4, 5, 5, 6], 4], out: 4, note: "duplicates count separately"}
+      - {args: [[7, 6, 5, 4, 3, 2, 1], 7], out: 1, note: "k = n: the minimum"}
+      - {args: [[2, 1], 2], out: 1, note: "n = 2"}
+      - {args: [[-1, -1], 2], out: -1, note: "negatives, all equal"}
+      - {args: [[1], 1], out: 1, note: "single element"}
+    solution:
+      python: |
+        import heapq
+
+        def find_kth_largest(nums, k):
+            heap = nums[:k]
+            heapq.heapify(heap)
+            for x in nums[k:]:
+                if x > heap[0]:
+                    heapq.heapreplace(heap, x)
+            return heap[0]
+      ruby: |
+        def find_kth_largest(nums, k)
+          heap = MinHeap.new
+          nums.each do |x|
+            if heap.size < k
+              heap.push(x)
+            elsif x > heap.peek
+              heap.pop
+              heap.push(x)
+            end
+          end
+          heap.peek
+        end
+
+  - id: merge-k-lists
+    title: Merge k Sorted Lists
+    difficulty: Hard
+    variant: k-way merge
+    statement: "`lists` holds k sorted linked lists. Merge them into one sorted list and return its head."
+    example: "lists = [[1, 4, 5], [1, 3, 4], [2, 6]]  →  [1, 1, 2, 3, 4, 4, 5, 6]"
+    hint: The next output is always one of the k current heads. How do you pick the smallest of k quickly, over and over?
+    insight: The heap holds exactly one node per list — the frontier. Pop the smallest, push its successor; each of the N nodes costs O(log k).
+    complexity: O(N log k) time (N = total nodes) · O(k) space
+    fn: merge_k_lists
+    tests:
+      - {args: [[{list: [1, 4, 5]}, {list: [1, 3, 4]}, {list: [2, 6]}]], out: {list: [1, 1, 2, 3, 4, 4, 5, 6]}, note: "example"}
+      - {args: [[{list: [1, 2]}, {list: [1, 3]}, {list: []}]], out: {list: [1, 1, 2, 3]}, note: "equal values: needs a tie-breaker"}
+      - {args: [[{list: [5]}, {list: [0]}]], out: {list: [0, 5]}, note: "single-node lists"}
+      - {args: [[{list: []}]], out: {list: []}, note: "one empty list"}
+      - {args: [[]], out: {list: []}, note: "no lists"}
+    solution:
+      python: |
+        import heapq
+
+        def merge_k_lists(lists):
+            heap = [(node.val, i, node) for i, node in enumerate(lists) if node]   # i breaks ties
+            heapq.heapify(heap)
+            dummy = tail = ListNode()
+            while heap:
+                _, i, node = heapq.heappop(heap)
+                tail.next = node
+                tail = node
+                if node.next:
+                    heapq.heappush(heap, (node.next.val, i, node.next))
+            return dummy.next
+      ruby: |
+        def merge_k_lists(lists)
+          heap = MinHeap.new
+          lists.each_with_index { |node, i| heap.push([node.val, i, node]) if node }   # i breaks ties
+          dummy = tail = ListNode.new
+          until heap.empty?
+            _, i, node = heap.pop
+            tail.next = node
+            tail = node
+            heap.push([node.next.val, i, node.next]) if node.next
+          end
+          dummy.next
+        end

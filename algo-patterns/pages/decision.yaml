@@ -1,0 +1,45 @@
+# ── Decision guide: what the input looks like → which pattern.
+decision:
+  - q: Contiguous subarray or substring
+    opts:
+      - {if: "constraint only breaks as the window grows (non-negative sums, counts, distinct chars)", go: sliding-window}
+      - {if: "exact sum = K, or negative numbers", go: prefix-sum}
+      - {if: "many range-sum queries", go: prefix-sum}
+  - q: Sorted (or sortable) array
+    opts:
+      - {if: "pair / triplet hitting a target", go: two-pointers}
+      - {if: "find a value, a boundary, or the smallest feasible answer", go: binary-search}
+      - {if: "dedupe / partition in place", go: two-pointers}
+  - q: Linked list
+    opts:
+      - {if: "cycle, middle, k-th from end", go: fast-slow}
+  - q: Intervals or time ranges
+    opts:
+      - {if: "merge / insert / count overlaps", go: merge-intervals}
+      - {if: "how many overlap at once (rooms needed)", go: heap}
+  - q: '"Top K", "K-th", or a stream'
+    opts:
+      - {if: "k largest / most frequent / merge k sorted / running median", go: heap}
+  - q: Tree
+    opts:
+      - {if: "answer for a node is built from its children (depth, diameter, path sum)", go: tree-recursion}
+      - {if: "level by level, or nearest node", go: bfs}
+  - q: Graph or grid
+    opts:
+      - {if: "fewest steps (unweighted), or something spreading per tick", go: bfs}
+      - {if: "which items end up in the same group", go: union-find}
+      - {if: "an order that respects prerequisites", go: topo-sort}
+  - q: '"Return all …" (combinations, permutations, boards)'
+    opts:
+      - {if: "list every valid configuration", go: backtracking}
+      - {if: "only the count / best value, subproblems repeat", go: dp-1d}
+  - q: '"Minimum / maximum / number of ways"'
+    opts:
+      - {if: "one index moves along one sequence", go: dp-1d}
+      - {if: "two strings, or a grid", go: dp-2d}
+  - q: Words and prefixes
+    opts:
+      - {if: "many prefix lookups, or many words searched at once", go: trie}
+  - q: Each element needs its next bigger / smaller neighbour
+    opts:
+      - {if: "next greater, days until warmer, largest rectangle", go: monotonic-stack}

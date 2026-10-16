@@ -1,0 +1,131 @@
+id: prefix-sum
+name: Prefix Sum
+signal: [range sum queries, "subarray sum = K / divisible by K", "negatives allowed (window fails)", "count subarrays with …"]
+idea: >-
+  P[i] = sum of the first i elements, so any range sum is one subtraction: sum(i..j) = P[j+1] − P[i]. Build it in O(n), answer queries in O(1).
+  To count subarrays summing to K, scan once with a hash map of prefix sums seen so far: a subarray ending here works iff P − K was seen.
+  Unlike a sliding window, this works with negatives.
+diagram:
+  type: grid
+  caption: "sum(i..j) = P[j+1] − P[i]"
+  frames:
+    - rows: [[null, 3, 1, 4, 1, 5], [0, 3, 4, 8, 9, 14]]
+      labels: [nums, P]
+      cols: [0, 1, 2, 3, 4, 5]
+      win: [[0, 2], [0, 3], [0, 4]]
+      hit: [[1, 1], [1, 4]]
+      note: "sum(nums[1..3]) = P[4] − P[1] = 9 − 3 = 6"
+template:
+  python: |
+    # pre[i] = sum of a[:i]; n + 1 entries, pre[0] = 0
+    pre = [0]
+    for x in a:
+        pre.append(pre[-1] + x)
+    range_sum = pre[j + 1] - pre[i]       # a[i..j] inclusive
+
+    # count subarrays with sum k: one pass, map of prefix counts
+    seen = {0: 1}                         # the empty prefix
+    run = count = 0
+    for x in a:
+        run += x
+        count += seen.get(run - k, 0)     # earlier prefixes leaving exactly k
+        seen[run] = seen.get(run, 0) + 1
+  ruby: |
+    # pre[i] = sum of a[0...i]; n + 1 entries, pre[0] = 0
+    pre = [0]
+    a.each { |x| pre << pre[-1] + x }
+    range_sum = pre[j + 1] - pre[i]       # a[i..j] inclusive
+
+    # count subarrays with sum k: one pass, map of prefix counts
+    seen = Hash.new(0)
+    seen[0] = 1                           # the empty prefix
+    run = count = 0
+    a.each do |x|
+      run += x
+      count += seen[run - k]              # earlier prefixes leaving exactly k
+      seen[run] += 1
+    end
+pitfalls:
+  - "Size n + 1 with `P[0] = 0` removes every `i == 0` special case."
+  - "Seed the map with `{0: 1}` (the empty prefix), or subarrays starting at index 0 are missed."
+  - "Look up `run − k` before inserting `run`. Otherwise k = 0 counts the empty subarray."
+  - "Sliding windows need non-negative numbers; prefix sum + hash map doesn't. For 'divisible by K', key by `run % k`; both Python's and Ruby's `%` are already non-negative for positive k."
+  - "2D: P[r+1][c+1] = cell + P[r][c+1] + P[r+1][c] − P[r][c]. Any rectangle sum is then 4 lookups."
+
+problems:
+  - id: range-sum-query
+    title: Range Sum Query — Immutable
+    difficulty: Easy
+    variant: canonical
+    statement: Implement `NumArray(nums)` with `sum_range(left, right)`, which returns the sum of `nums[left..right]` inclusive. Many queries are made on the same array.
+    example: "NumArray([-2, 0, 3, -5, 2, -1]): sum_range(0, 2) → 1, sum_range(2, 5) → -1"
+    hint: Pay O(n) once in the constructor so every query is O(1). What would you precompute?
+    insight: Store prefix sums with a leading 0; each query is the difference of two prefixes — no loop per query.
+    complexity: O(n) build · O(1) per query · O(n) space
+    fn: NumArray
+    tests:
+      - {ops: [NumArray, sum_range, sum_range, sum_range], args: [[[-2, 0, 3, -5, 2, -1]], [0, 2], [2, 5], [0, 5]], out: [null, 1, -1, -3], note: "example"}
+      - {ops: [NumArray, sum_range, sum_range, sum_range], args: [[[1, 2, 3]], [1, 1], [0, 0], [2, 2]], out: [null, 2, 1, 3], note: "left == right"}
+      - {ops: [NumArray, sum_range, sum_range], args: [[[-1, -2, -3]], [0, 2], [1, 2]], out: [null, -6, -5], note: "all negative"}
+      - {ops: [NumArray, sum_range], args: [[[5]], [0, 0]], out: [null, 5], note: "single element"}
+    solution:
+      python: |
+        class NumArray:
+            def __init__(self, nums):
+                self.pre = [0]
+                for x in nums:
+                    self.pre.append(self.pre[-1] + x)
+
+            def sum_range(self, left, right):
+                return self.pre[right + 1] - self.pre[left]
+      ruby: |
+        class NumArray
+          def initialize(nums)
+            @pre = [0]
+            nums.each { |x| @pre << @pre[-1] + x }
+          end
+
+          def sum_range(left, right)
+            @pre[right + 1] - @pre[left]
+          end
+        end
+
+  - id: subarray-sum-k
+    title: Subarray Sum Equals K
+    difficulty: Medium
+    variant: prefix + hash map (negatives)
+    statement: Return the number of contiguous subarrays of `nums` whose sum equals `k`. `nums` may contain negatives and zeros.
+    example: "nums = [1, 1, 1], k = 2  →  2"
+    hint: A subarray sum is the difference of two prefix sums. For a subarray ending here, which earlier prefix value would work?
+    insight: sum(i..j) = k ⇔ P[i] = P[j+1] − k. Counting earlier prefixes with that value in a hash map is O(n) even with negatives, where a window fails.
+    complexity: O(n) time · O(n) space
+    fn: subarray_sum
+    tests:
+      - {args: [[1, 1, 1], 2], out: 2, note: "example"}
+      - {args: [[1, 2, 3], 3], out: 2, note: "starts at index 0: needs {0: 1}"}
+      - {args: [[3, 4, 7, 2, -3, 1, 4, 2], 7], out: 4, note: "negatives"}
+      - {args: [[1, -1, 0], 0], out: 3, note: "k = 0 with zeros"}
+      - {args: [[-1, -1, 1], 0], out: 1, note: "only [-1, 1]"}
+      - {args: [[1], 0], out: 0, note: "empty subarray doesn't count"}
+    solution:
+      python: |
+        def subarray_sum(nums, k):
+            seen = {0: 1}                       # the empty prefix
+            run = count = 0
+            for x in nums:
+                run += x
+                count += seen.get(run - k, 0)   # prefixes leaving exactly k
+                seen[run] = seen.get(run, 0) + 1
+            return count
+      ruby: |
+        def subarray_sum(nums, k)
+          seen = Hash.new(0)
+          seen[0] = 1                         # the empty prefix
+          run = count = 0
+          nums.each do |x|
+            run += x
+            count += seen[run - k]            # prefixes leaving exactly k
+            seen[run] += 1
+          end
+          count
+        end

@@ -1,0 +1,147 @@
+id: backtracking
+name: Backtracking
+signal: [all subsets / permutations / combinations, "generate every valid …", "small n (≤ ~20)", "constraint puzzles (N-Queens, Sudoku)"]
+idea: >-
+  DFS over a tree of partial choices — choose, recurse, un-choose — so one `path` list serves every branch.
+  A `start` index yields combinations instead of permutations, and pruning (sorted input, running sum past target) cuts whole subtrees before entering them.
+  Cost is the size of that tree: exponential, usually bounded by the output size.
+diagram:
+  type: tree
+  caption: "choose → recurse → un-choose"
+  frames:
+    - tree: {v: "[]", hit: true, c: [
+              {v: "[1]", e: "+1", hit: true, c: [{v: "[1,2]", e: "+2", c: [{v: "[1,2,3]", e: "+3"}]}, {v: "[1,3]", e: "+3", hit: true}]},
+              {v: "[2]", e: "+2", c: [{v: "[2,3]", e: "+3"}]},
+              {v: "[3]", e: "+3"}]}
+      note: "at [1,3]: record, pop 3, pop 1, then try 2"
+template:
+  python: |
+    res, path = [], []
+
+    def dfs(start):
+        res.append(path[:])         # record a copy (or only at leaves)
+        for i in range(start, len(a)):
+            if prune(i):
+                continue            # or break if sorted
+            path.append(a[i])       # choose
+            dfs(i + 1)              # i + 1: each item once · i: reuse
+            path.pop()              # un-choose
+
+    dfs(0)
+  ruby: |
+    res, path = [], []
+    dfs = lambda do |start|
+      res << path.dup               # record a copy (or only at leaves)
+      (start...a.size).each do |i|
+        next if prune(i)            # or break if sorted
+        path << a[i]                # choose
+        dfs.(i + 1)                 # i + 1: each item once · i: reuse
+        path.pop                    # un-choose
+      end
+    end
+    dfs.(0)
+pitfalls:
+  - Record a copy (`path[:]` / `path.dup`). Appending `path` itself stores the same list n times, and it ends up empty.
+  - "The child's start index sets the shape: `i + 1` → each item at most once (subsets, combinations); `i` → unlimited reuse; no start index plus a `used` set → permutations."
+  - "Duplicate inputs: sort, then skip equal siblings with `i > start and a[i] == a[i - 1]`. Equal values along one path are fine."
+  - Prune before recursing. With sorted candidates, `break` once `a[i] > remaining`, because every later one is bigger.
+  - "Ruby: a nested `def` can't see outer locals, so use a lambda (`dfs = ->(i) { … }`, call `dfs.(i)`) or pass state as arguments. Python: rebinding an outer variable needs `nonlocal`; mutating a list doesn't."
+
+problems:
+  - id: subsets
+    title: Subsets
+    difficulty: Medium
+    variant: canonical
+    statement: Return all subsets (the power set) of `nums`, whose values are distinct. Any order; no duplicate subsets.
+    example: "nums = [1, 2, 3]  →  [[], [1], [1, 2], [1, 2, 3], [1, 3], [2], [2, 3], [3]]"
+    hint: Every node of the recursion tree is a subset. When do you record?
+    insight: Record at every node, not just leaves, and only move forward from `start` — each of the 2ⁿ subsets is produced exactly once.
+    complexity: O(n · 2ⁿ) time · O(n) recursion depth (excluding output)
+    fn: subsets
+    compare: unordered
+    tests:
+      - {args: [[1, 2, 3]], out: [[], [1], [2], [3], [1, 2], [1, 3], [2, 3], [1, 2, 3]], note: "example"}
+      - {args: [[0]], out: [[], [0]], note: "single element"}
+      - {args: [[]], out: [[]], note: "empty input: one empty subset"}
+      - {args: [[4, 1]], out: [[], [4], [1], [1, 4]], note: "unsorted input"}
+    solution:
+      python: |
+        def subsets(nums):
+            res, path = [], []
+
+            def dfs(start):
+                res.append(path[:])
+                for i in range(start, len(nums)):
+                    path.append(nums[i])
+                    dfs(i + 1)
+                    path.pop()
+
+            dfs(0)
+            return res
+      ruby: |
+        def subsets(nums)
+          res, path = [], []
+          dfs = lambda do |start|
+            res << path.dup
+            (start...nums.size).each do |i|
+              path << nums[i]
+              dfs.(i + 1)
+              path.pop
+            end
+          end
+          dfs.(0)
+          res
+        end
+
+  - id: combination-sum
+    title: Combination Sum
+    difficulty: Medium
+    variant: unlimited reuse + pruning
+    statement: Return all unique combinations of `candidates` (distinct positive integers) that sum to `target`. A candidate may be used any number of times. Combinations are unique as multisets; any order.
+    example: "candidates = [2, 3, 6, 7], target = 7  →  [[2, 2, 3], [7]]"
+    hint: "Same tree as Subsets, two changes: which index does the child start from, and when can you abandon a whole branch?"
+    insight: Recursing with `i` (not `i + 1`) allows reuse but never goes backward, so [2, 3] and [3, 2] can't both appear. Sorting turns the over-target check into a `break`.
+    complexity: O(n^(T/m)) time (T = target, m = smallest candidate) · O(T/m) depth
+    fn: combination_sum
+    compare: unordered
+    tests:
+      - {args: [[2, 3, 6, 7], 7], out: [[2, 2, 3], [7]], note: "example"}
+      - {args: [[2, 3, 5], 8], out: [[2, 2, 2, 2], [2, 3, 3], [3, 5]], note: "several answers"}
+      - {args: [[8, 4, 2], 8], out: [[8], [4, 4], [2, 2, 4], [2, 2, 2, 2]], note: "unsorted input"}
+      - {args: [[1], 2], out: [[1, 1]], note: "reuse the same element"}
+      - {args: [[2], 1], out: [], note: "impossible"}
+    solution:
+      python: |
+        def combination_sum(candidates, target):
+            candidates = sorted(candidates)
+            res, path = [], []
+
+            def dfs(start, remaining):
+                if remaining == 0:
+                    res.append(path[:])
+                    return
+                for i in range(start, len(candidates)):
+                    if candidates[i] > remaining:
+                        break                       # sorted: the rest are bigger too
+                    path.append(candidates[i])
+                    dfs(i, remaining - candidates[i])   # i, not i + 1: reuse allowed
+                    path.pop()
+
+            dfs(0, target)
+            return res
+      ruby: |
+        def combination_sum(candidates, target)
+          candidates = candidates.sort
+          res, path = [], []
+          dfs = lambda do |start, remaining|
+            return res << path.dup if remaining.zero?
+            (start...candidates.size).each do |i|
+              break if candidates[i] > remaining      # sorted: the rest are bigger too
+              path << candidates[i]
+              dfs.(i, remaining - candidates[i])      # i, not i + 1: reuse allowed
+              path.pop
+            end
+          end
+          dfs.(0, target)
+          res
+        end

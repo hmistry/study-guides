@@ -1,0 +1,122 @@
+id: dp-2d
+name: DP — 2D
+signal: ["two strings (LCS, edit distance)", grid paths, "knapsack: items × capacity", "dp[i][j] from top / left / diagonal"]
+idea: >-
+  The state needs two indices: a prefix of each string, a grid cell, or (item, capacity). dp[i][j] is built from neighbours already filled — top, left, diagonal.
+  Fill row by row; when a row only reads the previous one, keep one or two rows.
+  O(m · n) time, O(n) space with rolling rows.
+diagram:
+  type: grid
+  caption: "match → ↖ + 1   ·   else max(↑, ←)"
+  frames:
+    - {rows: [[0, 0, 0, 0, 0, 0], [0, 1, 1, 1, 1, 1], [0, 1, 1, 2, 2, 2], [0, 1, 1, 2, 2, 3]], labels: ["", a, c, e], cols: ["", a, b, c, d, e], win: [[1, 2]], hit: [[2, 3]], note: "'c' = 'c' → diagonal + 1 = 2"}
+    - {rows: [[0, 0, 0, 0, 0, 0], [0, 1, 1, 1, 1, 1], [0, 1, 1, 2, 2, 2], [0, 1, 1, 2, 2, 3]], labels: ["", a, c, e], cols: ["", a, b, c, d, e], win: [[1, 4], [2, 3]], hit: [[2, 4]], note: "'c' ≠ 'd' → max(top, left) = 2"}
+template:
+  python: |
+    m, n = len(a), len(b)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]   # row / col 0 = empty prefix
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if a[i - 1] == b[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1] + 1      # diagonal
+            else:
+                dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])   # top, left
+    return dp[m][n]
+  ruby: |
+    m, n = a.size, b.size
+    dp = Array.new(m + 1) { Array.new(n + 1, 0) }  # row / col 0 = empty prefix
+    (1..m).each do |i|
+      (1..n).each do |j|
+        dp[i][j] = if a[i - 1] == b[j - 1]
+                     dp[i - 1][j - 1] + 1          # diagonal
+                   else
+                     [dp[i - 1][j], dp[i][j - 1]].max   # top, left
+                   end
+      end
+    end
+    dp[m][n]
+pitfalls:
+  - "Build rows with a comprehension or block. `[[0] * n] * m` (Python) and `Array.new(m, Array.new(n, 0))` (Ruby) make every row the same object."
+  - "Pad with an empty-prefix row and column, size (m + 1) × (n + 1). Then the char for row i is `a[i − 1]`, the classic off-by-one."
+  - "Rolling rows: if dp[i] reads only dp[i − 1], keep one row. For 0/1 knapsack, iterate capacity right to left so each item is used at most once."
+  - "Edit distance is the same table: match → diagonal; otherwise 1 + min(top, left, diagonal) for delete, insert and replace."
+  - "To recover the sequence itself, walk back from dp[m][n] along the moves that produced each value."
+
+problems:
+  - id: unique-paths
+    title: Unique Paths
+    difficulty: Medium
+    variant: canonical
+    statement: A robot starts at the top-left of an `m × n` grid and moves only right or down. Return the number of distinct paths to the bottom-right corner.
+    example: "m = 3, n = 7  →  28"
+    hint: Every path into a cell arrives from the cell above or the cell to its left.
+    insight: dp[i][j] = dp[i−1][j] + dp[i][j−1]. Each row needs only the previous one, so a single array updated left to right holds both (or use C(m+n−2, m−1) directly).
+    complexity: O(m · n) time · O(n) space
+    fn: unique_paths
+    tests:
+      - {args: [3, 7], out: 28, note: "example"}
+      - {args: [3, 2], out: 3, note: "small grid"}
+      - {args: [1, 5], out: 1, note: "single row"}
+      - {args: [1, 1], out: 1, note: "start = end"}
+      - {args: [23, 12], out: 193536720, note: "large"}
+    solution:
+      python: |
+        def unique_paths(m, n):
+            row = [1] * n                   # first row: one way to each cell
+            for _ in range(1, m):
+                for j in range(1, n):
+                    row[j] += row[j - 1]    # from top (old row[j]) + from left
+            return row[-1]
+      ruby: |
+        def unique_paths(m, n)
+          row = [1] * n                   # first row: one way to each cell
+          (m - 1).times do
+            (1...n).each { |j| row[j] += row[j - 1] }   # from top (old row[j]) + from left
+          end
+          row[-1]
+        end
+
+  - id: lcs
+    title: Longest Common Subsequence
+    difficulty: Medium
+    variant: two sequences
+    statement: Return the length of the longest subsequence common to `text1` and `text2` (characters in order, not necessarily contiguous).
+    example: "text1 = \"abcde\", text2 = \"ace\"  →  3   (\"ace\")"
+    hint: Compare the last characters of two prefixes. If they match, what's left? If not, which prefix can drop a character?
+    insight: Match → extend the diagonal (both prefixes shrink). No match → the better of dropping a char from either side. The padded (m + 1) × (n + 1) table handles empty prefixes for free.
+    complexity: O(m · n) time · O(m · n) space (O(n) with rolling rows)
+    fn: longest_common_subsequence
+    tests:
+      - {args: ["abcde", "ace"], out: 3, note: "example"}
+      - {args: ["abc", "abc"], out: 3, note: "identical"}
+      - {args: ["abc", "def"], out: 0, note: "nothing in common"}
+      - {args: ["bsbininm", "jmjkbkjkv"], out: 1, note: "common chars in the wrong order"}
+      - {args: ["ezupkr", "ubmrapg"], out: 2, note: "several equal-length answers"}
+      - {args: ["a", ""], out: 0, note: "empty string"}
+    solution:
+      python: |
+        def longest_common_subsequence(text1, text2):
+            m, n = len(text1), len(text2)
+            dp = [[0] * (n + 1) for _ in range(m + 1)]
+            for i in range(1, m + 1):
+                for j in range(1, n + 1):
+                    if text1[i - 1] == text2[j - 1]:
+                        dp[i][j] = dp[i - 1][j - 1] + 1
+                    else:
+                        dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
+            return dp[m][n]
+      ruby: |
+        def longest_common_subsequence(text1, text2)
+          m, n = text1.size, text2.size
+          dp = Array.new(m + 1) { Array.new(n + 1, 0) }
+          (1..m).each do |i|
+            (1..n).each do |j|
+              dp[i][j] = if text1[i - 1] == text2[j - 1]
+                           dp[i - 1][j - 1] + 1
+                         else
+                           [dp[i - 1][j], dp[i][j - 1]].max
+                         end
+            end
+          end
+          dp[m][n]
+        end

@@ -1,0 +1,196 @@
+id: topo-sort
+name: Topological Sort
+signal: ["prerequisites / dependencies", "build / course / task order", "cycle in a directed graph?", "order from pairwise rules"]
+idea: >-
+  Kahn's algorithm: count incoming edges, queue every node with in-degree 0, and each time you output a node, decrement its neighbours and enqueue any that reach 0.
+  If fewer than V nodes come out, the rest lie on a cycle.
+  O(V + E).
+diagram:
+  type: graph
+  caption: "take in-degree 0 · decrement · repeat"
+  frames:
+    - nodes: &topo {a: [0, 0], b: [0, 2], c: [1, 1], d: [2, 0], e: [2, 2], f: [3, 1]}
+      edges: &topoE [[a, c], [b, c], [c, d], [c, e], [d, f], [e, f]]
+      badge: {a: 0, b: 0, c: 2, d: 1, e: 1, f: 2}
+      hit: [a, b]
+      note: "badge = in-degree · queue starts with a, b"
+    - nodes: *topo
+      edges: *topoE
+      badge: {c: 0, d: 1, e: 1, f: 2}
+      win: [a, b]
+      hit: [c]
+      note: "output a, b → c drops to 0 → enqueue c"
+template:
+  python: |
+    from collections import deque
+
+    graph = [[] for _ in range(n)]
+    indeg = [0] * n
+    for a, b in edges:              # a must come before b
+        graph[a].append(b)
+        indeg[b] += 1
+
+    q = deque(i for i in range(n) if indeg[i] == 0)
+    order = []
+    while q:
+        u = q.popleft()
+        order.append(u)
+        for v in graph[u]:
+            indeg[v] -= 1
+            if indeg[v] == 0:
+                q.append(v)
+    # len(order) < n → cycle
+  ruby: |
+    graph = Array.new(n) { [] }
+    indeg = [0] * n
+    edges.each do |a, b|            # a must come before b
+      graph[a] << b
+      indeg[b] += 1
+    end
+
+    q = (0...n).select { |i| indeg[i].zero? }
+    order = []
+    until q.empty?
+      u = q.shift
+      order << u
+      graph[u].each do |v|
+        indeg[v] -= 1
+        q << v if indeg[v].zero?
+      end
+    end
+    # order.size < n → cycle
+pitfalls:
+  - "Get the edge direction right: \"to take a you need b\" is the edge b → a. Reversed edges still produce a valid-looking order, but for the reverse problem."
+  - "The cycle check is free: `len(order) < n`. Kahn's doesn't need a separate visited set."
+  - "Give every node an in-degree entry, including nodes with no edges (in Alien Dictionary, every letter that appears)."
+  - "DFS alternative: post-order with three colours (unvisited, in progress, done). Reaching an in-progress node means a cycle; reverse post-order is the topological order."
+  - "Several valid orders usually exist. For the lexicographically smallest one, use a min-heap instead of the queue."
+
+problems:
+  - id: course-schedule
+    title: Course Schedule
+    difficulty: Medium
+    variant: canonical
+    statement: "There are `num_courses` courses, labelled 0..n−1. `prerequisites[i] = [a, b]` means b must be taken before a. Return true if all courses can be finished."
+    example: "num_courses = 2, prerequisites = [[1, 0], [0, 1]]  →  false"
+    hint: Which courses can you take right now? Once you take them, which become available?
+    insight: It's "does this directed graph have a cycle?" — Kahn's answers it by counting how many nodes ever reach in-degree 0.
+    complexity: O(V + E) time and space
+    fn: can_finish
+    tests:
+      - {args: [2, [[1, 0], [0, 1]]], out: false, note: "example: 2-cycle"}
+      - {args: [2, [[1, 0]]], out: true, note: "one prerequisite"}
+      - {args: [3, [[0, 1], [0, 2], [1, 2]]], out: true, note: "diamond, no cycle"}
+      - {args: [3, [[0, 1], [1, 2], [2, 0]]], out: false, note: "3-cycle"}
+      - {args: [4, [[1, 0], [2, 1], [3, 3]]], out: false, note: "self-loop"}
+      - {args: [1, []], out: true, note: "no prerequisites"}
+    solution:
+      python: |
+        from collections import deque
+
+        def can_finish(num_courses, prerequisites):
+            graph = [[] for _ in range(num_courses)]
+            indeg = [0] * num_courses
+            for course, pre in prerequisites:       # edge pre → course
+                graph[pre].append(course)
+                indeg[course] += 1
+            q = deque(i for i in range(num_courses) if indeg[i] == 0)
+            taken = 0
+            while q:
+                u = q.popleft()
+                taken += 1
+                for v in graph[u]:
+                    indeg[v] -= 1
+                    if indeg[v] == 0:
+                        q.append(v)
+            return taken == num_courses             # the rest lie on a cycle
+      ruby: |
+        def can_finish(num_courses, prerequisites)
+          graph = Array.new(num_courses) { [] }
+          indeg = [0] * num_courses
+          prerequisites.each do |course, pre|     # edge pre → course
+            graph[pre] << course
+            indeg[course] += 1
+          end
+          q = (0...num_courses).select { |i| indeg[i].zero? }
+          taken = 0
+          until q.empty?
+            u = q.shift
+            taken += 1
+            graph[u].each do |v|
+              indeg[v] -= 1
+              q << v if indeg[v].zero?
+            end
+          end
+          taken == num_courses                    # the rest lie on a cycle
+        end
+
+  - id: alien-dictionary
+    title: Alien Dictionary
+    difficulty: Hard
+    variant: build the graph yourself
+    statement: "`words` is sorted in an alien language's lexicographic order. Return a string of every letter that appears, in an order consistent with `words`, or \"\" if no order is valid. (These tests use inputs with exactly one valid order.)"
+    example: "words = [\"wrt\", \"wrf\", \"er\", \"ett\", \"rftt\"]  →  \"wertf\""
+    hint: Compare adjacent words only. What does their first differing letter tell you — and what if there isn't one?
+    insight: Each adjacent pair gives at most one edge (first differing letter). The rest is Kahn's. There are two invalid cases — a cycle, and a longer word listed before its own prefix.
+    complexity: O(C) time (C = total characters) · O(1) extra (≤ 26 letters)
+    fn: alien_order
+    tests:
+      - {args: [["wrt", "wrf", "er", "ett", "rftt"]], out: "wertf", note: "example"}
+      - {args: [["ba", "bc", "ac", "cab"]], out: "bac", note: "edges from several pairs"}
+      - {args: [["z", "x"]], out: "zx", note: "two letters"}
+      - {args: [["z", "x", "z"]], out: "", note: "cycle"}
+      - {args: [["abc", "ab"]], out: "", note: "prefix listed after the longer word"}
+      - {args: [["z", "z"]], out: "z", note: "single letter"}
+    solution:
+      python: |
+        from collections import deque
+
+        def alien_order(words):
+            graph = {c: set() for w in words for c in w}
+            indeg = {c: 0 for c in graph}
+            for a, b in zip(words, words[1:]):
+                for x, y in zip(a, b):
+                    if x != y:                      # first difference: x before y
+                        if y not in graph[x]:
+                            graph[x].add(y)
+                            indeg[y] += 1
+                        break
+                else:
+                    if len(a) > len(b):
+                        return ""                   # "abc" before "ab" is impossible
+            q = deque(c for c in indeg if indeg[c] == 0)
+            order = []
+            while q:
+                c = q.popleft()
+                order.append(c)
+                for d in graph[c]:
+                    indeg[d] -= 1
+                    if indeg[d] == 0:
+                        q.append(d)
+            return "".join(order) if len(order) == len(indeg) else ""
+      ruby: |
+        def alien_order(words)
+          graph = {}
+          words.each { |w| w.each_char { |c| graph[c] ||= Set.new } }
+          indeg = graph.keys.to_h { |c| [c, 0] }
+          words.each_cons(2) do |a, b|
+            i = (0...[a.size, b.size].min).find { |k| a[k] != b[k] }
+            if i.nil?
+              return "" if a.size > b.size        # "abc" before "ab" is impossible
+              next
+            end
+            indeg[b[i]] += 1 if graph[a[i]].add?(b[i])   # first difference: a[i] before b[i]
+          end
+          q = indeg.select { |_, d| d.zero? }.keys
+          order = []
+          until q.empty?
+            c = q.shift
+            order << c
+            graph[c].each do |d|
+              indeg[d] -= 1
+              q << d if indeg[d].zero?
+            end
+          end
+          order.size == indeg.size ? order.join : ""
+        end

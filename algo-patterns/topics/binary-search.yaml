@@ -1,0 +1,131 @@
+id: binary-search
+name: Binary Search
+signal: [sorted or rotated array, "O(log n) required", "minimum / maximum x such that…", huge answer range + a yes/no check]
+idea: >-
+  Keep a range [lo, hi] that must contain the answer and halve it with one check per step. Anything monotonic works:
+  a sorted array, or a yes/no check over the answer space ("can she finish at speed x?" is ✗…✗ ✓…✓) — find the first ✓.
+  O(log n) checks instead of n.
+diagram:
+  caption: "first ✓   ·   ✗ → L = M+1   ·   ✓ → R = M"
+  frames:
+    - {values: ["✗", "✗", "✗", "✗", "✓", "✓", "✓", "✓"], marks: {L: 0, M: 3, R: 7}, window: [0, 7], note: "check(3) ✗ → L = 4"}
+    - {values: ["✗", "✗", "✗", "✗", "✓", "✓", "✓", "✓"], marks: {L: 4, M: 5, R: 7}, window: [4, 7], note: "check(5) ✓ → R = 5 (keep M)"}
+    - {values: ["✗", "✗", "✗", "✗", "✓", "✓", "✓", "✓"], marks: {L R: 4}, hit: [4], note: "… check(4) ✓ → R = 4 = L → first ✓"}
+template:
+  python: |
+    # first x in [lo, hi] where ok(x) — ok is ✗…✗ ✓…✓
+    lo, hi = LOW, HIGH         # hi must be a valid answer
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if ok(mid):
+            hi = mid           # mid may be the answer: keep it
+        else:
+            lo = mid + 1
+    return lo
+  ruby: |
+    # first x in [lo, hi] where ok(x) — ok is ✗…✗ ✓…✓
+    lo, hi = LOW, HIGH         # hi must be a valid answer
+    while lo < hi
+      mid = (lo + hi) / 2
+      ok(mid) ? hi = mid : lo = mid + 1
+    end
+    lo
+    # or: (LOW..HIGH).bsearch { |x| ok(x) }
+pitfalls:
+  - "Pick one loop shape and keep it. `lo < hi` + `hi = mid` finds the first ✓; `lo <= hi` + `hi = mid − 1` finds an exact match. Mixing `lo <= hi` with `hi = mid` loops forever."
+  - "`mid` rounds down, so a search for the *last* ✓ (`lo = mid`) needs `mid = (lo + hi + 1) // 2` or it stalls at two elements."
+  - "Search on the answer: when the input isn't sorted but the answer is (speed, capacity, days), binary-search the answer range with a feasibility check → O(n log range)."
+  - Rotated array — one side of `mid` is always sorted; check if the target falls in that side's range. Duplicates break this (`nums[lo] == nums[mid]` tells you nothing → worst case O(n)).
+  - "Built-ins: Python `bisect_left` / `bisect_right`; Ruby `bsearch` (block returns true/false → first true). `lo + hi` can't overflow in Python/Ruby, but write `lo + (hi − lo) / 2` in Java/C++."
+
+problems:
+  - id: search-rotated
+    title: Search in Rotated Sorted Array
+    difficulty: Medium
+    variant: one half is always sorted
+    statement: A sorted array of distinct integers was rotated at an unknown pivot (e.g. `[0, 1, 2, 4, 5, 6, 7]` → `[4, 5, 6, 7, 0, 1, 2]`). Return the index of `target`, or -1. O(log n) time.
+    example: "nums = [4, 5, 6, 7, 0, 1, 2], target = 0  →  4"
+    hint: Split at `mid`. At least one half is in sorted order — can you tell whether `target` is inside it?
+    insight: You never need the pivot. `nums[lo] <= nums[mid]` says which half is sorted, and a range check on that half decides where to go.
+    complexity: O(log n) time · O(1) space
+    fn: search
+    tests:
+      - {args: [[4, 5, 6, 7, 0, 1, 2], 0], out: 4, note: "example: target right of the pivot"}
+      - {args: [[4, 5, 6, 7, 0, 1, 2], 3], out: -1, note: "missing"}
+      - {args: [[1, 2, 3, 4, 5], 4], out: 3, note: "not rotated"}
+      - {args: [[5, 1, 3], 5], out: 0, note: "target at lo"}
+      - {args: [[3, 1], 1], out: 1, note: "n = 2: lo == mid"}
+      - {args: [[1], 0], out: -1, note: "single, missing"}
+    solution:
+      python: |
+        def search(nums, target):
+            lo, hi = 0, len(nums) - 1
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                if nums[mid] == target:
+                    return mid
+                if nums[lo] <= nums[mid]:                # left half sorted
+                    if nums[lo] <= target < nums[mid]:
+                        hi = mid - 1
+                    else:
+                        lo = mid + 1
+                else:                                    # right half sorted
+                    if nums[mid] < target <= nums[hi]:
+                        lo = mid + 1
+                    else:
+                        hi = mid - 1
+            return -1
+      ruby: |
+        def search(nums, target)
+          lo, hi = 0, nums.length - 1
+          while lo <= hi
+            mid = (lo + hi) / 2
+            return mid if nums[mid] == target
+            if nums[lo] <= nums[mid]                         # left half sorted
+              if nums[lo] <= target && target < nums[mid]
+                hi = mid - 1
+              else
+                lo = mid + 1
+              end
+            elsif nums[mid] < target && target <= nums[hi]   # right half sorted, target in it
+              lo = mid + 1
+            else
+              hi = mid - 1
+            end
+          end
+          -1
+        end
+
+  - id: koko-bananas
+    title: Koko Eating Bananas
+    difficulty: Medium
+    variant: search on the answer
+    statement: "`piles[i]` bananas per pile. Koko picks one speed `k` (bananas/hour). Each hour she eats up to `k` from one pile; if it has fewer, she finishes it and waits out the hour. Return the minimum integer `k` that finishes everything within `h` hours (`h ≥ len(piles)`)."
+    example: "piles = [3, 6, 7, 11], h = 8  →  4"
+    hint: You're not searching the array. If speed k is fast enough, is k + 1?
+    insight: Feasibility is monotonic in k, so binary-search k over [1, max(piles)] with an O(n) check — O(n log max) instead of trying every speed.
+    complexity: O(n log max(piles)) time · O(1) space
+    fn: min_eating_speed
+    tests:
+      - {args: [[3, 6, 7, 11], 8], out: 4, note: "example"}
+      - {args: [[30, 11, 23, 4, 20], 5], out: 30, note: "h = n: speed = max pile"}
+      - {args: [[30, 11, 23, 4, 20], 6], out: 23, note: "one spare hour"}
+      - {args: [[5, 5], 100], out: 1, note: "lots of time: lower bound 1"}
+      - {args: [[1000000000], 2], out: 500000000, note: "huge pile: needs log search"}
+      - {args: [[312884470], 312884469], out: 2, note: "ceil division matters"}
+    solution:
+      python: |
+        def min_eating_speed(piles, h):
+            lo, hi = 1, max(piles)                  # speed max(piles) always works
+            while lo < hi:
+                k = (lo + hi) // 2
+                if sum((p + k - 1) // k for p in piles) <= h:   # ceil(p / k) hours per pile
+                    hi = k
+                else:
+                    lo = k + 1
+            return lo
+      ruby: |
+        def min_eating_speed(piles, h)
+          # bsearch returns the first k whose block is true
+          (1..piles.max).bsearch { |k| piles.sum { |p| (p + k - 1) / k } <= h }   # ceil(p / k) hours per pile
+        end

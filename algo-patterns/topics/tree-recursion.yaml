@@ -1,0 +1,118 @@
+id: tree-recursion
+name: Tree Recursion
+signal: [max depth / height, path sums, "diameter / longest path", "balanced? same tree? subtree?", lowest common ancestor]
+idea: >-
+  Each call answers for its subtree from its children's answers. Return what the parent needs (height, sum, found?), and keep anything that isn't one upward branch —
+  like a path bending through this node — in an outer variable. Every node is visited once: O(n) time, O(h) stack (h = n when skewed).
+diagram:
+  type: tree
+  caption: "return height · record L + R on the side"
+  frames:
+    - tree: {v: 1, b: 3, hit: true, c: [{v: 2, b: 2, hit: true, c: [{v: 4, b: 1, hit: true}, {v: 5, b: 1}]}, {v: 3, b: 1, hit: true}]}
+      note: "badge = height returned · best L + R = 3 at node 1"
+template:
+  python: |
+    def solve(root):
+        best = 0
+
+        def dfs(node):
+            nonlocal best
+            if not node:
+                return 0                        # empty subtree
+            left, right = dfs(node.left), dfs(node.right)
+            best = max(best, combine(left, right))   # answer bending here
+            return 1 + max(left, right)         # what the parent needs
+
+        dfs(root)
+        return best
+  ruby: |
+    def solve(root)
+      best = 0
+      dfs = lambda do |node|
+        return 0 unless node                    # empty subtree
+        left, right = dfs.(node.left), dfs.(node.right)
+        best = [best, combine(left, right)].max # answer bending here
+        1 + [left, right].max                   # what the parent needs
+      end
+      dfs.(root)
+      best
+    end
+pitfalls:
+  - Separate what you return from what you record. The return value must extend upward (one branch); anything that uses both children goes into `best`.
+  - "Base case `None → 0` counts nodes. If the problem counts edges, the answer is often nodes − 1. Check with a 1-node tree."
+  - "Python's default recursion limit is ~1000, so a skewed tree of 10⁴ nodes crashes. Raise it with `sys.setrecursionlimit` or use an explicit stack. Ruby allows ~10k frames by default."
+  - "Top-down (pass bounds or depth as arguments) vs bottom-up (return values). Validating a BST needs bounds passed down; height and diameter need values returned."
+  - "Don't recompute heights inside a recursive check: `is_balanced` calling `height` at each node is O(n²). Return the height plus a sentinel (−1 = unbalanced) in one pass."
+
+problems:
+  - id: max-depth
+    title: Maximum Depth of Binary Tree
+    difficulty: Easy
+    variant: canonical
+    statement: "Return the maximum depth of a binary tree: the number of nodes on the longest root-to-leaf path."
+    example: "root = [3, 9, 20, null, null, 15, 7]  →  3"
+    hint: If you knew the depth of both subtrees, what's the depth of this one?
+    insight: A node's answer is 1 + its better child — the return value is the whole solution, no outer state.
+    complexity: O(n) time · O(h) space
+    fn: max_depth
+    tests:
+      - {args: [{tree: [3, 9, 20, null, null, 15, 7]}], out: 3, note: "example"}
+      - {args: [{tree: [1, null, 2]}], out: 2, note: "only a right child"}
+      - {args: [{tree: [1, 2, null, 3, null, 4]}], out: 4, note: "skewed: depth = n"}
+      - {args: [{tree: [1]}], out: 1, note: "single node"}
+      - {args: [{tree: []}], out: 0, note: "empty tree"}
+    solution:
+      python: |
+        def max_depth(root):
+            if not root:
+                return 0
+            return 1 + max(max_depth(root.left), max_depth(root.right))
+      ruby: |
+        def max_depth(root)
+          return 0 unless root
+          1 + [max_depth(root.left), max_depth(root.right)].max
+        end
+
+  - id: diameter
+    title: Diameter of Binary Tree
+    difficulty: Easy
+    variant: answer ≠ return value
+    statement: "Return the diameter of a binary tree: the number of edges on the longest path between any two nodes. The path need not pass through the root."
+    example: "root = [1, 2, 3, 4, 5]  →  3   (4 → 2 → 1 → 3)"
+    hint: The longest path bends at some node. In terms of that node's subtree heights, how long is it?
+    insight: Return height (one branch, for the parent) but record `left + right` (both branches) on the side. Mixing the two up is the whole bug surface.
+    complexity: O(n) time · O(h) space
+    fn: diameter_of_binary_tree
+    tests:
+      - {args: [{tree: [1, 2, 3, 4, 5]}], out: 3, note: "example"}
+      - {args: [{tree: [1, 2, null, 3, 4, 5, null, null, 6]}], out: 4, note: "best path skips the root"}
+      - {args: [{tree: [1, 2, null, 3]}], out: 2, note: "skewed: one-sided path"}
+      - {args: [{tree: [1, 2]}], out: 1, note: "two nodes"}
+      - {args: [{tree: [1]}], out: 0, note: "single node: 0 edges"}
+    solution:
+      python: |
+        def diameter_of_binary_tree(root):
+            best = 0
+
+            def height(node):
+                nonlocal best
+                if not node:
+                    return 0
+                l, r = height(node.left), height(node.right)
+                best = max(best, l + r)     # longest path bending here, in edges
+                return 1 + max(l, r)
+
+            height(root)
+            return best
+      ruby: |
+        def diameter_of_binary_tree(root)
+          best = 0
+          height = lambda do |node|
+            return 0 unless node
+            l, r = height.(node.left), height.(node.right)
+            best = [best, l + r].max      # longest path bending here, in edges
+            1 + [l, r].max
+          end
+          height.(root)
+          best
+        end

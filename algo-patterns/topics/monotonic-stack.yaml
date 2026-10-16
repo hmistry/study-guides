@@ -1,0 +1,125 @@
+id: monotonic-stack
+name: Monotonic Stack
+signal: ["next greater / smaller element", "days until warmer; stock span", "largest rectangle / area bounded by heights", "remove k digits for the smallest number"]
+idea: >-
+  Keep a stack of indices whose values stay monotonic (e.g. decreasing). A new element pops everything it beats — for each popped index it is the "next greater" — then pushes itself.
+  Each index is pushed and popped once: O(n) instead of an O(n²) scan to the right.
+diagram:
+  type: grid
+  caption: "pop what the new value beats, then push"
+  frames:
+    - {rows: [[73, 74, 75, 71, 69, 72, 76, 73], [75, 71, 69]], labels: [temps, stack], marks: {i: 5}, win: [[0, 5]], hit: [[1, 1], [1, 2]], note: "72 beats 69 and 71 → pop: ans[4] = 1, ans[3] = 2"}
+    - {rows: [[73, 74, 75, 71, 69, 72, 76, 73], [75, 72]], labels: [temps, stack], marks: {i: 5}, win: [[0, 5]], hit: [[1, 1]], note: "push 72 · stack stays decreasing (holds indices)"}
+template:
+  python: |
+    ans = [DEFAULT] * len(a)
+    stack = []                          # indices; a[stack] decreasing
+    for i, x in enumerate(a):
+        while stack and a[stack[-1]] < x:   # x is next greater for these
+            j = stack.pop()
+            ans[j] = resolve(j, i)          # e.g. i - j, or x
+        stack.append(i)
+    # indices still on the stack have no greater element
+  ruby: |
+    ans = Array.new(a.size, DEFAULT)
+    stack = []                          # indices; a[stack] decreasing
+    a.each_with_index do |x, i|
+      while !stack.empty? && a[stack[-1]] < x   # x is next greater for these
+        j = stack.pop
+        ans[j] = resolve(j, i)          # e.g. i - j, or x
+      end
+      stack << i
+    end
+    # indices still on the stack have no greater element
+pitfalls:
+  - "Push indices, not values. You need positions for distances and widths, and `a[i]` gives you the value back."
+  - "Direction: next greater → decreasing stack, pop while `top < x`; next smaller → increasing stack, pop while `top > x`. Choose `<` or `<=` to decide which way equal values resolve."
+  - "Leftovers never got an answer. Set the default (0 or −1) up front, or append a sentinel (0 / −∞) so the main loop flushes them."
+  - "Circular arrays (Next Greater Element II): loop i over 2n, index with `i % n`, and push only during the first pass."
+  - "A popped element's span runs from the new top (left bound) to i (right bound). That's how Largest Rectangle gets both boundaries in one pass."
+
+problems:
+  - id: daily-temperatures
+    title: Daily Temperatures
+    difficulty: Medium
+    variant: canonical
+    statement: Given daily `temperatures`, return `answer` where `answer[i]` is the number of days after day i until a strictly warmer day, or 0 if there is none.
+    example: "temperatures = [73, 74, 75, 71, 69, 72, 76, 73]  →  [1, 1, 4, 2, 1, 1, 0, 0]"
+    hint: Keep the days still waiting for a warmer one. When a warm day arrives, which of them does it answer?
+    insight: The waiting days always have decreasing temperatures (anything warmer would have answered them). A new day pops every colder one, and each day is answered exactly once.
+    complexity: O(n) time · O(n) space
+    fn: daily_temperatures
+    tests:
+      - {args: [[73, 74, 75, 71, 69, 72, 76, 73]], out: [1, 1, 4, 2, 1, 1, 0, 0], note: "example"}
+      - {args: [[30, 40, 50, 60]], out: [1, 1, 1, 0], note: "increasing: answered at once"}
+      - {args: [[90, 80, 70]], out: [0, 0, 0], note: "decreasing: never answered"}
+      - {args: [[70, 70, 71]], out: [2, 1, 0], note: "equal isn't warmer"}
+      - {args: [[50]], out: [0], note: "single day"}
+    solution:
+      python: |
+        def daily_temperatures(temperatures):
+            ans = [0] * len(temperatures)
+            stack = []                              # days still waiting
+            for i, t in enumerate(temperatures):
+                while stack and temperatures[stack[-1]] < t:
+                    j = stack.pop()
+                    ans[j] = i - j
+                stack.append(i)
+            return ans
+      ruby: |
+        def daily_temperatures(temperatures)
+          ans = [0] * temperatures.size
+          stack = []                              # days still waiting
+          temperatures.each_with_index do |t, i|
+            while !stack.empty? && temperatures[stack[-1]] < t
+              j = stack.pop
+              ans[j] = i - j
+            end
+            stack << i
+          end
+          ans
+        end
+
+  - id: largest-rectangle
+    title: Largest Rectangle in Histogram
+    difficulty: Hard
+    variant: both boundaries from one pop
+    statement: "`heights[i]` is the height of a bar of width 1. Return the area of the largest rectangle that fits inside the histogram."
+    example: "heights = [2, 1, 5, 6, 2, 3]  →  10   (bars 5 and 6, width 2)"
+    hint: The best rectangle at bar i's full height stretches until a shorter bar on each side. What finds both of those, for every bar, in one pass?
+    insight: Keep an increasing stack. When bar i is shorter than the top, the top's rectangle is bounded — right by i, left by the new top. A trailing 0 flushes the rest.
+    complexity: O(n) time · O(n) space
+    fn: largest_rectangle_area
+    tests:
+      - {args: [[2, 1, 5, 6, 2, 3]], out: 10, note: "example"}
+      - {args: [[6, 2, 5, 4, 5, 1, 6]], out: 12, note: "best spans a dip"}
+      - {args: [[1, 2, 3, 4, 5]], out: 9, note: "increasing: all resolved by the sentinel"}
+      - {args: [[2, 2, 2]], out: 6, note: "equal heights"}
+      - {args: [[2, 4]], out: 4, note: "two bars"}
+      - {args: [[0]], out: 0, note: "zero height"}
+    solution:
+      python: |
+        def largest_rectangle_area(heights):
+            stack = []                                  # indices, heights increasing
+            best = 0
+            for i, h in enumerate(heights + [0]):       # sentinel 0 flushes the stack
+                while stack and heights[stack[-1]] >= h:
+                    top = stack.pop()
+                    left = stack[-1] if stack else -1   # nearest shorter bar on the left
+                    best = max(best, heights[top] * (i - left - 1))
+                stack.append(i)
+            return best
+      ruby: |
+        def largest_rectangle_area(heights)
+          stack = []                                  # indices, heights increasing
+          best = 0
+          (heights + [0]).each_with_index do |h, i|   # sentinel 0 flushes the stack
+            while !stack.empty? && heights[stack[-1]] >= h
+              top = stack.pop
+              left = stack.empty? ? -1 : stack[-1]    # nearest shorter bar on the left
+              best = [best, heights[top] * (i - left - 1)].max
+            end
+            stack << i
+          end
+          best
+        end

@@ -1,0 +1,22 @@
+# Catalog: every pattern in display order (cheat-sheet rows + numbering). A file in topics/ must have
+# an entry here; a pattern gets a full section once topics/<id>.yaml exists.
+# Topic files: inline `code` in text fields renders as <code>.
+# compare: exact (default) | unordered (order of outer list and of each inner list ignored)
+
+catalog:
+  - {id: two-pointers, name: Two Pointers, signal: "sorted array; pair / triplet; in-place", key: "move `l` / `r` by comparing a[l], a[r]", cx: "O(n) · O(1)"}
+  - {id: sliding-window, name: Sliding Window, signal: "contiguous subarray / substring + a constraint", key: "grow R; shrink L while invalid", cx: "O(n) · O(k)"}
+  - {id: fast-slow, name: Fast & Slow Pointers, signal: "linked list; cycle; middle; array as a function", key: "slow +1, fast +2 — they meet iff there's a cycle", cx: "O(n) · O(1)"}
+  - {id: merge-intervals, name: Merge Intervals, signal: "ranges; meetings; overlaps", key: "sort by start; merge if start ≤ last end", cx: "O(n log n) · O(n)"}
+  - {id: binary-search, name: Binary Search, signal: "sorted / rotated; \"minimum x such that…\"", key: "halve the range on a monotonic yes/no check", cx: "O(log n) × check"}
+  - {id: bfs, name: BFS, signal: "fewest steps (unweighted); level order; spreads over time", key: "queue; mark visited when enqueued", cx: "O(V + E)"}
+  - {id: backtracking, name: Backtracking, signal: "all subsets / permutations / combinations", key: "choose → recurse → un-choose; prune early", cx: "O(branches^depth)"}
+  - {id: tree-recursion, name: Tree Recursion, signal: "depth; path; subtree; LCA", key: "return a value up; track the global best on the side", cx: "O(n) · O(h)"}
+  - {id: heap, name: Heap / Top-K, signal: "k largest / smallest; merge k sorted; running median", key: "keep a size-k heap; pop the worst", cx: "O(n log k)"}
+  - {id: prefix-sum, name: Prefix Sum, signal: "range sums; subarray sum = K; negatives allowed", key: "sum(i..j) = P[j+1] − P[i]; hash map of seen prefixes", cx: "O(n) · O(n)"}
+  - {id: dp-1d, name: DP — 1D, signal: "count ways / min cost / max value along one sequence", key: "dp[i] from dp[i−1], dp[i−2], …", cx: "O(n × choices)"}
+  - {id: dp-2d, name: DP — 2D, signal: "two strings; grid paths; knapsack", key: "dp[i][j] from top / left / diagonal", cx: "O(m · n)"}
+  - {id: union-find, name: Union-Find, signal: "connected components; merge groups; undirected cycle", key: "find with path compression; union by rank", cx: "≈ O(1) per op"}
+  - {id: topo-sort, name: Topological Sort, signal: "prerequisites; build order; dependencies", key: "Kahn: repeatedly take nodes with in-degree 0", cx: "O(V + E)"}
+  - {id: trie, name: Trie, signal: "prefix lookups; autocomplete; many words at once", key: "one node per char + end-of-word flag", cx: "O(L) per word"}
+  - {id: monotonic-stack, name: Monotonic Stack, signal: "next greater / smaller; spans; histogram", key: "pop while the top breaks the order", cx: "O(n)"}

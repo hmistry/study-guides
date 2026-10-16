@@ -1,0 +1,117 @@
+id: sliding-window
+name: Sliding Window
+signal: [contiguous subarray / substring, "longest / shortest / max sum", "at most K distinct, no repeats"]
+idea: >-
+  Keep a contiguous window [L, R] plus a running state (sum, counts, last-seen index).
+  R advances every step; L advances only to repair a broken constraint. Since neither pointer moves backward,
+  each element enters and leaves once — O(n) instead of re-scanning every subarray.
+diagram:
+  caption: "grow R every step   ·   shrink L only while the window is invalid"
+  frames:
+    - {values: [a, b, c, a, b, c, b, b], marks: {L: 0, R: 2}, window: [0, 2], note: "\"abc\" valid → len 3"}
+    - {values: [a, b, c, a, b, c, b, b], marks: {L: 1, R: 3}, window: [1, 3], note: "R hits 2nd 'a' → L jumps to 1"}
+template:
+  python: |
+    l = 0
+    best = 0
+    state = ...                 # running sum, counts, last-seen map
+    for r, x in enumerate(a):
+        add(state, x)           # grow: x enters
+        while invalid(state):   # shrink until valid again
+            remove(state, a[l])
+            l += 1
+        best = max(best, r - l + 1)
+  ruby: |
+    l = 0
+    best = 0
+    state = ...                 # running sum, counts, last-seen map
+    a.each_with_index do |x, r|
+      add(state, x)             # grow: x enters
+      while invalid(state)      # shrink until valid again
+        remove(state, a[l])
+        l += 1
+      end
+      best = [best, r - l + 1].max
+    end
+pitfalls:
+  - Needs monotonicity — growing must only push the window toward invalid. Negative numbers break sum windows → use prefix sum + hash map instead.
+  - Pick the shape first. Fixed size → add one, drop one. Variable → grow, then `while invalid` shrink.
+  - "Record the answer at the right moment: longest → after shrinking (window valid); shortest → inside the shrink loop (still valid)."
+  - Window length is `r - l + 1` — the most common off-by-one.
+  - '"Exactly K" = atMost(K) − atMost(K − 1). When counting distinct keys, delete keys whose count drops to 0.'
+
+problems:
+  - id: max-sum-k
+    title: Max Sum Subarray of Size K
+    difficulty: Easy
+    variant: fixed window
+    statement: Return the maximum sum of any contiguous subarray of `nums` with length exactly `k`.
+    example: "nums = [2, 1, 5, 1, 3, 2], k = 3  →  9   (5 + 1 + 3)"
+    hint: Sliding the window by one changes its sum by exactly two numbers.
+    insight: Never re-sum the window — add the element entering and subtract the one leaving.
+    complexity: O(n) time · O(1) space
+    fn: max_sum_subarray
+    tests:
+      - {args: [[2, 1, 5, 1, 3, 2], 3], out: 9, note: "example"}
+      - {args: [[2, 3, 4, 1, 5], 2], out: 7, note: "k = 2"}
+      - {args: [[5], 1], out: 5, note: "single element"}
+      - {args: [[-1, -2, -3], 2], out: -3, note: "all negative"}
+    solution:
+      python: |
+        def max_sum_subarray(nums, k):
+            window = sum(nums[:k])
+            best = window
+            for r in range(k, len(nums)):
+                window += nums[r] - nums[r - k]   # add incoming, drop outgoing
+                best = max(best, window)
+            return best
+      ruby: |
+        def max_sum_subarray(nums, k)
+          window = nums[0, k].sum
+          best = window
+          (k...nums.length).each do |r|
+            window += nums[r] - nums[r - k]   # add incoming, drop outgoing
+            best = [best, window].max
+          end
+          best
+        end
+
+  - id: longest-substring-no-repeat
+    title: Longest Substring Without Repeating Characters
+    difficulty: Medium
+    variant: variable window
+    statement: Return the length of the longest substring of `s` with no repeated characters.
+    example: "s = \"abcabcbb\"  →  3   (\"abc\")"
+    hint: Grow R each step. When a character repeats inside the window, where must L move to?
+    insight: Store each character's last index — L jumps straight past the duplicate and never moves backward.
+    complexity: O(n) time · O(k) space (k = distinct characters)
+    fn: length_of_longest_substring
+    tests:
+      - {args: ["abcabcbb"], out: 3, note: "example"}
+      - {args: ["bbbbb"], out: 1, note: "all same char"}
+      - {args: ["pwwkew"], out: 3, note: "answer isn't a prefix"}
+      - {args: [""], out: 0, note: "empty string"}
+      - {args: ["abba"], out: 2, note: "L must never move backward"}
+      - {args: [" "], out: 1, note: "space counts as a char"}
+    solution:
+      python: |
+        def length_of_longest_substring(s):
+            last = {}                      # char -> last index seen
+            l = best = 0
+            for r, c in enumerate(s):
+                if last.get(c, -1) >= l:   # repeat inside window
+                    l = last[c] + 1        # jump past it
+                last[c] = r
+                best = max(best, r - l + 1)
+            return best
+      ruby: |
+        def length_of_longest_substring(s)
+          last = {}                          # char -> last index seen
+          l = best = 0
+          s.each_char.with_index do |c, r|
+            l = last[c] + 1 if last.fetch(c, -1) >= l   # repeat inside window → jump past it
+            last[c] = r
+            best = [best, r - l + 1].max
+          end
+          best
+        end

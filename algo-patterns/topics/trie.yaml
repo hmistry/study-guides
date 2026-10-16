@@ -1,0 +1,188 @@
+id: trie
+name: Trie
+signal: ["prefix lookups / starts with", autocomplete, "many words against one board or text", "dictionary with wildcards"]
+idea: >-
+  A tree with one edge per character: words sharing a prefix share a path, and an end marker flags complete words. Insert and lookup cost O(L), however many words are stored.
+  To search a board or text for many words at once, walk the trie alongside the DFS — a missing child ends the path for every word at once.
+diagram:
+  type: tree
+  caption: "shared prefix = shared path"
+  frames:
+    - tree: {v: "·", c: [{v: a, c: [{v: p, c: [{v: p, hit: true, c: [{v: l, c: [{v: e, hit: true}]}]}]}]}, {v: b, c: [{v: a, c: [{v: d, hit: true}, {v: t, hit: true}]}]}]}
+      note: "app, apple, bad, bat · green = end of a word"
+template:
+  python: |
+    root = {}
+
+    def insert(word):
+        node = root
+        for ch in word:
+            node = node.setdefault(ch, {})   # child for ch, created if missing
+        node["$"] = word                     # end marker (stores the word)
+
+    def walk(s):                             # node for prefix s, or None
+        node = root
+        for ch in s:
+            node = node.get(ch)
+            if node is None:
+                return None
+        return node
+  ruby: |
+    root = {}
+
+    insert = lambda do |word|
+      node = word.each_char.reduce(root) { |n, ch| n[ch] ||= {} }   # create missing children
+      node["$"] = word                     # end marker (stores the word)
+    end
+
+    # node for prefix s, or nil
+    walk = ->(s) { s.each_char.reduce(root) { |n, ch| n && n[ch] } }
+pitfalls:
+  - "`search` needs the end marker: after inserting \"apple\", \"app\" is a path but not a word. `starts_with` ignores the marker."
+  - "Nested dicts (`{ch: child}` plus a `\"$\"` end key) are quickest to write. A node class with a 26-slot array is leaner for a fixed alphabet. Either way, the marker key must not be a real character."
+  - "Store the whole word at its end node (`node[\"$\"] = word`). A board DFS can then report it without rebuilding the path string."
+  - "Prune as you go: remove the end marker once a word is reported (no duplicates), and delete children that become empty so later paths die sooner."
+  - "A set of every prefix also answers prefix queries, but it costs O(Σ L²) memory and can't advance one character at a time alongside a DFS."
+
+problems:
+  - id: implement-trie
+    title: Implement Trie (Prefix Tree)
+    difficulty: Medium
+    variant: canonical
+    statement: Implement `Trie` with `insert(word)`, `search(word)` (true if `word` was inserted) and `starts_with(prefix)` (true if any inserted word starts with `prefix`). Lowercase letters only.
+    example: "insert(\"apple\"); search(\"apple\") → true; search(\"app\") → false; starts_with(\"app\") → true"
+    hint: What does each node need to store, and how does `search` tell "app" the word from "app" the prefix of "apple"?
+    insight: One dict per node plus an end marker. `search` and `starts_with` share a single walk and differ only in whether they check the marker.
+    complexity: O(L) per operation · O(total characters) space
+    fn: Trie
+    tests:
+      - {ops: [Trie, insert, search, search, starts_with, insert, search], args: [[], ["apple"], ["apple"], ["app"], ["app"], ["app"], ["app"]], out: [null, null, true, false, true, null, true], note: "example"}
+      - {ops: [Trie, insert, insert, search, search, starts_with], args: [[], ["bat"], ["bad"], ["bad"], ["ba"], ["ba"]], out: [null, null, null, true, false, true], note: "shared prefix, branch"}
+      - {ops: [Trie, insert, starts_with, search], args: [[], ["ab"], ["abc"], ["abc"]], out: [null, null, false, false], note: "query longer than any word"}
+      - {ops: [Trie, search, starts_with], args: [[], ["a"], ["a"]], out: [null, false, false], note: "empty trie"}
+      - {ops: [Trie, insert, insert, search], args: [[], ["a"], ["a"], ["a"]], out: [null, null, null, true], note: "insert twice"}
+    solution:
+      python: |
+        class Trie:
+            def __init__(self):
+                self.root = {}
+
+            def insert(self, word):
+                node = self.root
+                for ch in word:
+                    node = node.setdefault(ch, {})
+                node["$"] = word                    # end marker
+
+            def search(self, word):
+                node = self._walk(word)
+                return node is not None and "$" in node
+
+            def starts_with(self, prefix):
+                return self._walk(prefix) is not None
+
+            def _walk(self, s):
+                node = self.root
+                for ch in s:
+                    node = node.get(ch)
+                    if node is None:
+                        return None
+                return node
+      ruby: |
+        class Trie
+          def initialize
+            @root = {}
+          end
+
+          def insert(word)
+            node = word.each_char.reduce(@root) { |n, ch| n[ch] ||= {} }
+            node["$"] = word                      # end marker
+          end
+
+          def search(word)
+            node = walk(word)
+            !node.nil? && node.key?("$")
+          end
+
+          def starts_with(prefix)
+            !walk(prefix).nil?
+          end
+
+          private
+
+          def walk(s)
+            s.each_char.reduce(@root) { |n, ch| n && n[ch] }
+          end
+        end
+
+  - id: word-search-ii
+    title: Word Search II
+    difficulty: Hard
+    variant: trie + grid DFS
+    statement: Given an m × n `board` of letters and a list of distinct `words`, return every word that can be traced through 4-directionally adjacent cells, using each cell at most once per word. Any order.
+    example: "board = [[o,a,a,n],[e,t,a,e],[i,h,k,r],[i,f,l,v]], words = [oath, pea, eat, rain]  →  [eat, oath]"
+    hint: Running Word Search once per word repeats the same prefix walks. How can one DFS check every word at once?
+    insight: Put the words in a trie and let the board DFS walk it — a missing child kills the path for all words at once. Popping found words and empty nodes stops later searches from re-entering dead branches.
+    complexity: O(m · n · 4 · 3^(L−1)) worst case (L = longest word) · O(total characters)
+    fn: find_words
+    compare: unordered
+    tests:
+      - {args: [[["o", "a", "a", "n"], ["e", "t", "a", "e"], ["i", "h", "k", "r"], ["i", "f", "l", "v"]], ["oath", "pea", "eat", "rain"]], out: ["eat", "oath"], note: "example"}
+      - {args: [[["a", "b"], ["c", "d"]], ["ab", "abd", "acdb", "ba", "x"]], out: ["ab", "abd", "acdb", "ba"], note: "shared prefixes"}
+      - {args: [[["a", "b"], ["c", "d"]], ["abcb"]], out: [], note: "can't reuse a cell"}
+      - {args: [[["a", "a"], ["a", "a"]], ["aa"]], out: ["aa"], note: "found many ways, reported once"}
+      - {args: [[["a", "a"]], ["aaa"]], out: [], note: "longer than the board"}
+      - {args: [[["a"]], ["a"]], out: ["a"], note: "1 × 1 board"}
+    solution:
+      python: |
+        def find_words(board, words):
+            root = {}
+            for w in words:
+                node = root
+                for ch in w:
+                    node = node.setdefault(ch, {})
+                node["$"] = w
+            rows, cols = len(board), len(board[0])
+            found = []
+
+            def dfs(r, c, parent):
+                ch = board[r][c]
+                node = parent[ch]
+                if "$" in node:
+                    found.append(node.pop("$"))     # report once
+                board[r][c] = "#"                   # mark visited
+                for nr, nc in ((r + 1, c), (r - 1, c), (r, c + 1), (r, c - 1)):
+                    if 0 <= nr < rows and 0 <= nc < cols and board[nr][nc] in node:
+                        dfs(nr, nc, node)
+                board[r][c] = ch                    # unmark
+                if not node:
+                    parent.pop(ch)                  # prune an exhausted branch
+
+            for r in range(rows):
+                for c in range(cols):
+                    if board[r][c] in root:
+                        dfs(r, c, root)
+            return found
+      ruby: |
+        def find_words(board, words)
+          root = {}
+          words.each do |w|
+            node = w.each_char.reduce(root) { |n, ch| n[ch] ||= {} }
+            node["$"] = w
+          end
+          rows, cols = board.size, board[0].size
+          found = []
+          dfs = lambda do |r, c, parent|
+            ch = board[r][c]
+            node = parent[ch]
+            found << node.delete("$") if node.key?("$")   # report once
+            board[r][c] = "#"                             # mark visited
+            [[r + 1, c], [r - 1, c], [r, c + 1], [r, c - 1]].each do |nr, nc|
+              next unless nr.between?(0, rows - 1) && nc.between?(0, cols - 1) && node.key?(board[nr][nc])
+              dfs.(nr, nc, node)
+            end
+            board[r][c] = ch                              # unmark
+            parent.delete(ch) if node.empty?              # prune an exhausted branch
+          end
+          rows.times { |r| cols.times { |c| dfs.(r, c, root) if root.key?(board[r][c]) } }
+          found
+        end

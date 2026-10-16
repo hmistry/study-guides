@@ -1,0 +1,2239 @@
+# Language cheat sheet: everyday Python and Ruby. build.py runs every row in its language.
+#   task          what you want to do (shared by both languages)
+#   py / rb       code; a row may have only one of them (shown only in that language's view)
+#   py_out / rb_out        expected repr / inspect of the last expression, exactly as the language prints it
+#   py_stdout / rb_stdout  expected printed output instead (trailing newline ignored)
+#   note / py_note / rb_note   short text under the code; inline `code` allowed
+#   trap: true | py | rb   a gotcha (shown with ⚠); `true` = both languages
+#   since: {py: "3.10", rb: "3.2"}   minimum version, shown as a tag
+#   run: false     syntax check only (side effects: files, stdin, network…)
+#   shell: true    terminal commands (venv, uv, bundle…): shown with a `$` prompt, never run; `# …` comments allowed
+# Section `given: {py, rb}` is shown under the heading and prepended to every row of that section.
+# Targets: Python 3.11+, Ruby 3.2+. Ruby output follows 3.4+ inspect (`{"a" => 1}`, `{a: 1}`).
+
+sections:
+  - id: basics
+    name: Basics
+    rows:
+      - task: Multiple assignment, swap
+        py: "a, b = 1, 2\na, b = b, a\na, b"
+        py_out: "(2, 1)"
+        rb: "a, b = 1, 2\na, b = b, a\n[a, b]"
+        rb_out: "[2, 1]"
+      - task: Increment
+        py: "n = 1\nn += 1\nn"
+        py_out: "2"
+        rb: "n = 1\nn += 1\nn"
+        rb_out: "2"
+        note: "There is no `++` or `--`."
+      - task: Constants
+        py: "MAX_N = 10**5"
+        rb: "MAX_N = 10**5"
+        py_note: "Upper case is only a convention; nothing stops reassignment."
+        rb_note: "Capitalised names are constants; reassigning one prints a warning."
+      - task: No value
+        py: "x = None\nx is None"
+        py_out: "True"
+        rb: "x = nil\nx.nil?"
+        rb_out: "true"
+      - task: Truthiness
+        py: "[bool(v) for v in (0, \"\", [], {}, None)]"
+        py_out: "[False, False, False, False, False]"
+        rb: "[0, \"\", [], {}, nil, false].map { |v| v ? true : false }"
+        rb_out: "[true, true, true, true, false, false]"
+        py_note: "Zero, empty containers and `None` are falsy."
+        rb_note: "Only `nil` and `false` are falsy — `0`, `\"\"` and `[]` are truthy."
+        trap: rb
+      - task: Value vs identity
+        py: "a, b = [1], [1]\na == b, a is b"
+        py_out: "(True, False)"
+        rb: "a, b = [1], [1]\n[a == b, a.equal?(b)]"
+        rb_out: "[true, false]"
+        py_note: "Use `is` only for `None` and other singletons."
+      - task: Type check
+        py: "isinstance(3, int), type(3.0).__name__"
+        py_out: "(True, 'float')"
+        rb: "[3.is_a?(Integer), 3.0.class]"
+        rb_out: "[true, Float]"
+      - task: Convert types
+        py: "int(\"42\"), float(\"2.5\"), str(7), int(\"ff\", 16)"
+        py_out: "(42, 2.5, '7', 255)"
+        rb: "[\"42\".to_i, \"2.5\".to_f, 7.to_s, \"ff\".to_i(16)]"
+        rb_out: "[42, 2.5, \"7\", 255]"
+      - task: Strict parsing
+        py: "try:\n    int(\"4x\")\nexcept ValueError as e:\n    err = str(e)\nerr"
+        py_out: "\"invalid literal for int() with base 10: '4x'\""
+        rb: "[\"4x\".to_i, (Integer(\"4x\") rescue \"ArgumentError\")]"
+        rb_out: "[4, \"ArgumentError\"]"
+        rb_note: "`to_i` stops at the first bad character and never raises. `Integer(s)` / `Float(s)` raise."
+        trap: rb
+      - task: Integer division, modulo
+        py: "7 // 2, -7 // 2, -7 % 3, int(-7 / 2)"
+        py_out: "(3, -4, 2, -3)"
+        rb: "[7 / 2, -7 / 2, -7 % 3, (-7.fdiv(2)).truncate]"
+        rb_out: "[3, -4, 2, -3]"
+        note: "Both floor toward −∞, and `%` takes the sign of the divisor. Truncation needs an explicit step."
+      - task: True division
+        py: "7 / 2"
+        py_out: "3.5"
+        rb: "[7 / 2, 7 / 2.0, 7.fdiv(2)]"
+        rb_out: "[3, 3.5, 3.5]"
+        rb_note: "Integer / Integer is integer division in Ruby."
+        trap: rb
+      - task: divmod, power, abs
+        py: "divmod(17, 5), 2 ** 10, pow(2, 10, 1000), abs(-3)"
+        py_out: "((3, 2), 1024, 24, 3)"
+        rb: "[17.divmod(5), 2**10, 2.pow(10, 1000), -3.abs]"
+        rb_out: "[[3, 2], 1024, 24, 3]"
+      - task: Rounding
+        py: "import math\nround(2.5), round(3.14159, 2), math.floor(-1.5), math.ceil(1.2)"
+        py_out: "(2, 3.14, -2, 2)"
+        rb: "[2.5.round, 3.14159.round(2), -1.5.floor, 1.2.ceil]"
+        rb_out: "[3, 3.14, -2, 2]"
+        py_note: "`round` uses banker's rounding: `round(2.5) == 2`, `round(3.5) == 4`."
+        trap: py
+      - task: Infinity, big integers
+        py: "import math\nmath.inf > 2**100, 2**100"
+        py_out: "(True, 1267650600228229401496703205376)"
+        rb: "[Float::INFINITY > 2**100, 2**100]"
+        rb_out: "[true, 1267650600228229401496703205376]"
+        note: "Integers never overflow. Also `float('inf')` in Python."
+      - task: Compare floats
+        py: "import math\n0.1 + 0.2 == 0.3, math.isclose(0.1 + 0.2, 0.3)"
+        py_out: "(False, True)"
+        rb: "[0.1 + 0.2 == 0.3, (0.1 + 0.2 - 0.3).abs < 1e-9]"
+        rb_out: "[false, true]"
+      - task: Chained comparison
+        py: "x = 3\n1 < x < 5"
+        py_out: "True"
+        rb: "x = 3\n[1 < x && x < 5, x.between?(1, 5), (1..5).cover?(x)]"
+        rb_out: "[true, true, true]"
+        rb_note: "No chained comparisons: `1 < x < 5` is an error."
+      - task: Default when missing
+        py: "x = None\ny = x or 5\ny"
+        py_out: "5"
+        rb: "x = nil\nx ||= 5\nx"
+        rb_out: "5"
+        py_note: "`or` also replaces `0`, `\"\"` and `[]`. Use `5 if x is None else x` when those are valid."
+        rb_note: "`||=` assigns only when the value is `nil` or `false`."
+      - task: Safe navigation
+        py: "s = None\nlen(s) if s is not None else None"
+        py_out: "None"
+        rb: "s = nil\ns&.length"
+        rb_out: "nil"
+      - task: Print
+        py: "print(\"a\", 1, sep=\", \")"
+        py_stdout: "a, 1"
+        rb: "puts \"a, #{1}\""
+        rb_stdout: "a, 1"
+        rb_note: "`puts` adds a newline; `print` doesn't."
+      - task: Debug print
+        py: "x = 5\nprint(f\"{x=}\", repr(\"hi\"))"
+        py_stdout: "x=5 'hi'"
+        rb: "x = 5\np x, \"hi\""
+        rb_stdout: "5\n\"hi\""
+        rb_note: "`p` prints `inspect` and returns its argument; `pp` pretty-prints nested data."
+      - task: Comments, docs
+        py: "# line comment\ndef f():\n    \"\"\"Docstring: first string in a def or class.\"\"\"\nf.__doc__"
+        py_out: "'Docstring: first string in a def or class.'"
+        rb: "# line comment\n# Ruby has no docstrings: comment above the def (YARD: @param, @return)\ndef f; end"
+        rb_out: ":f"
+        rb_note: "`def` returns the method name as a symbol."
+      - task: Symbols, word lists
+        rb: "[:status.to_s, \"status\".to_sym, %w[a b], %i[a b]]"
+        rb_out: "[\"status\", :status, [\"a\", \"b\"], [:a, :b]]"
+        note: "Symbols are immutable, interned names: hash keys, method names, options."
+
+  - id: control
+    name: Control flow
+    rows:
+      - task: if / elif / else
+        py: "x = 7\nif x > 5:\n    size = \"big\"\nelif x > 2:\n    size = \"mid\"\nelse:\n    size = \"small\"\nsize"
+        py_out: "'big'"
+        rb: "x = 7\nsize = if x > 5 then \"big\"\n       elsif x > 2 then \"mid\"\n       else \"small\"\n       end\nsize"
+        rb_out: "\"big\""
+        rb_note: "`if` is an expression, so it can be assigned."
+      - task: Ternary
+        py: "\"even\" if 4 % 2 == 0 else \"odd\""
+        py_out: "'even'"
+        rb: "4.even? ? \"even\" : \"odd\""
+        rb_out: "\"even\""
+      - task: One-line conditions
+        py: "n = 5\nif n % 2: n -= 1\nn"
+        py_out: "4"
+        rb: "n = 5\nn -= 1 if n.odd?\nn += 10 unless n > 100\nn"
+        rb_out: "14"
+        rb_note: "Modifier `if` / `unless` go after the statement. Avoid `unless … else`."
+      - task: Pattern matching
+        since: {py: "3.10"}
+        py: |-
+          def kind(v):
+              match v:
+                  case 0:
+                      return "zero"
+                  case int(n) if n < 0:
+                      return "negative"
+                  case [x, y]:
+                      return f"pair {x},{y}"
+                  case {"type": t}:
+                      return f"type {t}"
+                  case _:
+                      return "other"
+          [kind(0), kind(-3), kind([1, 2]), kind({"type": "a"}), kind("?")]
+        py_out: "['zero', 'negative', 'pair 1,2', 'type a', 'other']"
+        rb: |-
+          def kind(v)
+            case v
+            in 0 then "zero"
+            in Integer => n if n < 0 then "negative"
+            in [x, y] then "pair #{x},#{y}"
+            in {type: t} then "type #{t}"
+            else "other"
+            end
+          end
+          [kind(0), kind(-3), kind([1, 2]), kind({type: "a"}), kind("?")]
+        rb_out: "[\"zero\", \"negative\", \"pair 1,2\", \"type a\", \"other\"]"
+      - task: case / when
+        rb: |-
+          grade = ->(s) do
+            case s
+            when 90.. then "A"
+            when 80...90 then "B"
+            when Integer then "C"
+            else "?"
+            end
+          end
+          [grade.(95), grade.(85), grade.(10), grade.("x")]
+        rb_out: "[\"A\", \"B\", \"C\", \"?\"]"
+        rb_note: "`when` compares with `===`, so ranges, classes and regexes all match naturally."
+      - task: Loop over a collection
+        py: "out = []\nfor x in [1, 2, 3]:\n    out.append(x * x)\nout"
+        py_out: "[1, 4, 9]"
+        rb: "out = []\n[1, 2, 3].each { |x| out << x * x }\nout"
+        rb_out: "[1, 4, 9]"
+        rb_note: "`for x in …` exists but `each` is idiomatic; use `{ }` for one-liners, `do … end` for multi-line blocks."
+      - task: Counting loops
+        py: "list(range(3)), list(range(1, 4)), list(range(3, 0, -1)), list(range(0, 10, 5))"
+        py_out: "([0, 1, 2], [1, 2, 3], [3, 2, 1], [0, 5])"
+        rb: "[3.times.to_a, 1.upto(3).to_a, 3.downto(1).to_a, 0.step(9, 5).to_a]"
+        rb_out: "[[0, 1, 2], [1, 2, 3], [3, 2, 1], [0, 5]]"
+      - task: Ranges
+        py: "list(range(2, 5)), 4 in range(2, 5)"
+        py_out: "([2, 3, 4], True)"
+        rb: "[(2..4).to_a, (2...5).to_a, (2..4).include?(4), (1..).first(2)]"
+        rb_out: "[[2, 3, 4], [2, 3, 4], true, [1, 2]]"
+        py_note: "`range(a, b)` excludes b."
+        rb_note: "`..` includes the end, `...` excludes it. `(1..)` is endless."
+        trap: true
+      - task: Loop with index
+        py: "[f\"{i}:{c}\" for i, c in enumerate(\"ab\", 1)]"
+        py_out: "['1:a', '2:b']"
+        rb: "\"ab\".chars.each.with_index(1).map { |c, i| \"#{i}:#{c}\" }"
+        rb_out: "[\"1:a\", \"2:b\"]"
+        note: "Start index is optional (default 0). Ruby also has `each_with_index`, which always starts at 0."
+      - task: Loop over two lists
+        py: "[a + b for a, b in zip([1, 2], [10, 20])]"
+        py_out: "[11, 22]"
+        rb: "[1, 2].zip([10, 20]).map { |a, b| a + b }"
+        rb_out: "[11, 22]"
+        py_note: "`zip` stops at the shorter list; `zip(a, b, strict=True)` raises instead (3.10+)."
+        rb_note: "`zip` pads a shorter argument with `nil`."
+      - task: while / until
+        py: "n, steps = 27, 0\nwhile n != 1:\n    n = n // 2 if n % 2 == 0 else 3 * n + 1\n    steps += 1\nsteps"
+        py_out: "111"
+        rb: "n, steps = 27, 0\nuntil n == 1\n  n = n.even? ? n / 2 : 3 * n + 1\n  steps += 1\nend\nsteps"
+        rb_out: "111"
+      - task: Infinite loop with break
+        py: "i = 0\nwhile True:\n    i += 3\n    if i > 10:\n        break\ni"
+        py_out: "12"
+        rb: "i = 0\nloop do\n  i += 3\n  break if i > 10\nend\ni"
+        rb_out: "12"
+      - task: Skip / stop
+        py: "out = []\nfor x in range(10):\n    if x % 2:\n        continue\n    if x > 6:\n        break\n    out.append(x)\nout"
+        py_out: "[0, 2, 4, 6]"
+        rb: "out = []\n(0...10).each do |x|\n  next if x.odd?\n  break if x > 6\n  out << x\nend\nout"
+        rb_out: "[0, 2, 4, 6]"
+        note: "Python `continue` = Ruby `next`."
+      - task: First match
+        py: "next((x for x in [1, 4, 5] if x % 2 == 0), None), next((x for x in [1, 3] if x % 2 == 0), None)"
+        py_out: "(4, None)"
+        rb: "[[1, 4, 5].find(&:even?), [1, 3].find(&:even?)]"
+        rb_out: "[4, nil]"
+      - task: Loop finished without break
+        py: |-
+          def first_even(nums):
+              for x in nums:
+                  if x % 2 == 0:
+                      break
+              else:
+                  return None     # runs only when the loop didn't break
+              return x
+          first_even([1, 4, 5]), first_even([1, 3])
+        py_out: "(4, None)"
+      - task: Guard clause
+        py: "def safe_div(a, b):\n    if b == 0:\n        return None\n    return a / b\nsafe_div(1, 0), safe_div(6, 3)"
+        py_out: "(None, 2.0)"
+        rb: "def safe_div(a, b)\n  return nil if b.zero?\n  a.fdiv(b)\nend\n[safe_div(1, 0), safe_div(6, 3)]"
+        rb_out: "[nil, 2.0]"
+      - task: Leave nested loops
+        py: "def find(grid):\n    for row in grid:\n        for v in row:\n            if v > 2:\n                return v\nfind([[1, 2], [3, 4]])"
+        py_out: "3"
+        rb: |-
+          found = catch(:done) do
+            [[1, 2], [3, 4]].each do |row|
+              row.each { |v| throw :done, v if v > 2 }
+            end
+            nil
+          end
+          found
+        rb_out: "3"
+        py_note: "Python has no labelled break: return from a helper function, or use a flag."
+        rb_note: "`catch` / `throw` is control flow, not exceptions. A helper method with `return` works too."
+
+  - id: functions
+    name: Functions & blocks
+    rows:
+      - task: Define, default argument
+        py: "def add(a, b=1):\n    return a + b\nadd(2), add(2, 5)"
+        py_out: "(3, 7)"
+        rb: "def add(a, b = 1)\n  a + b              # last expression is the return value\nend\ndef sq(x) = x * x   # one-line (endless) method\n[add(2), add(2, 5), sq(4)]"
+        rb_out: "[3, 7, 16]"
+      - task: Keyword arguments
+        py: "def box(w, *, h=1):\n    return w * h\nbox(3, h=4)"
+        py_out: "12"
+        rb: "def box(w, h: 1)\n  w * h\nend\nbox(3, h: 4)"
+        rb_out: "12"
+        py_note: "Parameters after a bare `*` must be passed by keyword."
+        rb_note: "`h:` with no default makes the keyword required."
+      - task: Variable arguments
+        py: "def total(*nums, **opts):\n    return sum(nums) * opts.get(\"scale\", 1)\ntotal(1, 2, 3, scale=10)"
+        py_out: "60"
+        rb: "def total(*nums, **opts)\n  nums.sum * opts.fetch(:scale, 1)\nend\ntotal(1, 2, 3, scale: 10)"
+        rb_out: "60"
+      - task: Spread arguments into a call
+        py: "def f(a, b, c=0):\n    return a * b + c\nf(*[3, 4], **{\"c\": 1})"
+        py_out: "13"
+        rb: "def f(a, b, c: 0) = a * b + c\nf(*[3, 4], **{c: 1})"
+        rb_out: "13"
+      - task: Return several values
+        py: "def bounds(a):\n    return min(a), max(a)\nlo, hi = bounds([3, 1, 4])\nlo, hi"
+        py_out: "(1, 4)"
+        rb: "def bounds(a) = a.minmax\nlo, hi = bounds([3, 1, 4])\n[lo, hi]"
+        rb_out: "[1, 4]"
+      - task: Lambda
+        py: "sq = lambda x: x * x\nsq(5)"
+        py_out: "25"
+        rb: "sq = ->(x) { x * x }\n[sq.(5), sq[5], sq.call(5)]"
+        rb_out: "[25, 25, 25]"
+      - task: Pass behaviour in
+        py: "def twice(f):\n    return f(1) + f(2)\ntwice(lambda x: x * 10)"
+        py_out: "30"
+        rb: "def twice\n  yield(1) + yield(2)\nend\ntwice { |x| x * 10 }"
+        rb_out: "30"
+        rb_note: "Every method can take one block; `yield` calls it and `block_given?` checks for it."
+      - task: Method as a function
+        py: "list(map(str.upper, [\"a\", \"b\"])), sorted([\"bb\", \"a\"], key=len)"
+        py_out: "(['A', 'B'], ['a', 'bb'])"
+        rb: "[%w[a b].map(&:upcase), %w[bb a].sort_by(&:length), [1, 2].map(&method(:Integer))]"
+        rb_out: "[[\"A\", \"B\"], [\"a\", \"bb\"], [1, 2]]"
+        rb_note: "`&:sym` turns a method name into a block."
+      - task: Capture a block
+        rb: "def apply(x, &blk) = blk.call(x)\napply(4) { |v| v + 1 }"
+        rb_out: "5"
+      - task: Proc vs lambda
+        rb: "l = ->(a, b) { [a, b] }\npr = proc { |a, b| [a, b] }\n[pr.call(1), l.lambda?, (l.call(1) rescue \"ArgumentError\")]"
+        rb_out: "[[1, nil], true, \"ArgumentError\"]"
+        rb_note: "Lambdas check argument count and `return` leaves the lambda. Procs are lenient, and `return` leaves the enclosing method."
+        trap: rb
+      - task: Closures
+        py: "def counter():\n    n = 0\n    def inc():\n        nonlocal n\n        n += 1\n        return n\n    return inc\nc = counter()\nc(); c()"
+        py_out: "2"
+        rb: "def counter\n  n = 0\n  -> { n += 1 }\nend\nc = counter\nc.(); c.()"
+        rb_out: "2"
+        py_note: "Rebinding an outer variable needs `nonlocal` (or `global`); mutating a list doesn't."
+      - task: Nested function scope
+        py: "x = 10\ndef f():\n    return x + 1     # reads outer names freely\nf()"
+        py_out: "11"
+        rb: "x = 10\nf = -> { x + 1 }     # blocks and lambdas see outer locals\nf.()"
+        rb_out: "11"
+        rb_note: "A nested `def` starts a fresh scope and can't see `x`. Use a lambda, or pass it in."
+        trap: rb
+      - task: Mutable default argument
+        py: "def add(x, acc=None):\n    acc = [] if acc is None else acc\n    acc.append(x)\n    return acc\nadd(1), add(2)"
+        py_out: "([1], [2])"
+        py_note: "Never write `acc=[]`: the default list is created once and shared by every call."
+        trap: py
+      - task: Decorator / wrap a method
+        py: |-
+          import functools
+
+          def logged(fn):
+              @functools.wraps(fn)
+              def wrapper(*args):
+                  return f"{fn.__name__}{args} = {fn(*args)}"
+              return wrapper
+
+          @logged
+          def add(a, b):
+              return a + b
+
+          add(2, 3)
+        py_out: "'add(2, 3) = 5'"
+        rb: |-
+          module Logged
+            def add(a, b) = "add(#{a}, #{b}) = #{super}"
+          end
+
+          class Calc
+            prepend Logged      # Logged#add runs first; super calls Calc#add
+            def add(a, b) = a + b
+          end
+
+          Calc.new.add(2, 3)
+        rb_out: "\"add(2, 3) = 5\""
+      - task: Generator / lazy sequence
+        py: "import itertools\n\ndef evens():\n    n = 0\n    while True:\n        yield n\n        n += 2\n\nlist(itertools.islice(evens(), 4))"
+        py_out: "[0, 2, 4, 6]"
+        rb: "evens = Enumerator.new do |y|\n  n = 0\n  loop { y << n; n += 2 }\nend\n[evens.take(4), (1..).lazy.map { _1 * 3 }.select(&:even?).first(2)]"
+        rb_out: "[[0, 2, 4, 6], [6, 12]]"
+        rb_note: "`_1` (or `it` in 3.4+) is the implicit block parameter."
+      - task: Type hints
+        py: "def area(w: float, h: float = 1.0) -> float:\n    return w * h\narea(2, 3)"
+        py_out: "6"
+        py_note: "Hints aren't enforced at runtime; checkers like mypy or pyright read them."
+      - task: Bang and predicate methods
+        rb: "a = [3, 1, 2]\nb = a.sort      # new array\na.sort!         # in place\n[a, b, a.empty?]"
+        rb_out: "[[1, 2, 3], [1, 2, 3], false]"
+        rb_note: "Convention: `?` returns a boolean, `!` mutates or is the dangerous version."
+
+  - id: strings
+    name: Strings
+    given:
+      py: "s = \"Hello, World\""
+      rb: "s = \"Hello, World\""
+    rows:
+      - task: Length, index, slice
+        py: "len(s), s[0], s[-1], s[0:5], s[7:]"
+        py_out: "(12, 'H', 'd', 'Hello', 'World')"
+        rb: "[s.length, s[0], s[-1], s[0, 5], s[7..]]"
+        rb_out: "[12, \"H\", \"d\", \"Hello\", \"World\"]"
+        rb_note: "`s[start, length]` vs `s[a..b]` (range)."
+      - task: Reverse
+        py: "s[::-1]"
+        py_out: "'dlroW ,olleH'"
+        rb: "s.reverse"
+        rb_out: "\"dlroW ,olleH\""
+      - task: Change case
+        py: "s.upper(), s.lower(), \"hi there\".title(), \"hi there\".capitalize()"
+        py_out: "('HELLO, WORLD', 'hello, world', 'Hi There', 'Hi there')"
+        rb: "[s.upcase, s.downcase, \"hi there\".split.map(&:capitalize).join(\" \"), \"hi there\".capitalize]"
+        rb_out: "[\"HELLO, WORLD\", \"hello, world\", \"Hi There\", \"Hi there\"]"
+      - task: Search
+        py: "s.find(\"o\"), s.rfind(\"o\"), s.find(\"z\"), \"World\" in s, s.count(\"l\")"
+        py_out: "(4, 8, -1, True, 3)"
+        rb: "[s.index(\"o\"), s.rindex(\"o\"), s.index(\"z\"), s.include?(\"World\"), s.count(\"l\")]"
+        rb_out: "[4, 8, nil, true, 3]"
+        py_note: "`find` returns -1 when missing; `index` raises `ValueError`."
+        rb_note: "`index` returns `nil` when missing, not -1."
+      - task: Starts / ends with
+        py: "s.startswith(\"Hell\"), s.endswith((\"d\", \"x\"))"
+        py_out: "(True, True)"
+        rb: "[s.start_with?(\"Hell\"), s.end_with?(\"d\", \"x\")]"
+        rb_out: "[true, true]"
+      - task: Split, join
+        py: "\"a,b,,c\".split(\",\"), \"a  b c\".split(), \"-\".join([\"x\", \"y\"])"
+        py_out: "(['a', 'b', '', 'c'], ['a', 'b', 'c'], 'x-y')"
+        rb: "[\"a,b,,c\".split(\",\"), \"a  b c\".split, [\"x\", \"y\"].join(\"-\")]"
+        rb_out: "[[\"a\", \"b\", \"\", \"c\"], [\"a\", \"b\", \"c\"], \"x-y\"]"
+        note: "No argument splits on runs of whitespace."
+      - task: Split keeps trailing empties?
+        py: "\"a,b,,\".split(\",\")"
+        py_out: "['a', 'b', '', '']"
+        rb: "[\"a,b,,\".split(\",\"), \"a,b,,\".split(\",\", -1)]"
+        rb_out: "[[\"a\", \"b\"], [\"a\", \"b\", \"\", \"\"]]"
+        rb_note: "Ruby drops trailing empty fields unless the limit is negative."
+        trap: rb
+      - task: Strip whitespace or characters
+        py: "\"  hi \\n\".strip(), \"xxhixx\".strip(\"x\"), \"v1.2\".removeprefix(\"v\")"
+        py_out: "('hi', 'hi', '1.2')"
+        rb: "[\"  hi \\n\".strip, \"xxhixx\".gsub(/\\Ax+|x+\\z/, \"\"), \"v1.2\".delete_prefix(\"v\")]"
+        rb_out: "[\"hi\", \"hi\", \"1.2\"]"
+        note: "`lstrip` / `rstrip` trim one side."
+        rb_note: "`chomp` removes one trailing newline (handy after `gets`)."
+      - task: Replace
+        py: "s.replace(\"l\", \"L\"), s.replace(\"l\", \"L\", 1), \"hello\".translate(str.maketrans(\"el\", \"ip\"))"
+        py_out: "('HeLLo, WorLd', 'HeLlo, World', 'hippo')"
+        rb: "[s.gsub(\"l\", \"L\"), s.sub(\"l\", \"L\"), \"hello\".tr(\"el\", \"ip\")]"
+        rb_out: "[\"HeLLo, WorLd\", \"HeLlo, World\", \"hippo\"]"
+        rb_note: "`sub` replaces the first match, `gsub` all of them, `tr` maps characters."
+      - task: Interpolation
+        py: "name, n = \"Ada\", 3\nf\"{name} has {n} items, {n * 2} total\""
+        py_out: "'Ada has 3 items, 6 total'"
+        rb: "name, n = \"Ada\", 3\n\"#{name} has #{n} items, #{n * 2} total\""
+        rb_out: "\"Ada has 3 items, 6 total\""
+        rb_note: "Only double quotes interpolate: `'#{n}'` is literal text."
+        trap: rb
+      - task: Format numbers
+        py: "f\"{3.14159:.2f}\", f\"{42:05d}\", f\"{1234567:,}\", f\"{0.256:.1%}\", f\"{255:x}\""
+        py_out: "('3.14', '00042', '1,234,567', '25.6%', 'ff')"
+        rb: "[format(\"%.2f\", 3.14159), format(\"%05d\", 42), 1234567.to_s.gsub(/\\B(?=(\\d{3})+\\z)/, \",\"), format(\"%.1f%%\", 25.6), 255.to_s(16)]"
+        rb_out: "[\"3.14\", \"00042\", \"1,234,567\", \"25.6%\", \"ff\"]"
+      - task: Pad, align
+        py: "\"7\".zfill(3), \"ab\".ljust(5, \".\"), \"ab\".rjust(5), \"ab\".center(6, \"*\")"
+        py_out: "('007', 'ab...', '   ab', '**ab**')"
+        rb: "[\"7\".rjust(3, \"0\"), \"ab\".ljust(5, \".\"), \"ab\".rjust(5), \"ab\".center(6, \"*\")]"
+        rb_out: "[\"007\", \"ab...\", \"   ab\", \"**ab**\"]"
+      - task: Repeat, concatenate
+        py: "\"ab\" * 3 + \"!\""
+        py_out: "'ababab!'"
+        rb: "\"ab\" * 3 + \"!\""
+        rb_out: "\"ababab!\""
+      - task: Build a string in a loop
+        py: "parts = []\nfor i in range(3):\n    parts.append(str(i))\n\"\".join(parts)"
+        py_out: "'012'"
+        rb: "out = +\"\"\n3.times { |i| out << i.to_s }\nout"
+        rb_out: "\"012\""
+        py_note: "Strings are immutable: collect parts and `join` once. `+=` in a loop can go quadratic."
+        rb_note: "`<<` appends in place; `+=` copies. `+\"\"` makes an unfrozen string."
+        trap: true
+      - task: Characters, codes
+        py: "list(\"abc\"), ord(\"a\"), chr(98), ord(\"c\") - ord(\"a\")"
+        py_out: "(['a', 'b', 'c'], 97, 'b', 2)"
+        rb: "[\"abc\".chars, \"a\".ord, 98.chr, \"c\".ord - \"a\".ord]"
+        rb_out: "[[\"a\", \"b\", \"c\"], 97, \"b\", 2]"
+      - task: Character tests
+        py: "\"a1\".isalnum(), \"12\".isdigit(), \"ab\".isalpha(), \" \".isspace(), \"Ab\".islower()"
+        py_out: "(True, True, True, True, False)"
+        rb: "[\"a1\".match?(/\\A[[:alnum:]]+\\z/), \"12\".match?(/\\A\\d+\\z/), \"ab\".match?(/\\A[[:alpha:]]+\\z/), \" \".match?(/\\A\\s+\\z/), \"Ab\" == \"Ab\".downcase]"
+        rb_out: "[true, true, true, true, false]"
+        rb_note: "No `isdigit`-style methods: use `match?` with a regex."
+      - task: Compare, sort ignoring case
+        py: "\"Hello\".casefold() == \"hello\", sorted([\"b\", \"a\", \"B\"]), sorted([\"b\", \"a\", \"B\"], key=lambda w: (w.lower(), w))"
+        py_out: "(True, ['B', 'a', 'b'], ['a', 'B', 'b'])"
+        rb: "[\"Hello\".casecmp?(\"hello\"), %w[b a B].sort, %w[b a B].sort_by { |w| [w.downcase, w] }]"
+        rb_out: "[true, [\"B\", \"a\", \"b\"], [\"a\", \"B\", \"b\"]]"
+        note: "Upper case sorts before lower case by default."
+      - task: Lines, multi-line strings
+        py: "text = \"\"\"\\\nSELECT *\nFROM t\n\"\"\"\ntext.splitlines(), text.count(\"\\n\")"
+        py_out: "(['SELECT *', 'FROM t'], 2)"
+        rb: "text = <<~SQL\n  SELECT *\n  FROM t\nSQL\n[text.lines.map(&:chomp), text.count(\"\\n\")]"
+        rb_out: "[[\"SELECT *\", \"FROM t\"], 2]"
+        rb_note: "`<<~` (squiggly heredoc) strips the common indentation."
+      - task: Palindrome, anagram
+        py: "w = \"Racecar\".lower()\nw == w[::-1], sorted(\"listen\") == sorted(\"silent\")"
+        py_out: "(True, True)"
+        rb: "w = \"Racecar\".downcase\n[w == w.reverse, \"listen\".chars.sort == \"silent\".chars.sort]"
+        rb_out: "[true, true]"
+      - task: Regex match, groups
+        py: "import re\nm = re.search(r\"(\\d+)-(\\d+)\", \"call 555-1234\")\nm.group(0), m.group(1), m.groups()"
+        py_out: "('555-1234', '555', ('555', '1234'))"
+        rb: "m = \"call 555-1234\".match(/(\\d+)-(\\d+)/)\n[m[0], m[1], m.captures]"
+        rb_out: "[\"555-1234\", \"555\", [\"555\", \"1234\"]]"
+        py_note: "`re.match` anchors at the start; `re.search` scans; `re.fullmatch` must match everything."
+      - task: Regex find all, replace
+        py: "import re\nre.findall(r\"\\d+\", \"a1b22c333\"), re.sub(r\"\\d\", \"#\", \"a1b2\")"
+        py_out: "(['1', '22', '333'], 'a#b#')"
+        rb: "[\"a1b22c333\".scan(/\\d+/), \"a1b2\".gsub(/\\d/, \"#\")]"
+        rb_out: "[[\"1\", \"22\", \"333\"], \"a#b#\"]"
+      - task: Regex named groups
+        py: "import re\nre.match(r\"(?P<y>\\d{4})-(?P<m>\\d\\d)\", \"2026-10\").groupdict()"
+        py_out: "{'y': '2026', 'm': '10'}"
+        rb: "\"2026-10\".match(/(?<y>\\d{4})-(?<m>\\d\\d)/).named_captures"
+        rb_out: "{\"y\" => \"2026\", \"m\" => \"10\"}"
+      - task: Bytes, encoding
+        py: "\"é\".encode(), len(\"é\"), len(\"é\".encode()), b\"\\xc3\\xa9\".decode()"
+        py_out: "(b'\\xc3\\xa9', 1, 2, 'é')"
+        rb: "[\"é\".bytes, \"é\".length, \"é\".bytesize, [195, 169].pack(\"C*\").force_encoding(\"UTF-8\")]"
+        rb_out: "[[195, 169], 1, 2, \"é\"]"
+      - task: Immutable strings
+        py: "s2 = \"abc\"\ntry:\n    s2[0] = \"x\"\nexcept TypeError:\n    s2 = \"x\" + s2[1:]\ns2"
+        py_out: "'xbc'"
+        rb: "s2 = +\"abc\"\ns2[0] = \"x\"\n[s2, \"abc\".freeze.frozen?]"
+        rb_out: "[\"xbc\", true]"
+        py_note: "Python strings are immutable: build a new one."
+        rb_note: "Ruby strings are mutable unless frozen; `# frozen_string_literal: true` at the top of a file freezes literals."
+
+  - id: lists
+    name: Lists / Arrays
+    given:
+      py: "a = [3, 1, 4, 1, 5]"
+      rb: "a = [3, 1, 4, 1, 5]"
+    rows:
+      - task: Create
+        py: "[0] * 3, list(range(4)), [None] * 2, [i * i for i in range(4)]"
+        py_out: "([0, 0, 0], [0, 1, 2, 3], [None, None], [0, 1, 4, 9])"
+        rb: "[[0] * 3, (0...4).to_a, Array.new(2), Array.new(4) { |i| i * i }]"
+        rb_out: "[[0, 0, 0], [0, 1, 2, 3], [nil, nil], [0, 1, 4, 9]]"
+      - task: 2D grid
+        py: |-
+          g = [[0] * 3 for _ in range(2)]
+          g[0][0] = 1
+          bad = [[0] * 3] * 2
+          bad[0][0] = 1
+          g, bad
+        py_out: "([[1, 0, 0], [0, 0, 0]], [[1, 0, 0], [1, 0, 0]])"
+        rb: |-
+          g = Array.new(2) { Array.new(3, 0) }
+          g[0][0] = 1
+          bad = Array.new(2, Array.new(3, 0))
+          bad[0][0] = 1
+          [g, bad]
+        rb_out: "[[[1, 0, 0], [0, 0, 0]], [[1, 0, 0], [1, 0, 0]]]"
+        note: "The second form repeats one row object, so writing to one row writes to all of them."
+        trap: true
+      - task: Index, slice
+        py: "a[0], a[-1], a[1:3], a[::2], a[::-1]"
+        py_out: "(3, 5, [1, 4], [3, 4, 5], [5, 1, 4, 1, 3])"
+        rb: "[a[0], a[-1], a[1, 2], a[1..2], a.values_at(0, 2, 4), a.reverse]"
+        rb_out: "[3, 5, [1, 4], [1, 4], [3, 4, 5], [5, 1, 4, 1, 3]]"
+        rb_note: "`a[start, length]` vs `a[a..b]`; also `a.first(2)`, `a.last(2)`."
+      - task: Read past the end
+        py: |-
+          try:
+              a[10]
+          except IndexError:
+              r = "IndexError"
+          r, a[10:]
+        py_out: "('IndexError', [])"
+        rb: "[a[10], a.fetch(10, :none), (a.fetch(10) rescue \"IndexError\")]"
+        rb_out: "[nil, :none, \"IndexError\"]"
+        rb_note: "Reading past the end returns `nil` with no error. `fetch` raises or takes a default."
+        trap: rb
+      - task: Add items
+        py: "b = [1]\nb.append(2)\nb.extend([3, 4])\nb.insert(0, 0)\nb"
+        py_out: "[0, 1, 2, 3, 4]"
+        rb: "b = [1]\nb << 2\nb.concat([3, 4])\nb.unshift(0)\nb"
+        rb_out: "[0, 1, 2, 3, 4]"
+        rb_note: "`push` = `<<`; `+` makes a new array."
+      - task: Remove items
+        py: "b = [5, 6, 7, 6]\nlast = b.pop()\nfirst = b.pop(0)\nb.remove(6)\nlast, first, b"
+        py_out: "(6, 5, [7])"
+        rb: "b = [5, 6, 7, 6]\nlast = b.pop\nfirst = b.shift\nb.delete_at(b.index(6))\n[last, first, b, [1, 2, 1].tap { _1.delete(1) }]"
+        rb_out: "[6, 5, [7], [2]]"
+        py_note: "`remove(x)` deletes the first match; `del b[i]` deletes by index."
+        rb_note: "`delete(x)` removes every copy; `delete_at(i)` removes one by index."
+      - task: Search
+        py: "4 in a, a.index(1), a.count(1)"
+        py_out: "(True, 1, 2)"
+        rb: "[a.include?(4), a.index(1), a.count(1), a.find_index { _1 > 3 }]"
+        rb_out: "[true, 1, 2, 2]"
+      - task: Sort
+        py: "b = [3, 1, 2]\nr = b.sort()\nr, b, sorted([3, 1, 2], reverse=True)"
+        py_out: "(None, [1, 2, 3], [3, 2, 1])"
+        rb: "b = [3, 1, 2]\nr = b.sort!\n[r, b, [3, 1, 2].sort.reverse, [3, 1, 2].max(2)]"
+        rb_out: "[[1, 2, 3], [1, 2, 3], [3, 2, 1], [3, 2]]"
+        py_note: "`list.sort()` sorts in place and returns `None`; `sorted(x)` returns a new list."
+        trap: py
+      - task: Sort by key, several keys
+        py: "words = [\"bb\", \"a\", \"ccc\", \"dd\"]\nsorted(words, key=lambda w: (-len(w), w))"
+        py_out: "['ccc', 'bb', 'dd', 'a']"
+        rb: "words = %w[bb a ccc dd]\nwords.sort_by { |w| [-w.length, w] }"
+        rb_out: "[\"ccc\", \"bb\", \"dd\", \"a\"]"
+        note: "Tuple / array keys compare field by field; negate a number to reverse just that field."
+      - task: Sort with a comparator
+        py: |-
+          import functools
+
+          def cmp(x, y):
+              return (y + x > x + y) - (y + x < x + y)   # -1 puts x first
+
+          sorted(["9", "34", "3"], key=functools.cmp_to_key(cmp))
+        py_out: "['9', '34', '3']"
+        rb: "%w[9 34 3].sort { |x, y| (y + x) <=> (x + y) }"
+        rb_out: "[\"9\", \"34\", \"3\"]"
+      - task: Stable sort
+        py: "sorted([\"b2\", \"a1\", \"b1\", \"a2\"], key=lambda w: w[0])"
+        py_out: "['a1', 'a2', 'b2', 'b1']"
+        rb: "%w[b2 a1 b1 a2].sort_by.with_index { |w, i| [w[0], i] }"
+        rb_out: "[\"a1\", \"a2\", \"b2\", \"b1\"]"
+        py_note: "Python's sort is stable: equal keys keep their order."
+        rb_note: "`sort` / `sort_by` aren't guaranteed stable. Add the index as a tie-breaker."
+        trap: rb
+      - task: Min, max, sum
+        py: "min(a), max(a), sum(a), sum(a) / len(a)"
+        py_out: "(1, 5, 14, 2.8)"
+        rb: "[a.min, a.max, a.sum, a.sum.fdiv(a.size), a.minmax]"
+        rb_out: "[1, 5, 14, 2.8, [1, 5]]"
+      - task: Index of the largest
+        py: "max(range(len(a)), key=a.__getitem__), a.index(max(a))"
+        py_out: "(4, 4)"
+        rb: "[a.each_index.max_by { a[_1] }, a.index(a.max)]"
+        rb_out: "[4, 4]"
+      - task: Map, filter, reduce
+        py: "import functools\n[x * 2 for x in a if x > 1], functools.reduce(lambda acc, x: acc * x, a, 1)"
+        py_out: "([6, 8, 10], 60)"
+        rb: "[a.select { _1 > 1 }.map { _1 * 2 }, a.filter_map { _1 * 2 if _1 > 1 }, a.reduce(1) { |acc, x| acc * x }]"
+        rb_out: "[[6, 8, 10], [6, 8, 10], 60]"
+        rb_note: "`select` = `filter`, `reject` is the opposite, `reduce` = `inject`."
+      - task: any, all, none
+        py: "any(x > 4 for x in a), all(x > 0 for x in a), not any(x == 0 for x in a)"
+        py_out: "(True, True, True)"
+        rb: "[a.any? { _1 > 4 }, a.all?(&:positive?), a.none?(&:zero?)]"
+        rb_out: "[true, true, true]"
+      - task: Count, partition
+        py: "sum(1 for x in a if x % 2), ([x for x in a if x % 2 == 0], [x for x in a if x % 2])"
+        py_out: "(4, ([4], [3, 1, 1, 5]))"
+        rb: "[a.count(&:odd?), a.partition(&:even?)]"
+        rb_out: "[4, [[4], [3, 1, 1, 5]]]"
+      - task: Remove duplicates
+        py: "list(dict.fromkeys(a)), sorted(set(a))"
+        py_out: "([3, 1, 4, 5], [1, 3, 4, 5])"
+        rb: "[a.uniq, a.uniq.sort, %w[ab AB c].uniq(&:downcase)]"
+        rb_out: "[[3, 1, 4, 5], [1, 3, 4, 5], [\"ab\", \"c\"]]"
+        py_note: "`dict.fromkeys` keeps first-seen order; `set` doesn't keep any order."
+      - task: Flatten
+        py: "import itertools\nnested = [[1, 2], [3], []]\n[x for sub in nested for x in sub], list(itertools.chain.from_iterable(nested))"
+        py_out: "([1, 2, 3], [1, 2, 3])"
+        rb: "[[[1, 2], [3], []].flatten, [1, [2, [3]]].flatten(1)]"
+        rb_out: "[[1, 2, 3], [1, 2, [3]]]"
+        rb_note: "`flatten` goes all the way down unless you pass a depth."
+      - task: Copy
+        py: |-
+          import copy
+          grid = [[1], [2]]
+          shallow = grid[:]           # or list(grid), grid.copy()
+          deep = copy.deepcopy(grid)
+          grid[0].append(9)
+          shallow, deep
+        py_out: "([[1, 9], [2]], [[1], [2]])"
+        rb: |-
+          grid = [[1], [2]]
+          shallow = grid.dup
+          deep = Marshal.load(Marshal.dump(grid))
+          grid[0] << 9
+          [shallow, deep]
+        rb_out: "[[[1, 9], [2]], [[1], [2]]]"
+        note: "A shallow copy duplicates the outer list only; inner lists are still shared."
+        trap: true
+      - task: Unpack head and rest
+        py: "first, *rest = a\n*init, last = a\nfirst, rest, last"
+        py_out: "(3, [1, 4, 1, 5], 5)"
+        rb: "first, *rest = a\n*init, last = a\n[first, rest, last]"
+        rb_out: "[3, [1, 4, 1, 5], 5]"
+      - task: Rotate
+        py: "a[2:] + a[:2]"
+        py_out: "[4, 1, 5, 3, 1]"
+        rb: "a.rotate(2)"
+        rb_out: "[4, 1, 5, 3, 1]"
+      - task: Compare lists
+        py: "[1, 2] < [1, 3], [1, 2] == [1, 2], max([[1, 9], [2, 0]])"
+        py_out: "(True, True, [2, 0])"
+        rb: "[([1, 2] <=> [1, 3]), [1, 2] == [1, 2], [[1, 9], [2, 0]].max]"
+        rb_out: "[-1, true, [2, 0]]"
+        note: "Lists compare element by element (lexicographically)."
+        rb_note: "Arrays have `<=>` but not `<`: `[1, 2] < [1, 3]` is a NoMethodError."
+      - task: Join into a string
+        py: "\" \".join(map(str, a))"
+        py_out: "'3 1 4 1 5'"
+        rb: "a.join(\" \")"
+        rb_out: "\"3 1 4 1 5\""
+        py_note: "`join` needs strings: `\" \".join(a)` on numbers is a TypeError."
+      - task: Binary search a sorted list
+        py: "import bisect\ns = [1, 3, 3, 7]\nlo, hi = bisect.bisect_left(s, 3), bisect.bisect_right(s, 3)\nbisect.insort(s, 5)\nlo, hi, s"
+        py_out: "(1, 3, [1, 3, 3, 5, 7])"
+        rb: "s = [1, 3, 3, 7]\n[s.bsearch_index { _1 >= 3 }, s.bsearch_index { _1 > 3 }, s.bsearch { _1 >= 4 }]"
+        rb_out: "[1, 3, 7]"
+        rb_note: "The block must be false…false, true…true; `bsearch` returns the first true element."
+
+  - id: dicts
+    name: Dicts / Hashes & Sets
+    rows:
+      - task: Create
+        py: "d = {\"a\": 1, \"b\": 2}\nd == dict(a=1, b=2), d"
+        py_out: "(True, {'a': 1, 'b': 2})"
+        rb: "h = {\"a\" => 1, \"b\" => 2}\nsym = {a: 1, b: 2}\n[h, sym, sym == h]"
+        rb_out: "[{\"a\" => 1, \"b\" => 2}, {a: 1, b: 2}, false]"
+        rb_note: "`{a: 1}` has symbol keys: `h[\"a\"]` and `h[:a]` are different keys."
+        trap: rb
+      - task: Read, with a default
+        py: "d = {\"a\": 1}\nd[\"a\"], d.get(\"z\"), d.get(\"z\", 0)"
+        py_out: "(1, None, 0)"
+        rb: "h = {\"a\" => 1}\n[h[\"a\"], h[\"z\"], h.fetch(\"z\", 0), (h.fetch(\"z\") rescue \"KeyError\")]"
+        rb_out: "[1, nil, 0, \"KeyError\"]"
+        py_note: "`d[\"z\"]` raises `KeyError`."
+        rb_note: "`h[k]` returns `nil` (or the hash's default) for a missing key; `fetch` raises."
+      - task: Add, update, delete
+        py: "d = {\"a\": 1}\nd[\"b\"] = 2\nd.update({\"c\": 3})\nremoved = d.pop(\"a\")\nremoved, d, d.pop(\"zz\", None)"
+        py_out: "(1, {'b': 2, 'c': 3}, None)"
+        rb: "h = {\"a\" => 1}\nh[\"b\"] = 2\nh.merge!(\"c\" => 3)\nremoved = h.delete(\"a\")\n[removed, h, h.delete(\"zz\")]"
+        rb_out: "[1, {\"b\" => 2, \"c\" => 3}, nil]"
+      - task: Key exists?
+        py: "d = {\"a\": None}\n\"a\" in d, d.get(\"a\") is None, \"z\" in d"
+        py_out: "(True, True, False)"
+        rb: "h = {\"a\" => nil}\n[h.key?(\"a\"), h[\"a\"].nil?, h.key?(\"z\")]"
+        rb_out: "[true, true, false]"
+        note: "Test the key, not the value: a stored `None` / `nil` looks the same as a missing key."
+      - task: Iterate
+        py: "d = {\"x\": 1, \"y\": 2}\n[f\"{k}={v}\" for k, v in d.items()], list(d), list(d.values())"
+        py_out: "(['x=1', 'y=2'], ['x', 'y'], [1, 2])"
+        rb: "h = {\"x\" => 1, \"y\" => 2}\n[h.map { |k, v| \"#{k}=#{v}\" }, h.keys, h.values]"
+        rb_out: "[[\"x=1\", \"y=2\"], [\"x\", \"y\"], [1, 2]]"
+        note: "Both keep insertion order."
+      - task: Count occurrences
+        py: "from collections import Counter\nc = Counter(\"banana\")\nc[\"a\"], c.most_common(1), c[\"z\"]"
+        py_out: "(3, [('a', 3)], 0)"
+        rb: "c = \"banana\".chars.tally\n[c[\"a\"], c.max_by { |_, n| n }, c.fetch(\"z\", 0)]"
+        rb_out: "[3, [\"a\", 3], 0]"
+      - task: Count by hand
+        py: "d = {}\nfor ch in \"abca\":\n    d[ch] = d.get(ch, 0) + 1\nd"
+        py_out: "{'a': 2, 'b': 1, 'c': 1}"
+        rb: "h = Hash.new(0)\n\"abca\".each_char { |ch| h[ch] += 1 }\nh"
+        rb_out: "{\"a\" => 2, \"b\" => 1, \"c\" => 1}"
+        rb_note: "`Hash.new(0)` is safe because numbers are immutable."
+      - task: Group into lists
+        py: |-
+          from collections import defaultdict
+          g = defaultdict(list)
+          for w in ["apple", "avocado", "banana"]:
+              g[w[0]].append(w)
+          dict(g)
+        py_out: "{'a': ['apple', 'avocado'], 'b': ['banana']}"
+        rb: |-
+          g = Hash.new { |h, k| h[k] = [] }
+          %w[apple avocado banana].each { |w| g[w[0]] << w }
+          [g, %w[apple avocado banana].group_by { _1[0] } == g]
+        rb_out: "[{\"a\" => [\"apple\", \"avocado\"], \"b\" => [\"banana\"]}, true]"
+        rb_note: "Never `Hash.new([])`: every key shares ONE array, and `<<` on it doesn't even store the key."
+        trap: rb
+      - task: Build from pairs, comprehension
+        py: "{w: len(w) for w in [\"hi\", \"hey\"]}, dict(zip(\"ab\", [1, 2]))"
+        py_out: "({'hi': 2, 'hey': 3}, {'a': 1, 'b': 2})"
+        rb: "[%w[hi hey].to_h { |w| [w, w.length] }, %w[a b].zip([1, 2]).to_h]"
+        rb_out: "[{\"hi\" => 2, \"hey\" => 3}, {\"a\" => 1, \"b\" => 2}]"
+      - task: Transform, filter
+        py: "prices = {\"a\": 10, \"b\": 25}\n{k: v * 2 for k, v in prices.items()}, {k: v for k, v in prices.items() if v > 15}"
+        py_out: "({'a': 20, 'b': 50}, {'b': 25})"
+        rb: "prices = {\"a\" => 10, \"b\" => 25}\n[prices.transform_values { _1 * 2 }, prices.select { |_, v| v > 15 }, prices.transform_keys(&:to_sym)]"
+        rb_out: "[{\"a\" => 20, \"b\" => 50}, {\"b\" => 25}, {a: 10, b: 25}]"
+      - task: Merge
+        since: {py: "3.9"}
+        py: "{\"a\": 1, \"b\": 2} | {\"b\": 3}, {**{\"a\": 1}, \"c\": 4}"
+        py_out: "({'a': 1, 'b': 3}, {'a': 1, 'c': 4})"
+        rb: "[{\"a\" => 1, \"b\" => 2}.merge(\"b\" => 3), {\"a\" => 1}.merge(\"a\" => 2) { |_key, old, new| old + new }]"
+        rb_out: "[{\"a\" => 1, \"b\" => 3}, {\"a\" => 3}]"
+        note: "The right-hand side wins on shared keys."
+      - task: Sort by value
+        py: "d = {\"x\": 3, \"y\": 1, \"z\": 2}\nsorted(d, key=d.get), sorted(d.items(), key=lambda kv: -kv[1])[:2], max(d, key=d.get)"
+        py_out: "(['y', 'z', 'x'], [('x', 3), ('z', 2)], 'x')"
+        rb: "h = {\"x\" => 3, \"y\" => 1, \"z\" => 2}\n[h.sort_by { |_, v| v }.map(&:first), h.max_by(2) { |_, v| v }, h.max_by { |_, v| v }.first]"
+        rb_out: "[[\"y\", \"z\", \"x\"], [[\"x\", 3], [\"z\", 2]], \"x\"]"
+      - task: Composite keys
+        py: "seen = {(1, 2): \"pt\"}\nseen[(1, 2)], (1, 2) in seen"
+        py_out: "('pt', True)"
+        rb: "seen = {[1, 2] => \"pt\"}\n[seen[[1, 2]], seen.key?([1, 2])]"
+        rb_out: "[\"pt\", true]"
+        py_note: "Lists aren't hashable: use a tuple (or `frozenset`) as the key."
+        rb_note: "Arrays work as keys, but mutating one after inserting it breaks lookup (`rehash` repairs it)."
+        trap: true
+      - task: Nested lookup
+        py: "cfg = {\"db\": {\"port\": 5432}}\ncfg.get(\"db\", {}).get(\"port\"), cfg.get(\"x\", {}).get(\"port\")"
+        py_out: "(5432, None)"
+        rb: "cfg = {db: {port: 5432}}\n[cfg.dig(:db, :port), cfg.dig(:x, :port)]"
+        rb_out: "[5432, nil]"
+      - task: Invert
+        py: "{v: k for k, v in {\"a\": 1, \"b\": 2}.items()}"
+        py_out: "{1: 'a', 2: 'b'}"
+        rb: "{\"a\" => 1, \"b\" => 2}.invert"
+        rb_out: "{1 => \"a\", 2 => \"b\"}"
+      - task: Set basics
+        py: "s = {3, 1}\ns.add(2)\ns.discard(9)\nsorted(s), 2 in s, type({}).__name__, set()"
+        py_out: "([1, 2, 3], True, 'dict', set())"
+        rb: "require \"set\"\ns = Set[3, 1]\ns << 2\ns.delete(9)\n[s.to_a.sort, s.include?(2), Set.new.empty?]"
+        rb_out: "[[1, 2, 3], true, true]"
+        py_note: "`{}` is an empty dict; an empty set is `set()`."
+        rb_note: "`require \"set\"` is needed before Ruby 3.2."
+        trap: py
+      - task: Set operations
+        py: "a, b = {1, 2, 3}, {2, 3, 4}\nsorted(a | b), sorted(a & b), sorted(a - b), sorted(a ^ b), {1, 2} <= a"
+        py_out: "([1, 2, 3, 4], [2, 3], [1], [1, 4], True)"
+        rb: "a, b = Set[1, 2, 3], Set[2, 3, 4]\n[(a | b).sort, (a & b).sort, (a - b).sort, (a ^ b).sort, Set[1, 2] <= a]"
+        rb_out: "[[1, 2, 3, 4], [2, 3], [1], [1, 4], true]"
+        note: "Union, intersection, difference, symmetric difference, subset."
+
+  - id: records
+    name: Records
+    rows:
+      - task: Tuple / frozen array
+        py: "p = (3, 4)\nx, y = p\np[0], len(p), x + y, (5,)"
+        py_out: "(3, 2, 7, (5,))"
+        rb: "p = [3, 4].freeze\nx, y = p\n[p[0], x + y, p.frozen?]"
+        rb_out: "[3, 7, true]"
+        py_note: "Tuples are immutable and hashable. A one-element tuple needs the comma: `(5,)`."
+        rb_note: "No tuples: a frozen array, or Struct / Data when fields need names."
+      - task: Named fields
+        py: "from collections import namedtuple\nPoint = namedtuple(\"Point\", \"x y\")\np = Point(1, 2)\np, p.x, p._replace(x=5)"
+        py_out: "(Point(x=1, y=2), 1, Point(x=5, y=2))"
+        rb: "Point = Struct.new(:x, :y)\np = Point.new(1, 2)\np.x = 5\n[p, p.to_a, p == Point.new(5, 2)]"
+        rb_out: "[#<struct Point x=5, y=2>, [5, 2], true]"
+        rb_note: "Struct fields are mutable; it also accepts keywords: `Point.new(x: 1, y: 2)`."
+      - task: Record class with defaults and methods
+        py: |-
+          from dataclasses import dataclass, field
+
+          @dataclass
+          class Item:
+              name: str
+              qty: int = 1
+              tags: list = field(default_factory=list)
+
+              def total(self, price):
+                  return self.qty * price
+
+          it = Item("pen", 3)
+          it, it.total(2), it == Item("pen", 3)
+        py_out: "(Item(name='pen', qty=3, tags=[]), 6, True)"
+        rb: |-
+          Item = Struct.new(:name, :qty, :tags) do
+            def initialize(name:, qty: 1, tags: [])
+              super
+            end
+
+            def total(price) = qty * price
+          end
+
+          it = Item.new(name: "pen", qty: 3)
+          [it, it.total(2), it == Item.new(name: "pen", qty: 3)]
+        rb_out: "[#<struct Item name=\"pen\", qty=3, tags=[]>, 6, true]"
+        py_note: "Mutable defaults need `field(default_factory=list)`; `dataclass` writes `__init__`, `__repr__` and `__eq__`."
+      - task: Immutable record
+        since: {rb: "3.2"}
+        py: |-
+          from dataclasses import dataclass, replace
+
+          @dataclass(frozen=True)
+          class Point:
+              x: int
+              y: int
+
+          p = Point(1, 2)
+          q = replace(p, y=5)
+          try:
+              p.x = 9
+          except AttributeError as e:
+              err = type(e).__name__
+          p, q, err, {p: "ok"}[Point(1, 2)]
+        py_out: "(Point(x=1, y=2), Point(x=1, y=5), 'FrozenInstanceError', 'ok')"
+        rb: |-
+          Point = Data.define(:x, :y) do
+            def +(other) = with(x: x + other.x, y: y + other.y)
+          end
+
+          p = Point.new(x: 1, y: 2)
+          q = p.with(y: 5)
+          [p, q, p + q, {p => "ok"}[Point.new(1, 2)]]
+        rb_out: "[#<data Point x=1, y=2>, #<data Point x=1, y=5>, #<data Point x=2, y=7>, \"ok\"]"
+        note: "Immutable, compared by value, usable as a dict / hash key. Change a field by making a copy."
+      - task: Sort records
+        py: "sorted([(2, \"b\"), (1, \"z\"), (2, \"a\")])"
+        py_out: "[(1, 'z'), (2, 'a'), (2, 'b')]"
+        rb: "[[2, \"b\"], [1, \"z\"], [2, \"a\"]].sort"
+        rb_out: "[[1, \"z\"], [2, \"a\"], [2, \"b\"]]"
+        note: "Tuples / arrays sort by first field, then second…"
+      - task: Enum
+        py: |-
+          from enum import Enum
+
+          class Color(Enum):
+              RED = 1
+              GREEN = 2
+
+          Color.RED, Color(2).name, [c.name for c in Color]
+        py_out: "(<Color.RED: 1>, 'GREEN', ['RED', 'GREEN'])"
+        rb: "module Color\n  RED = :red\n  GREEN = :green\n  ALL = [RED, GREEN].freeze\nend\n[Color::RED, Color::ALL]"
+        rb_out: "[:red, [:red, :green]]"
+        rb_note: "No enum type: symbols, or frozen constants in a module."
+
+  - id: classes
+    name: Classes & objects
+    rows:
+      - task: Class, constructor, attributes
+        py: |-
+          class Account:
+              def __init__(self, owner, balance=0):
+                  self.owner = owner
+                  self.balance = balance
+
+              def deposit(self, amount):
+                  self.balance += amount
+                  return self
+
+          acct = Account("ada").deposit(50)
+          acct.owner, acct.balance
+        py_out: "('ada', 50)"
+        rb: |-
+          class Account
+            attr_reader :owner
+            attr_accessor :balance
+
+            def initialize(owner, balance = 0)
+              @owner = owner
+              @balance = balance
+            end
+
+            def deposit(amount)
+              @balance += amount
+              self
+            end
+          end
+
+          acct = Account.new("ada").deposit(50)
+          [acct.owner, acct.balance]
+        rb_out: "[\"ada\", 50]"
+        py_note: "`self` is explicit: the first parameter of every method."
+        rb_note: "`@vars` are always private; `attr_reader` / `attr_writer` / `attr_accessor` generate getters and setters."
+      - task: String representation
+        py: |-
+          class P:
+              def __init__(self, x):
+                  self.x = x
+
+              def __repr__(self):
+                  return f"P({self.x!r})"
+
+              def __str__(self):
+                  return f"point {self.x}"
+
+          repr(P(1)), str(P(1)), f"{P(1)}", [P(2)]
+        py_out: "('P(1)', 'point 1', 'point 1', [P(2)])"
+        rb: |-
+          class P
+            def initialize(x)
+              @x = x
+            end
+
+            def inspect = "P(#{@x})"
+            def to_s = "point #{@x}"
+          end
+
+          [P.new(1).inspect, P.new(1).to_s, "#{P.new(1)}"]
+        rb_out: "[\"P(1)\", \"point 1\", \"point 1\"]"
+        py_note: "`repr` is for debugging (and how containers show items); `str` is for users."
+        rb_note: "`inspect` is for debugging (`p`); `to_s` is for users (`puts`, interpolation)."
+      - task: Class and static methods
+        py: |-
+          class Temp:
+              count = 0                      # class attribute, shared
+
+              def __init__(self, c):
+                  self.c = c
+                  Temp.count += 1
+
+              @classmethod
+              def from_f(cls, f):
+                  return cls((f - 32) * 5 / 9)
+
+              @staticmethod
+              def valid(c):
+                  return c >= -273.15
+
+          t = Temp.from_f(212)
+          t.c, Temp.count, Temp.valid(-300)
+        py_out: "(100.0, 1, False)"
+        rb: |-
+          class Temp
+            @count = 0                       # instance variable of the class itself
+            class << self
+              attr_accessor :count
+            end
+
+            def self.from_f(f) = new((f - 32) * 5.0 / 9)
+            def self.valid?(c) = c >= -273.15
+
+            attr_reader :c
+
+            def initialize(c)
+              @c = c
+              self.class.count += 1
+            end
+          end
+
+          t = Temp.from_f(212)
+          [t.c, Temp.count, Temp.valid?(-300)]
+        rb_out: "[100.0, 1, false]"
+        rb_note: "Avoid `@@class_variables`: subclasses share and overwrite them."
+      - task: Inheritance, super
+        py: |-
+          class Animal:
+              def __init__(self, name):
+                  self.name = name
+
+              def speak(self):
+                  return f"{self.name} makes a sound"
+
+          class Dog(Animal):
+              def __init__(self, name, breed):
+                  super().__init__(name)
+                  self.breed = breed
+
+              def speak(self):
+                  return super().speak().replace("a sound", "woof")
+
+          d = Dog("Rex", "lab")
+          d.speak(), isinstance(d, Animal), [c.__name__ for c in Dog.__mro__]
+        py_out: "('Rex makes woof', True, ['Dog', 'Animal', 'object'])"
+        rb: |-
+          class Animal
+            def initialize(name)
+              @name = name
+            end
+
+            def speak = "#{@name} makes a sound"
+          end
+
+          class Dog < Animal
+            def initialize(name, breed)
+              super(name)
+              @breed = breed
+            end
+
+            def speak = super.sub("a sound", "woof")
+          end
+
+          d = Dog.new("Rex", "lab")
+          [d.speak, d.is_a?(Animal), Dog.superclass]
+        rb_out: "[\"Rex makes woof\", true, Animal]"
+        rb_note: "Bare `super` passes along all of the current arguments; `super()` passes none; `super(x)` passes x."
+        trap: rb
+      - task: Equality and hashing
+        py: |-
+          class Pt:
+              def __init__(self, x, y):
+                  self.x, self.y = x, y
+
+              def __eq__(self, other):
+                  return isinstance(other, Pt) and (self.x, self.y) == (other.x, other.y)
+
+              def __hash__(self):
+                  return hash((self.x, self.y))
+
+          Pt(1, 2) == Pt(1, 2), len({Pt(1, 2), Pt(1, 2)})
+        py_out: "(True, 1)"
+        rb: |-
+          class Pt
+            attr_reader :x, :y
+
+            def initialize(x, y)
+              @x, @y = x, y
+            end
+
+            def ==(other) = other.is_a?(Pt) && [x, y] == [other.x, other.y]
+            alias eql? ==
+            def hash = [x, y].hash
+          end
+
+          [Pt.new(1, 2) == Pt.new(1, 2), [Pt.new(1, 2), Pt.new(1, 2)].uniq.size]
+        rb_out: "[true, 1]"
+        note: "By default objects are equal only to themselves."
+        py_note: "Defining `__eq__` without `__hash__` makes instances unhashable. `@dataclass(frozen=True)` writes both."
+        rb_note: "Hash keys, `uniq` and Set use `eql?` + `hash`, not `==`."
+        trap: true
+      - task: Ordering
+        py: |-
+          from functools import total_ordering
+
+          @total_ordering
+          class Version:
+              def __init__(self, s):
+                  self.parts = tuple(map(int, s.split(".")))
+
+              def __eq__(self, other):
+                  return self.parts == other.parts
+
+              def __lt__(self, other):
+                  return self.parts < other.parts
+
+              def __repr__(self):
+                  return ".".join(map(str, self.parts))
+
+          sorted([Version("1.10"), Version("1.2")]), Version("2.0") >= Version("1.9")
+        py_out: "([1.2, 1.10], True)"
+        rb: |-
+          class Version
+            include Comparable
+            attr_reader :parts
+
+            def initialize(s)
+              @parts = s.split(".").map(&:to_i)
+            end
+
+            def <=>(other) = parts <=> other.parts
+            def inspect = parts.join(".")
+          end
+
+          v = ->(s) { Version.new(s) }
+          [[v.("1.10"), v.("1.2")].sort, v.("2.0") >= v.("1.9"), v.("1.5").clamp(v.("1.0"), v.("1.2"))]
+        rb_out: "[[1.2, 1.10], true, 1.2]"
+        py_note: "`total_ordering` fills in `<=`, `>`, `>=` from `__eq__` and `__lt__`."
+        rb_note: "Define `<=>` and include Comparable to get `<`, `==`, `between?`, `clamp`."
+      - task: Make a class iterable
+        py: |-
+          class Countdown:
+              def __init__(self, n):
+                  self.n = n
+
+              def __iter__(self):
+                  for i in range(self.n, 0, -1):
+                      yield i
+
+              def __len__(self):
+                  return self.n
+
+          c = Countdown(3)
+          list(c), len(c), sum(c), 2 in c
+        py_out: "([3, 2, 1], 3, 6, True)"
+        rb: |-
+          class Countdown
+            include Enumerable
+
+            def initialize(n)
+              @n = n
+            end
+
+            def each
+              @n.downto(1) { |i| yield i }
+            end
+          end
+
+          c = Countdown.new(3)
+          [c.to_a, c.count, c.sum, c.include?(2), c.map { _1 * 10 }]
+        rb_out: "[[3, 2, 1], 3, 6, true, [30, 20, 10]]"
+        rb_note: "Define `each` and include Enumerable to get `map`, `select`, `sort`, `min`, `sum`… for free."
+      - task: Properties, validation
+        py: |-
+          class Celsius:
+              def __init__(self, deg):
+                  self.deg = deg                # goes through the setter
+
+              @property
+              def deg(self):
+                  return self._deg
+
+              @deg.setter
+              def deg(self, v):
+                  if v < -273.15:
+                      raise ValueError("below absolute zero")
+                  self._deg = v
+
+              @property
+              def fahrenheit(self):
+                  return self._deg * 9 / 5 + 32
+
+          Celsius(100).fahrenheit
+        py_out: "212.0"
+        rb: |-
+          class Celsius
+            attr_reader :deg
+
+            def initialize(deg)
+              self.deg = deg                    # without self. this makes a local variable
+            end
+
+            def deg=(v)
+              raise ArgumentError, "below absolute zero" if v < -273.15
+              @deg = v
+            end
+
+            def fahrenheit = deg * 9.0 / 5 + 32
+          end
+
+          Celsius.new(100).fahrenheit
+        rb_out: "212.0"
+        rb_note: "Inside a method, `deg = v` creates a local variable; call the setter with `self.deg = v`."
+        trap: rb
+      - task: Private methods
+        py: |-
+          class Box:
+              def area(self):
+                  return self._side() ** 2
+
+              def _side(self):          # leading underscore = internal, by convention
+                  return 3
+
+          Box().area()
+        py_out: "9"
+        rb: |-
+          class Box
+            def area = side**2
+
+            private
+
+            def side = 3
+          end
+
+          [Box.new.area, (Box.new.side rescue "NoMethodError")]
+        rb_out: "[9, \"NoMethodError\"]"
+        py_note: "Nothing is truly private. `__name` mangles the name to avoid clashes in subclasses."
+      - task: Class constants
+        py: "class Grid:\n    DIRS = ((0, 1), (1, 0), (0, -1), (-1, 0))\n\nGrid.DIRS[0], len(Grid.DIRS)"
+        py_out: "((0, 1), 4)"
+        rb: "class Grid\n  DIRS = [[0, 1], [1, 0], [0, -1], [-1, 0]].freeze\nend\n\n[Grid::DIRS[0], Grid::DIRS.size]"
+        rb_out: "[[0, 1], 4]"
+      - task: Mixins
+        py: |-
+          import json
+
+          class JsonMixin:
+              def to_json(self):
+                  return json.dumps(vars(self))
+
+          class User(JsonMixin):
+              def __init__(self, name):
+                  self.name = name
+
+          User("ada").to_json()
+        py_out: "'{\"name\": \"ada\"}'"
+        rb: |-
+          require "json"
+
+          module JsonMixin
+            def to_json(*)
+              instance_variables.to_h { |v| [v.to_s.delete("@"), instance_variable_get(v)] }.to_json
+            end
+          end
+
+          class User
+            include JsonMixin
+
+            def initialize(name)
+              @name = name
+            end
+          end
+
+          User.new("ada").to_json
+        rb_out: |-
+          "{\"name\":\"ada\"}"
+        py_note: "A mixin is a small class used through multiple inheritance."
+        rb_note: "`include` adds instance methods; `extend` adds them to one object or to the class itself."
+      - task: Abstract method
+        py: |-
+          from abc import ABC, abstractmethod
+
+          class Shape(ABC):
+              @abstractmethod
+              def area(self): ...
+
+          class Sq(Shape):
+              def __init__(self, s):
+                  self.s = s
+
+              def area(self):
+                  return self.s ** 2
+
+          try:
+              Shape()
+          except TypeError:
+              err = "TypeError"
+          Sq(3).area(), err
+        py_out: "(9, 'TypeError')"
+        rb: |-
+          class Shape
+            def area = raise(NotImplementedError, "#{self.class} must define area")
+          end
+
+          class Sq < Shape
+            def initialize(s)
+              @s = s
+            end
+
+            def area = @s**2
+          end
+
+          err = begin
+            Shape.new.area
+          rescue NotImplementedError => e
+            e.class
+          end
+          [Sq.new(3).area, err]
+        rb_out: "[9, NotImplementedError]"
+        rb_note: "`NotImplementedError` isn't a StandardError, so a bare `rescue` won't catch it. Often duck typing is enough."
+      - task: Duck typing checks
+        py: "hasattr(\"abc\", \"upper\"), callable(len), hasattr(5, \"__iter__\")"
+        py_out: "(True, True, False)"
+        rb: "[\"abc\".respond_to?(:upcase), 5.respond_to?(:each), [].respond_to?(:each)]"
+        rb_out: "[true, false, true]"
+      - task: Module of functions
+        rb: "module MathUtil\n  module_function\n\n  def sq(x) = x * x\nend\n\nMathUtil.sq(4)"
+        rb_out: "16"
+        rb_note: "In Python, a module (file) of plain functions plays this role."
+      - task: Reopen a class
+        rb: "class Integer\n  def double = self * 2\nend\n\n5.double"
+        rb_out: "10"
+        rb_note: "Reopening a core class changes it for the whole program. Prefer a helper method, or a refinement (`using`)."
+        trap: rb
+
+  - id: setup
+    name: Imports & project setup
+    rows:
+      - task: Import
+        py: "import math\nimport collections as co\nfrom itertools import permutations\n\nmath.gcd(12, 18), co.Counter(\"aab\")[\"a\"], len(list(permutations(\"abc\")))"
+        py_out: "(6, 2, 6)"
+        rb: "require \"json\"      # stdlib or gem; loaded once per process\nrequire \"set\"\n\n[JSON.generate([1]), Set[1, 1].size]"
+        rb_out: "[\"[1]\", 1]"
+        py_note: "Avoid `from x import *`: it hides where names come from."
+        rb_note: "Core classes (Array, Hash, String, Math, File, Time…) need no require."
+      - task: Import your own code
+        run: false
+        py: "from mypkg.utils import helper     # absolute: mypkg is on sys.path\nfrom .utils import helper          # relative: from inside the package"
+        rb: "require_relative \"lib/utils\"       # path relative to this file\nrequire \"utils\"                    # searched on $LOAD_PATH (gems, -I dirs)"
+        py_note: "A package is a folder of modules; `__init__.py` is optional for namespace packages but still common."
+      - task: Script entry point
+        py: "def main():\n    print(\"running\")\n\nif __name__ == \"__main__\":   # only when run directly, not when imported\n    main()"
+        rb: "def main\n  puts \"running\"\nend\n\nmain if __FILE__ == $PROGRAM_NAME   # only when run directly, not when required"
+      - task: Namespaces
+        rb: |-
+          module Geo
+            TAU = Math::PI * 2
+
+            class Circle
+              def initialize(r)
+                @r = r
+              end
+
+              def circumference = (TAU * @r).round(2)
+            end
+          end
+
+          Geo::Circle.new(1).circumference
+        rb_out: "6.28"
+        rb_note: "Modules namespace classes and constants: `Geo::Circle`, `Geo::TAU`. In Python, each file is a namespace."
+      - task: Everyday stdlib
+        py: |-
+          import collections, itertools, functools    # containers, iteration, caching
+          import heapq, bisect, math, random          # heaps, sorted lists, math, random
+          import re, json, datetime, pathlib          # regex, JSON, dates, paths
+          import sys, os, dataclasses, enum, typing   # interpreter, OS, records, enums, hints
+        rb: |-
+          require "json"            # JSON.parse / to_json
+          require "set"             # Set (built in from 3.2)
+          require "time"            # Time.parse, iso8601
+          require "date"            # Date
+          require "securerandom"    # random tokens, UUIDs
+          require "fileutils"       # mkdir_p, cp, rm_rf
+          require "pathname"        # Pathname paths
+      - task: Virtual environment
+        shell: true
+        py: "python3 -m venv .venv\nsource .venv/bin/activate      # Windows: .venv\\Scripts\\activate\npip install requests\npip freeze > requirements.txt\npip install -r requirements.txt\ndeactivate"
+        py_note: "One environment per project. Never `pip install` into the system Python."
+      - task: uv
+        shell: true
+        py: "uv init myapp && cd myapp     # pyproject.toml + .python-version\nuv add requests                # dependency + uv.lock\nuv run main.py                 # runs inside the project's venv\nuv sync                        # install exactly what uv.lock says\nuv python install 3.12\nuv tool install ruff           # global CLI tool, isolated"
+        py_note: "uv replaces pip, venv, pip-tools and pyenv with one fast tool; commit `pyproject.toml` and `uv.lock`."
+      - task: Ruby versions
+        shell: true
+        rb: "rbenv install 3.3.5\nrbenv local 3.3.5              # writes .ruby-version\nrbenv versions\n# chruby: ruby-install ruby 3.3.5, then chruby 3.3.5"
+        rb_note: "rbenv and chruby both read `.ruby-version`, so the project pins its Ruby."
+      - task: Bundler
+        shell: true
+        rb: "bundle init                    # creates Gemfile\nbundle add rspec\nbundle install                 # resolves and writes Gemfile.lock\nbundle exec rspec              # run with the locked gem versions\nbundle update rack"
+        rb_note: "Commit `Gemfile` and `Gemfile.lock`. Use `bundle exec` so the locked versions are the ones loaded."
+      - task: Gemfile
+        run: false
+        rb: |-
+          source "https://rubygems.org"
+          ruby "~> 3.3"
+
+          gem "rack", "~> 3.0"
+
+          group :development, :test do
+            gem "rspec"
+          end
+        rb_note: "`~> 3.0` allows 3.x but not 4.0."
+      - task: Install a single tool
+        shell: true
+        py: "pipx install ruff              # or: uv tool install ruff"
+        rb: "gem install rubocop\ngem list rubocop"
+      - task: Run, REPL, debug
+        shell: true
+        py: "python3 script.py arg1\npython3 -i script.py           # run, then stay in the REPL\npython3 -m pdb script.py\npython3 -m http.server 8000    # any stdlib module as a script"
+        rb: "ruby script.rb arg1\nirb -r ./script.rb             # REPL with the file loaded\nruby -e 'puts 1 + 1'\nruby -run -e httpd . -p 8000"
+      - task: Breakpoint
+        run: false
+        py: "breakpoint()        # pdb: n(ext), s(tep), c(ontinue), p expr, q(uit)"
+        rb: "binding.irb         # or: require \"debug\"; binding.break"
+
+  - id: errors
+    name: Errors
+    rows:
+      - task: Catch, else, always
+        py: |-
+          log = []
+
+          def parse(s):
+              try:
+                  n = int(s)
+              except ValueError:
+                  log.append(f"bad: {s}")
+                  return None
+              else:
+                  return n                # only when nothing was raised
+              finally:
+                  log.append("done")      # always runs
+
+          parse("7"), parse("x"), log
+        py_out: "(7, None, ['done', 'bad: x', 'done'])"
+        rb: |-
+          def parse(s, log)
+            n = Integer(s)
+          rescue ArgumentError
+            log << "bad: #{s}"
+            nil
+          else
+            n                             # only when nothing was raised
+          ensure
+            log << "done"                 # always runs; its value is ignored
+          end
+
+          log = []
+          [parse("7", log), parse("x", log), log]
+        rb_out: "[7, nil, [\"done\", \"bad: x\", \"done\"]]"
+        rb_note: "A method body (or `do … end` block) can `rescue` directly, without `begin`."
+      - task: Raise
+        py: |-
+          def withdraw(bal, amt):
+              if amt > bal:
+                  raise ValueError(f"insufficient: {bal} < {amt}")
+              return bal - amt
+
+          try:
+              withdraw(5, 9)
+          except ValueError as e:
+              msg = str(e)
+          msg
+        py_out: "'insufficient: 5 < 9'"
+        rb: |-
+          def withdraw(bal, amt)
+            raise ArgumentError, "insufficient: #{bal} < #{amt}" if amt > bal
+            bal - amt
+          end
+
+          begin
+            withdraw(5, 9)
+          rescue ArgumentError => e
+            e.message
+          end
+        rb_out: "\"insufficient: 5 < 9\""
+        rb_note: "`raise \"text\"` alone raises a RuntimeError."
+      - task: Custom exception
+        py: |-
+          class AppError(Exception):
+              """Base for this app's errors."""
+
+          class NotFound(AppError):
+              def __init__(self, key):
+                  super().__init__(f"{key!r} not found")
+                  self.key = key
+
+          try:
+              raise NotFound("user:7")
+          except AppError as e:
+              caught = (type(e).__name__, str(e), e.key)
+          caught
+        py_out: |-
+          ('NotFound', "'user:7' not found", 'user:7')
+        rb: |-
+          class AppError < StandardError; end
+
+          class NotFound < AppError
+            attr_reader :key
+
+            def initialize(key)
+              @key = key
+              super("#{key.inspect} not found")
+            end
+          end
+
+          begin
+            raise NotFound, "user:7"
+          rescue AppError => e
+            [e.class, e.message, e.key]
+          end
+        rb_out: |-
+          [NotFound, "\"user:7\" not found", "user:7"]
+        note: "One base class per app or library lets callers catch all of its errors at once."
+        rb_note: "Inherit from StandardError, not Exception: a bare `rescue` only catches StandardError."
+        trap: rb
+      - task: Several types, chain
+        py: |-
+          def load_num(s):
+              try:
+                  return int(s)
+              except (ValueError, TypeError) as e:
+                  raise RuntimeError(f"can't load {s!r}") from e
+
+          try:
+              load_num(None)
+          except RuntimeError as e:
+              out = (str(e), type(e.__cause__).__name__)
+          out
+        py_out: |-
+          ("can't load None", 'TypeError')
+        rb: |-
+          def load_num(s)
+            Integer(s)
+          rescue ArgumentError, TypeError
+            raise "can't load #{s.inspect}"
+          end
+
+          begin
+            load_num(nil)
+          rescue RuntimeError => e
+            [e.message, e.cause.class]
+          end
+        rb_out: |-
+          ["can't load nil", TypeError]
+        py_note: "`raise … from e` keeps the original as `__cause__`; plain `raise` inside `except` re-raises."
+        rb_note: "Raising inside `rescue` sets `cause` automatically; bare `raise` re-raises."
+      - task: Retry
+        py: |-
+          result = None
+          for attempt in range(1, 4):
+              try:
+                  if attempt < 3:
+                      raise ConnectionError("flaky")
+                  result = f"ok after {attempt}"
+                  break
+              except ConnectionError:
+                  continue
+          result
+        py_out: "'ok after 3'"
+        rb: |-
+          attempts = 0
+          begin
+            attempts += 1
+            raise IOError, "flaky" if attempts < 3
+            "ok after #{attempts}"
+          rescue IOError
+            retry if attempts < 3
+            "gave up"
+          end
+        rb_out: "\"ok after 3\""
+        rb_note: "`retry` reruns the `begin` block; always cap the attempts."
+      - task: Catch-all
+        py: "try:\n    {}[\"k\"]\nexcept Exception as e:\n    name = type(e).__name__\nname"
+        py_out: "'KeyError'"
+        rb: "begin\n  {}.fetch(\"k\")\nrescue => e          # same as rescue StandardError => e\n  e.class\nend"
+        rb_out: "KeyError"
+        py_note: "Never a bare `except:`; it also catches Ctrl-C and `sys.exit`."
+        rb_note: "Never `rescue Exception`; it also catches interrupts and `exit`."
+        trap: true
+      - task: Clean up with a block
+        py: |-
+          import contextlib
+
+          @contextlib.contextmanager
+          def tag(name, out):
+              out.append(f"<{name}>")
+              try:
+                  yield
+              finally:
+                  out.append(f"</{name}>")
+
+          out = []
+          with tag("b", out):
+              out.append("hi")
+          out
+        py_out: "['<b>', 'hi', '</b>']"
+        rb: |-
+          def tag(name, out)
+            out << "<#{name}>"
+            yield
+          ensure
+            out << "</#{name}>"
+          end
+
+          out = []
+          tag("b", out) { out << "hi" }
+          out
+        rb_out: "[\"<b>\", \"hi\", \"</b>\"]"
+        note: "This is how `with open(…)` and `File.open(…) { }` close files even when an error is raised."
+      - task: Check inputs
+        py: |-
+          def mean(xs):
+              if not xs:
+                  raise ValueError("empty list")
+              return sum(xs) / len(xs)
+
+          try:
+              mean([])
+          except ValueError as e:
+              msg = str(e)
+          msg
+        py_out: "'empty list'"
+        rb: "def mean(xs)\n  raise ArgumentError, \"empty list\" if xs.empty?\n  xs.sum.fdiv(xs.size)\nend\n\n(mean([]) rescue $!.message)"
+        rb_out: "\"empty list\""
+        py_note: "`assert` is for internal invariants only: `python -O` removes it."
+        rb_note: "`$!` is the exception being handled; prefer `rescue => e` in real code."
+      - task: Error hierarchy
+        py: "issubclass(KeyError, LookupError), issubclass(ZeroDivisionError, ArithmeticError), KeyError.__mro__[1].__name__"
+        py_out: "(True, True, 'LookupError')"
+        rb: "[KeyError.superclass, IndexError.superclass, ZeroDivisionError.superclass]"
+        rb_out: "[IndexError, StandardError, StandardError]"
+        note: "Catching a parent class also catches its children."
+
+  - id: iteration
+    name: Iteration helpers
+    rows:
+      - task: Combinations, permutations
+        py: "from itertools import combinations, permutations\nlist(combinations(\"abc\", 2)), len(list(permutations(\"abc\")))"
+        py_out: "([('a', 'b'), ('a', 'c'), ('b', 'c')], 6)"
+        rb: "[\"abc\".chars.combination(2).to_a, \"abc\".chars.permutation.count]"
+        rb_out: "[[[\"a\", \"b\"], [\"a\", \"c\"], [\"b\", \"c\"]], 6]"
+      - task: Cartesian product
+        py: "from itertools import product\nlist(product([0, 1], repeat=2)), list(product(\"ab\", [1, 2]))"
+        py_out: "([(0, 0), (0, 1), (1, 0), (1, 1)], [('a', 1), ('a', 2), ('b', 1), ('b', 2)])"
+        rb: "[[0, 1].product([0, 1]), %w[a b].product([1, 2]), [0, 1].repeated_permutation(2).count]"
+        rb_out: "[[[0, 0], [0, 1], [1, 0], [1, 1]], [[\"a\", 1], [\"a\", 2], [\"b\", 1], [\"b\", 2]], 4]"
+      - task: All subsets
+        py: "from itertools import combinations\n[list(c) for r in range(3) for c in combinations([1, 2], r)]"
+        py_out: "[[], [1], [2], [1, 2]]"
+        rb: "(0..2).flat_map { |r| [1, 2].combination(r).to_a }"
+        rb_out: "[[], [1], [2], [1, 2]]"
+      - task: Adjacent pairs, sliding windows
+        since: {py: "3.10"}
+        py: "from itertools import pairwise\nt = [1, 2, 4, 7]\nlist(pairwise(t)), [b - a for a, b in pairwise(t)], [t[i:i + 3] for i in range(len(t) - 2)]"
+        py_out: "([(1, 2), (2, 4), (4, 7)], [1, 2, 3], [[1, 2, 4], [2, 4, 7]])"
+        rb: "t = [1, 2, 4, 7]\n[t.each_cons(2).to_a, t.each_cons(2).map { |a, b| b - a }, t.each_cons(3).to_a]"
+        rb_out: "[[[1, 2], [2, 4], [4, 7]], [1, 2, 3], [[1, 2, 4], [2, 4, 7]]]"
+      - task: Chunks of n
+        since: {py: "3.12"}
+        py: "from itertools import batched\nlst = list(range(7))\n[lst[i:i + 3] for i in range(0, len(lst), 3)], list(batched(lst, 3))"
+        py_out: "([[0, 1, 2], [3, 4, 5], [6]], [(0, 1, 2), (3, 4, 5), (6,)])"
+        rb: "(0...7).each_slice(3).to_a"
+        rb_out: "[[0, 1, 2], [3, 4, 5], [6]]"
+        py_note: "Before 3.12, use the slicing version."
+      - task: Running totals
+        py: "from itertools import accumulate\nlist(accumulate([1, 2, 3])), list(accumulate([1, 2, 3], initial=0)), list(accumulate([3, 1, 4], max))"
+        py_out: "([1, 3, 6], [0, 1, 3, 6], [3, 3, 4])"
+        rb: "s = 0\n[[1, 2, 3].map { s += _1 }, [1, 2, 3].each_with_object([0]) { |x, acc| acc << acc[-1] + x }, [3, 1, 4].each_with_object([]) { |x, acc| acc << [x, acc.last || x].max }]"
+        rb_out: "[[1, 3, 6], [0, 1, 3, 6], [3, 3, 4]]"
+        note: "A leading 0 makes prefix sums: sum(i..j) = P[j+1] − P[i]."
+      - task: Group consecutive runs
+        py: "from itertools import groupby\n[(k, len(list(g))) for k, g in groupby(\"aaabcca\")]"
+        py_out: "[('a', 3), ('b', 1), ('c', 2), ('a', 1)]"
+        rb: "\"aaabcca\".chars.chunk_while { |a, b| a == b }.map { [_1[0], _1.size] }"
+        rb_out: "[[\"a\", 3], [\"b\", 1], [\"c\", 2], [\"a\", 1]]"
+        py_note: "`groupby` only groups adjacent items: sort by the same key first to group everything."
+        rb_note: "`chunk_while` / `slice_when` split runs; `group_by` collects all items per key."
+        trap: py
+      - task: Group all by key
+        py: "from itertools import groupby\nwords = sorted([\"bob\", \"apple\", \"avocado\"])\n{k: list(g) for k, g in groupby(words, key=lambda w: w[0])}"
+        py_out: "{'a': ['apple', 'avocado'], 'b': ['bob']}"
+        rb: "%w[bob apple avocado].group_by { _1[0] }"
+        rb_out: "{\"b\" => [\"bob\"], \"a\" => [\"apple\", \"avocado\"]}"
+        py_note: "Or a `defaultdict(list)` loop (see Dicts), which needs no sort."
+      - task: Zip, unzip
+        py: "pairs = [(1, \"a\"), (2, \"b\")]\nnums, chars = zip(*pairs)\nnums, chars, list(zip(*[[1, 2, 3], [4, 5, 6]]))"
+        py_out: "((1, 2), ('a', 'b'), [(1, 4), (2, 5), (3, 6)])"
+        rb: "pairs = [[1, \"a\"], [2, \"b\"]]\nnums, chars = pairs.transpose\n[nums, chars, [[1, 2, 3], [4, 5, 6]].transpose]"
+        rb_out: "[[1, 2], [\"a\", \"b\"], [[1, 4], [2, 5], [3, 6]]]"
+      - task: Cycle, count, repeat
+        py: "from itertools import cycle, islice, count, repeat\nlist(islice(cycle(\"ab\"), 5)), list(islice(count(10, 5), 3)), list(repeat(0, 3))"
+        py_out: "(['a', 'b', 'a', 'b', 'a'], [10, 15, 20], [0, 0, 0])"
+        rb: "[%w[a b].cycle.first(5), 10.step(by: 5).first(3), [0] * 3]"
+        rb_out: "[[\"a\", \"b\", \"a\", \"b\", \"a\"], [10, 15, 20], [0, 0, 0]]"
+      - task: Take / drop while
+        py: "from itertools import takewhile, dropwhile\nlist(takewhile(lambda x: x < 3, [1, 2, 5, 1])), list(dropwhile(lambda x: x < 3, [1, 2, 5, 1]))"
+        py_out: "([1, 2], [5, 1])"
+        rb: "[[1, 2, 5, 1].take_while { _1 < 3 }, [1, 2, 5, 1].drop_while { _1 < 3 }]"
+        rb_out: "[[1, 2], [5, 1]]"
+      - task: Min / max / sum by
+        py: "words = [\"kiwi\", \"fig\", \"banana\"]\nmin(words, key=len), max(words, key=len), sum(len(w) for w in words)"
+        py_out: "('fig', 'banana', 13)"
+        rb: "words = %w[kiwi fig banana]\n[words.min_by(&:length), words.max_by(&:length), words.sum(&:length), words.minmax_by(&:length)]"
+        rb_out: "[\"fig\", \"banana\", 13, [\"fig\", \"banana\"]]"
+      - task: Lazy pipeline
+        py: "import itertools\nnext(x * x for x in itertools.count(1) if x * x > 50)"
+        py_out: "64"
+        rb: "(1..).lazy.map { _1 * _1 }.find { _1 > 50 }"
+        rb_out: "64"
+        note: "Nothing is computed until a value is asked for, so infinite sources are fine."
+      - task: Reverse iteration
+        py: "list(reversed([1, 2, 3])), list(range(5, 0, -2))"
+        py_out: "([3, 2, 1], [5, 3, 1])"
+        rb: "[[1, 2, 3].reverse_each.to_a, 5.step(1, -2).to_a]"
+        rb_out: "[[3, 2, 1], [5, 3, 1]]"
+      - task: Step an iterator by hand
+        py: "it = iter([1, 2])\nnext(it), next(it), next(it, \"done\")"
+        py_out: "(1, 2, 'done')"
+        rb: "e = [1, 2].each\n[e.next, e.next, (e.next rescue \"StopIteration\")]"
+        rb_out: "[1, 2, \"StopIteration\"]"
+
+  - id: containers
+    name: Stack, queue, heap
+    rows:
+      - task: Stack
+        py: "st = []\nst.append(1)\nst.append(2)\ntop = st[-1]\nst.pop(), top, st, bool(st)"
+        py_out: "(2, 2, [1], True)"
+        rb: "st = []\nst.push(1)\nst.push(2)\ntop = st.last\n[st.pop, top, st, st.empty?]"
+        rb_out: "[2, 2, [1], false]"
+      - task: Queue
+        py: "from collections import deque\nq = deque([1, 2])\nq.append(3)\nq.popleft(), q.popleft(), list(q)"
+        py_out: "(1, 2, [3])"
+        rb: "q = [1, 2]\nq.push(3)\n[q.shift, q.shift, q]"
+        rb_out: "[1, 2, [3]]"
+        py_note: "`list.pop(0)` is O(n) per call; `deque.popleft()` is O(1)."
+        rb_note: "`Array#shift` is amortized O(1) in CRuby, so a plain array is a fine queue."
+        trap: py
+      - task: Double-ended queue
+        py: "from collections import deque\nd = deque([2])\nd.appendleft(1)\nd.append(3)\nd.pop(), d.popleft(), list(d), deque(range(5), maxlen=3)"
+        py_out: "(3, 1, [2], deque([2, 3, 4], maxlen=3))"
+        rb: "d = [2]\nd.unshift(1)\nd.push(3)\n[d.pop, d.shift, d]"
+        rb_out: "[3, 1, [2]]"
+        py_note: "`maxlen` keeps only the newest items: a ready-made sliding window."
+      - task: Min-heap
+        py: "import heapq\nh = [5, 1, 4]\nheapq.heapify(h)\nheapq.heappush(h, 2)\n[heapq.heappop(h) for _ in range(2)], h[0]"
+        py_out: "([1, 2], 4)"
+        rb: "h = []\n[5, 1, 4, 2].each { |x| h.insert(h.bsearch_index { _1 >= x } || h.size, x) }\n[h.shift(2), h.first]"
+        rb_out: "[[1, 2], 4]"
+        py_note: "`heapq` works on a plain list; `h[0]` is always the smallest."
+        rb_note: "No heap in core Ruby. A sorted array with a binary-search insert is O(n) per push, fine for small n; for big inputs use the MinHeap under pattern 09."
+        trap: rb
+      - task: Max-heap, priority with ties
+        py: "import heapq\nh = []\nfor score, name in [(3, \"c\"), (9, \"a\"), (5, \"b\")]:\n    heapq.heappush(h, (-score, name))\n[heapq.heappop(h)[1] for _ in range(2)]"
+        py_out: "['a', 'b']"
+        rb: "[[3, \"c\"], [9, \"a\"], [5, \"b\"]].max_by(2) { |score, _| score }.map(&:last)"
+        rb_out: "[\"a\", \"b\"]"
+        py_note: "`heapq` is min-only: push `-score` for a max-heap. Tuples compare field by field, so add a tie-breaker field when items don't compare."
+      - task: Top k
+        py: "import heapq\nheapq.nlargest(2, [5, 1, 9, 3]), heapq.nsmallest(2, [\"bb\", \"a\", \"ccc\"], key=len)"
+        py_out: "([9, 5], ['a', 'bb'])"
+        rb: "[[5, 1, 9, 3].max(2), %w[bb a ccc].min_by(2, &:length)]"
+        rb_out: "[[9, 5], [\"a\", \"bb\"]]"
+      - task: Linked list node
+        py: |-
+          class ListNode:
+              def __init__(self, val=0, next=None):
+                  self.val, self.next = val, next
+
+          head = ListNode(1, ListNode(2, ListNode(3)))
+          vals = []
+          while head:
+              vals.append(head.val)
+              head = head.next
+          vals
+        py_out: "[1, 2, 3]"
+        rb: |-
+          ListNode = Struct.new(:val, :next)
+
+          head = ListNode.new(1, ListNode.new(2, ListNode.new(3)))
+          vals = []
+          while head
+            vals << head.val
+            head = head.next
+          end
+          vals
+        rb_out: "[1, 2, 3]"
+
+  - id: recursion
+    name: Recursion & memo
+    rows:
+      - task: Memoize a function
+        py: "from functools import cache\n\n@cache\ndef fib(n):\n    return n if n < 2 else fib(n - 1) + fib(n - 2)\n\nfib(80)"
+        py_out: "23416728348467685"
+        rb: "fib = Hash.new { |h, n| h[n] = n < 2 ? n : h[n - 1] + h[n - 2] }\nfib[80]"
+        rb_out: "23416728348467685"
+        py_note: "`@cache` = `@lru_cache(maxsize=None)`; arguments must be hashable."
+        rb_note: "A Hash with a default block is a memoized function."
+      - task: Memo dictionary by hand
+        py: "memo = {}\n\ndef ways(n):\n    if n <= 1:\n        return 1\n    if n not in memo:\n        memo[n] = ways(n - 1) + ways(n - 2)\n    return memo[n]\n\nways(30)"
+        py_out: "1346269"
+        rb: "@memo = {}\n\ndef ways(n)\n  return 1 if n <= 1\n  return @memo[n] if @memo.key?(n)\n  @memo[n] = ways(n - 1) + ways(n - 2)\nend\n\nways(30)"
+        rb_out: "1346269"
+      - task: Memo that stores false / nil
+        rb: "@calls = 0\n@cache = {}\n\ndef slow_check(_x)\n  @calls += 1\n  false\nend\n\n3.times { @cache[:k] ||= slow_check(:k) }\n@calls"
+        rb_out: "3"
+        rb_note: "`memo[k] ||= …` recomputes whenever the cached value is `nil` or `false`. Check `memo.key?(k)` instead."
+        trap: rb
+      - task: Recursion depth limit
+        py: "import sys\nsys.getrecursionlimit()"
+        py_out: "1000"
+        rb: "def depth(n) = n.zero? ? 0 : 1 + depth(n - 1)\n\ndeep = begin\n  depth(10**6)\nrescue SystemStackError\n  \"SystemStackError\"\nend\n[depth(5_000), deep]"
+        rb_out: "[5000, \"SystemStackError\"]"
+        py_note: "About 1000 frames: raise it with `sys.setrecursionlimit(10**6)` or go iterative for deep inputs."
+        rb_note: "The limit is around 10k frames; `SystemStackError` isn't a StandardError, so a bare `rescue` misses it."
+        trap: true
+      - task: Iterative DFS with a stack
+        py: |-
+          graph = {1: [2, 3], 2: [4], 3: [4], 4: []}
+          seen, order, stack = set(), [], [1]
+          while stack:
+              v = stack.pop()
+              if v in seen:
+                  continue
+              seen.add(v)
+              order.append(v)
+              stack.extend(reversed(graph[v]))   # reversed: visit neighbours in order
+          order
+        py_out: "[1, 2, 4, 3]"
+        rb: |-
+          graph = {1 => [2, 3], 2 => [4], 3 => [4], 4 => []}
+          seen, order, stack = Set[], [], [1]
+          until stack.empty?
+            v = stack.pop
+            next if seen.include?(v)
+            seen << v
+            order << v
+            stack.concat(graph[v].reverse)       # reverse: visit neighbours in order
+          end
+          order
+        rb_out: "[1, 2, 4, 3]"
+        note: "Same order as recursive DFS, with no depth limit."
+      - task: Recurse over nested data
+        py: "def depth(x):\n    return 1 + max(map(depth, x), default=0) if isinstance(x, list) else 0\n\ndepth([1, [2, [3]], []])"
+        py_out: "3"
+        rb: "def depth(x) = x.is_a?(Array) ? 1 + (x.map { depth(_1) }.max || 0) : 0\n\ndepth([1, [2, [3]], []])"
+        rb_out: "3"
+      - task: Permutations by backtracking
+        py: |-
+          def perms(items):
+              out, path, used = [], [], [False] * len(items)
+
+              def go():
+                  if len(path) == len(items):
+                      out.append(path[:])
+                      return
+                  for i, x in enumerate(items):
+                      if not used[i]:
+                          used[i] = True
+                          path.append(x)
+                          go()
+                          path.pop()
+                          used[i] = False
+
+              go()
+              return out
+
+          perms([1, 2, 3])
+        py_out: "[[1, 2, 3], [1, 3, 2], [2, 1, 3], [2, 3, 1], [3, 1, 2], [3, 2, 1]]"
+        rb: |-
+          def perms(items)
+            out, path, used = [], [], [false] * items.size
+            go = lambda do
+              return out << path.dup if path.size == items.size
+              items.each_with_index do |x, i|
+                next if used[i]
+                used[i] = true
+                path << x
+                go.()
+                path.pop
+                used[i] = false
+              end
+            end
+            go.()
+            out
+          end
+
+          perms([1, 2, 3])
+        rb_out: "[[1, 2, 3], [1, 3, 2], [2, 1, 3], [2, 3, 1], [3, 1, 2], [3, 2, 1]]"
+        note: "Choose → recurse → un-choose; append a copy of the path."
+
+  - id: grids
+    name: Grid & graph idioms
+    given:
+      py: "grid = [[1, 2, 3], [4, 5, 6]]"
+      rb: "grid = [[1, 2, 3], [4, 5, 6]]"
+    rows:
+      - task: Size, bounds check
+        py: "rows, cols = len(grid), len(grid[0])\nr, c = 1, 3\nrows, cols, 0 <= r < rows and 0 <= c < cols"
+        py_out: "(2, 3, False)"
+        rb: "rows, cols = grid.size, grid[0].size\nr, c = 1, 3\n[rows, cols, r.between?(0, rows - 1) && c.between?(0, cols - 1), grid.dig(5, 0)]"
+        rb_out: "[2, 3, false, nil]"
+      - task: Neighbours
+        py: "DIRS = ((1, 0), (-1, 0), (0, 1), (0, -1))\nr, c = 0, 0\n[(r + dr, c + dc) for dr, dc in DIRS if 0 <= r + dr < len(grid) and 0 <= c + dc < len(grid[0])]"
+        py_out: "[(1, 0), (0, 1)]"
+        rb: "DIRS = [[1, 0], [-1, 0], [0, 1], [0, -1]].freeze\nr, c = 0, 0\nDIRS.map { |dr, dc| [r + dr, c + dc] }.select { |nr, nc| nr.between?(0, grid.size - 1) && nc.between?(0, grid[0].size - 1) }"
+        rb_out: "[[1, 0], [0, 1]]"
+        note: "Always bounds-check before indexing."
+        py_note: "A negative index wraps silently: `grid[-1]` is the last row, not an error."
+        rb_note: "A negative index wraps silently: `grid[-1]` is the last row, not an error."
+        trap: true
+      - task: All 8 directions
+        py: "[(dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1) if dr or dc]"
+        py_out: "[(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]"
+        rb: "[-1, 0, 1].product([-1, 0, 1]) - [[0, 0]]"
+        rb_out: "[[-1, -1], [-1, 0], [-1, 1], [0, -1], [0, 1], [1, -1], [1, 0], [1, 1]]"
+      - task: Iterate cells
+        py: "[(r, c, v) for r, row in enumerate(grid) for c, v in enumerate(row) if v % 2 == 0]"
+        py_out: "[(0, 1, 2), (1, 0, 4), (1, 2, 6)]"
+        rb: "grid.each_with_index.flat_map { |row, r| row.each_with_index.filter_map { |v, c| [r, c, v] if v.even? } }"
+        rb_out: "[[0, 1, 2], [1, 0, 4], [1, 2, 6]]"
+      - task: Transpose, rotate
+        py: "[list(col) for col in zip(*grid)], [list(row) for row in zip(*grid[::-1])]"
+        py_out: "([[1, 4], [2, 5], [3, 6]], [[4, 1], [5, 2], [6, 3]])"
+        rb: "[grid.transpose, grid.transpose.map(&:reverse)]"
+        rb_out: "[[[1, 4], [2, 5], [3, 6]], [[4, 1], [5, 2], [6, 3]]]"
+        note: "Rotate 90° clockwise = reverse the rows, then transpose."
+      - task: Totals, columns
+        py: "sum(map(sum, grid)), [row[1] for row in grid], max(max(row) for row in grid)"
+        py_out: "(21, [2, 5], 6)"
+        rb: "[grid.sum(&:sum), grid.map { _1[1] }, grid.flatten.max]"
+        rb_out: "[21, [2, 5], 6]"
+      - task: Parse a grid from text
+        py: "text = \"#.\\n.#\"\n[list(line) for line in text.splitlines()]"
+        py_out: "[['#', '.'], ['.', '#']]"
+        rb: "text = \"#.\\n.#\"\ntext.lines.map { _1.chomp.chars }"
+        rb_out: "[[\"#\", \".\"], [\".\", \"#\"]]"
+      - task: Adjacency list from edges
+        py: |-
+          from collections import defaultdict
+          edges = [(1, 2), (1, 3), (2, 3)]
+          g = defaultdict(list)
+          for a, b in edges:
+              g[a].append(b)
+              g[b].append(a)          # drop this line for a directed graph
+          dict(g)
+        py_out: "{1: [2, 3], 2: [1, 3], 3: [1, 2]}"
+        rb: |-
+          edges = [[1, 2], [1, 3], [2, 3]]
+          g = Hash.new { |h, k| h[k] = [] }
+          edges.each do |a, b|
+            g[a] << b
+            g[b] << a                 # drop this line for a directed graph
+          end
+          g
+        rb_out: "{1 => [2, 3], 2 => [1, 3], 3 => [1, 2]}"
+      - task: Shortest steps in a grid (BFS)
+        py: |-
+          from collections import deque
+          maze = ["..#", "...", "#.."]
+          q, dist = deque([(0, 0)]), {(0, 0): 0}
+          while q:
+              r, c = q.popleft()
+              for nr, nc in ((r + 1, c), (r - 1, c), (r, c + 1), (r, c - 1)):
+                  if 0 <= nr < 3 and 0 <= nc < 3 and maze[nr][nc] == "." and (nr, nc) not in dist:
+                      dist[(nr, nc)] = dist[(r, c)] + 1    # mark when enqueued
+                      q.append((nr, nc))
+          dist[(2, 2)]
+        py_out: "4"
+        rb: |-
+          maze = ["..#", "...", "#.."]
+          q, dist = [[0, 0]], {[0, 0] => 0}
+          until q.empty?
+            r, c = q.shift
+            [[r + 1, c], [r - 1, c], [r, c + 1], [r, c - 1]].each do |nr, nc|
+              next unless nr.between?(0, 2) && nc.between?(0, 2) && maze[nr][nc] == "." && !dist.key?([nr, nc])
+              dist[[nr, nc]] = dist[[r, c]] + 1          # mark when enqueued
+              q << [nr, nc]
+            end
+          end
+          dist[[2, 2]]
+        rb_out: "4"
+      - task: Weighted shortest path
+        py: |-
+          import heapq
+          g = {"a": [("b", 4), ("c", 1)], "c": [("b", 2)], "b": []}
+          dist, h = {"a": 0}, [(0, "a")]
+          while h:
+              d, u = heapq.heappop(h)
+              if d > dist[u]:
+                  continue                       # stale entry
+              for v, w in g[u]:
+                  if d + w < dist.get(v, float("inf")):
+                      dist[v] = d + w
+                      heapq.heappush(h, (d + w, v))
+          dist
+        py_out: "{'a': 0, 'b': 3, 'c': 1}"
+        rb: |-
+          g = {"a" => [["b", 4], ["c", 1]], "c" => [["b", 2]], "b" => []}
+          dist, done = {"a" => 0}, Set[]
+          while (u = dist.reject { |k, _| done.include?(k) }.min_by { |_, d| d }&.first)
+            done << u
+            g[u].each { |v, w| dist[v] = dist[u] + w if dist[u] + w < dist.fetch(v, Float::INFINITY) }
+          end
+          dist
+        rb_out: "{\"a\" => 0, \"b\" => 3, \"c\" => 1}"
+        py_note: "Dijkstra: non-negative weights only."
+        rb_note: "Without a heap this is O(V²), fine for small graphs; use the MinHeap under pattern 09 for big ones."
+
+  - id: bits
+    name: Bits
+    rows:
+      - task: Operators
+        py: "6 & 3, 6 | 3, 6 ^ 3, ~6, 1 << 4, 40 >> 2"
+        py_out: "(2, 7, 5, -7, 16, 10)"
+        rb: "[6 & 3, 6 | 3, 6 ^ 3, ~6, 1 << 4, 40 >> 2]"
+        rb_out: "[2, 7, 5, -7, 16, 10]"
+        note: "And, or, xor, not, shift left (×2ⁿ), shift right (÷2ⁿ)."
+      - task: Binary strings
+        py: "bin(10), f\"{10:08b}\", int(\"1010\", 2), 0b1010"
+        py_out: "('0b1010', '00001010', 10, 10)"
+        rb: "[10.to_s(2), format(\"%08b\", 10), \"1010\".to_i(2), 0b1010]"
+        rb_out: "[\"1010\", \"00001010\", 10, 10]"
+      - task: Read, set, clear a bit
+        py: "n = 13                     # 0b1101\nn & 1, (n >> 2) & 1, n | (1 << 1), n & ~(1 << 0)"
+        py_out: "(1, 1, 15, 12)"
+        rb: "n = 13                     # 0b1101\n[n & 1, n[2], n | (1 << 1), n & ~(1 << 0)]"
+        rb_out: "[1, 1, 15, 12]"
+        rb_note: "`n[i]` reads bit i directly."
+      - task: Count bits
+        since: {py: "3.10"}
+        py: "bin(13).count(\"1\"), (13).bit_count(), (13).bit_length()"
+        py_out: "(3, 3, 4)"
+        rb: "[13.to_s(2).count(\"1\"), 13.digits(2).sum, 13.bit_length]"
+        rb_out: "[3, 3, 4]"
+      - task: Lowest set bit, power of two
+        py: "n = 12\nn & -n, n & (n - 1), n > 0 and n & (n - 1) == 0"
+        py_out: "(4, 8, False)"
+        rb: "n = 12\n[n & -n, n & (n - 1), n.positive? && (n & (n - 1)).zero?]"
+        rb_out: "[4, 8, false]"
+        note: "`x & -x` isolates the lowest set bit; `x & (x - 1)` clears it, and is 0 exactly for powers of two."
+      - task: The number that appears once
+        py: "import functools, operator\nfunctools.reduce(operator.xor, [4, 1, 2, 1, 2])"
+        py_out: "4"
+        rb: "[4, 1, 2, 1, 2].reduce(:^)"
+        rb_out: "4"
+        note: "Pairs cancel because `a ^ a == 0` and `a ^ 0 == a`."
+      - task: Bitmask subsets
+        py: "items = [\"a\", \"b\", \"c\"]\n[[items[i] for i in range(3) if mask >> i & 1] for mask in range(1 << 3) if bin(mask).count(\"1\") == 2]"
+        py_out: "[['a', 'b'], ['a', 'c'], ['b', 'c']]"
+        rb: "items = %w[a b c]\n(0...(1 << 3)).filter_map { |m| (0...3).select { |i| m[i] == 1 }.map { |i| items[i] } if m.to_s(2).count(\"1\") == 2 }"
+        rb_out: "[[\"a\", \"b\"], [\"a\", \"c\"], [\"b\", \"c\"]]"
+        note: "Each of the 2ⁿ masks picks a subset: bit i set → item i included."
+      - task: Negative numbers
+        py: "-1 >> 1, bin(-5), -5 & 0xFF, (-5) & 0xFFFFFFFF"
+        py_out: "(-1, '-0b101', 251, 4294967291)"
+        rb: "[-1 >> 1, -5.to_s(2), -5 & 0xFF, -5 & 0xFFFFFFFF]"
+        rb_out: "[-1, \"-101\", 251, 4294967291]"
+        note: "Integers have no fixed width (no overflow, no 32-bit wraparound). Mask with `& 0xFFFFFFFF` to mimic 32-bit code."
+        trap: true
+
+  - id: io
+    name: I/O & everyday stdlib
+    rows:
+      - task: Read standard input
+        run: false
+        py: |-
+          import sys
+
+          n = int(input())                        # one line
+          nums = list(map(int, input().split()))  # a line of numbers
+          rest = sys.stdin.read().splitlines()    # everything that's left
+        rb: |-
+          n = gets.to_i                           # one line
+          nums = gets.split.map(&:to_i)           # a line of numbers
+          rest = $stdin.read.lines(chomp: true)   # everything that's left
+        rb_note: "`gets` keeps the trailing newline (`gets.chomp`) and returns `nil` at end of input."
+      - task: Read and write files
+        py: |-
+          import pathlib, tempfile
+          path = pathlib.Path(tempfile.mkdtemp()) / "notes.txt"
+          path.write_text("a\nb\n")
+          with open(path, "a") as f:              # "w" overwrite, "a" append, "r" read
+              f.write("c\n")
+          with open(path) as f:
+              lines = [line.rstrip("\n") for line in f]
+          lines, path.read_text().count("\n")
+        py_out: "(['a', 'b', 'c'], 3)"
+        rb: |-
+          require "tmpdir"
+          path = File.join(Dir.mktmpdir, "notes.txt")
+          File.write(path, "a\nb\n")
+          File.open(path, "a") { |f| f.puts "c" }   # "w" overwrite, "a" append, "r" read
+          [File.readlines(path, chomp: true), File.read(path).count("\n")]
+        rb_out: "[[\"a\", \"b\", \"c\"], 3]"
+        note: "The `with` / block form closes the file even if an error is raised."
+        rb_note: "`File.foreach(path)` streams line by line without loading the whole file."
+      - task: Paths
+        py: "from pathlib import Path\np = Path(\"/tmp/data/report.final.csv\")\np.name, p.stem, p.suffix, p.parent.name, str(p.with_suffix(\".json\"))"
+        py_out: "('report.final.csv', 'report.final', '.csv', 'data', '/tmp/data/report.final.json')"
+        rb: "p = \"/tmp/data/report.final.csv\"\n[File.basename(p), File.basename(p, \".csv\"), File.extname(p), File.basename(File.dirname(p)), p.sub(/\\.csv\\z/, \".json\")]"
+        rb_out: "[\"report.final.csv\", \"report.final\", \".csv\", \"data\", \"/tmp/data/report.final.json\"]"
+        py_note: "Also `p.exists()`, `p.is_dir()`, `Path(\".\").glob(\"**/*.py\")`, `p / \"child\"`."
+        rb_note: "Also `File.exist?`, `Dir.glob(\"**/*.rb\")`, `File.join(a, b)`; `Pathname` gives an object API."
+      - task: JSON
+        py: |-
+          import json
+          s = json.dumps({"a": [1, 2], "ok": True})
+          s, json.loads(s)["a"], json.dumps({"b": 1}, indent=2).count("\n")
+        py_out: |-
+          ('{"a": [1, 2], "ok": true}', [1, 2], 2)
+        rb: |-
+          require "json"
+          s = {a: [1, 2], ok: true}.to_json
+          [s, JSON.parse(s)["a"], JSON.parse(s, symbolize_names: true)[:ok]]
+        rb_out: |-
+          ["{\"a\":[1,2],\"ok\":true}", [1, 2], true]
+        py_note: "`json.load(f)` / `json.dump(obj, f)` read and write files."
+        rb_note: "Parsed keys are strings unless `symbolize_names: true`; `JSON.pretty_generate` for indented output."
+        trap: rb
+      - task: CSV
+        py: "import csv, io\nrows = list(csv.DictReader(io.StringIO(\"name,qty\\npen,3\\n\")))\nrows, int(rows[0][\"qty\"])"
+        py_out: "([{'name': 'pen', 'qty': '3'}], 3)"
+        rb: "require \"csv\"\nrows = CSV.parse(\"name,qty\\npen,3\\n\", headers: true)\n[rows.map(&:to_h), rows[0][\"qty\"].to_i]"
+        rb_out: "[[{\"name\" => \"pen\", \"qty\" => \"3\"}], 3]"
+        note: "Every field comes back as a string."
+      - task: Dates and times
+        py: |-
+          from datetime import date, datetime, timedelta
+          d = date(2026, 10, 9)
+          str(d + timedelta(days=30)), d.strftime("%a %d %b"), (date(2026, 12, 25) - d).days, datetime.fromisoformat("2026-10-09T14:30").hour
+        py_out: "('2026-11-08', 'Fri 09 Oct', 77, 14)"
+        rb: |-
+          require "date"
+          require "time"
+          d = Date.new(2026, 10, 9)
+          [(d + 30).to_s, d.strftime("%a %d %b"), (Date.new(2026, 12, 25) - d).to_i, Time.iso8601("2026-10-09T14:30:00Z").hour]
+        rb_out: "[\"2026-11-08\", \"Fri 09 Oct\", 77, 14]"
+        rb_note: "`d >> 1` adds a month; `Time.now`, `Time.now.utc.iso8601`."
+      - task: Measure elapsed time
+        py: "import time\nstart = time.perf_counter()\nsum(range(10_000))\ntime.perf_counter() - start >= 0"
+        py_out: "True"
+        rb: "t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)\n(1..10_000).sum\nProcess.clock_gettime(Process::CLOCK_MONOTONIC) - t0 >= 0"
+        rb_out: "true"
+        note: "Use a monotonic clock for durations; the wall clock can jump."
+      - task: Random
+        py: "import random\nrandom.seed(42)\nx = random.randint(1, 6)\n1 <= x <= 6, len(random.sample(range(10), 3)), random.choice(\"ab\") in \"ab\""
+        py_out: "(True, 3, True)"
+        rb: "srand(42)\nx = rand(1..6)\n[x.between?(1, 6), (0...10).to_a.sample(3).size, %w[a b].sample.size]"
+        rb_out: "[true, 3, 1]"
+        py_note: "`randint` includes both ends; `random.shuffle(lst)` shuffles in place. Use `secrets` for tokens."
+        rb_note: "`rand(n)` is 0…n−1; `shuffle` returns a new array. Use SecureRandom for tokens."
+      - task: Command-line arguments
+        py: |-
+          import argparse
+          ap = argparse.ArgumentParser()
+          ap.add_argument("path")
+          ap.add_argument("-n", type=int, default=10)
+          args = ap.parse_args(["data.txt", "-n", "3"])   # no argument = read sys.argv
+          args.path, args.n
+        py_out: "('data.txt', 3)"
+        rb: |-
+          require "optparse"
+          opts = {n: 10}
+          parser = OptionParser.new { |o| o.on("-n N", Integer) { |v| opts[:n] = v } }
+          rest = parser.parse(["data.txt", "-n", "3"])    # parse! modifies ARGV in place
+          [rest, opts]
+        rb_out: "[[\"data.txt\"], {n: 3}]"
+        py_note: "Raw arguments: `sys.argv[1:]`."
+        rb_note: "Raw arguments: `ARGV`."
+      - task: Environment variables
+        py: "import os\nos.environ.get(\"APP_MODE\", \"dev\"), \"PATH\" in os.environ"
+        py_out: "('dev', True)"
+        rb: "[ENV.fetch(\"APP_MODE\", \"dev\"), ENV.key?(\"PATH\")]"
+        rb_out: "[\"dev\", true]"
+      - task: Run a shell command
+        py: "import subprocess\nr = subprocess.run([\"echo\", \"hi\"], capture_output=True, text=True)\nr.stdout.strip(), r.returncode"
+        py_out: "('hi', 0)"
+        rb: "out = `echo hi`\n[out.strip, $?.exitstatus]"
+        rb_out: "[\"hi\", 0]"
+        py_note: "Pass a list (no shell) to avoid quoting bugs; `check=True` raises on a non-zero exit."
+        rb_note: "`system(\"cmd\")` returns true / false; `Open3.capture3` gives stdout, stderr and status."
+      - task: Exit, stderr
+        run: false
+        py: "import sys\nprint(\"error: bad input\", file=sys.stderr)\nsys.exit(1)"
+        rb: "warn \"error: bad input\"      # writes to stderr\nexit 1"
+      - task: Logging
+        run: false
+        py: "import logging\nlogging.basicConfig(level=logging.INFO, format=\"%(levelname)s %(message)s\")\nlog = logging.getLogger(__name__)\nlog.info(\"started %s\", \"job\")"
+        rb: "require \"logger\"\nlog = Logger.new($stderr, level: :info)\nlog.info(\"started job\")"
+      - task: HTTP GET
+        run: false
+        py: "import json\nfrom urllib.request import urlopen\n\nwith urlopen(\"https://api.github.com\") as r:\n    data = json.load(r)"
+        rb: "require \"net/http\"\nrequire \"json\"\n\ndata = JSON.parse(Net::HTTP.get(URI(\"https://api.github.com\")))"
+        py_note: "`requests` / `httpx` are the usual third-party clients."
+        rb_note: "Faraday / HTTParty are the usual gems."
+      - task: Hashes, UUIDs
+        py: "import hashlib, uuid\nlen(str(uuid.uuid4())), hashlib.sha256(b\"hi\").hexdigest()[:12]"
+        py_out: "(36, '8f434346648f')"
+        rb: "require \"securerandom\"\nrequire \"digest\"\n[SecureRandom.uuid.size, Digest::SHA256.hexdigest(\"hi\")[0, 12]]"
+        rb_out: "[36, \"8f434346648f\"]"

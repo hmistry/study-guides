@@ -1,0 +1,134 @@
+id: fast-slow
+name: Fast & Slow Pointers
+signal: [linked list cycle, middle of a list, "array values that point to indices", "repeats in x → f(x)"]
+idea: >-
+  Two pointers walk the same path, slow by 1 and fast by 2. In a cycle the gap closes by exactly one per step, so they must meet;
+  with no cycle, fast reaches the end while slow sits at the middle. To find the cycle entry, restart one pointer at the head and step both by 1.
+  Cycle detection in O(n) time with O(1) space instead of a visited set.
+diagram:
+  type: linked
+  caption: "S +1, F +2 → meet   ·   then H +1, S +1 → entry"
+  frames:
+    - {values: [1, 2, 3, 4, 5, 6], loop: 2, marks: {S F: 0}, note: "both start at head"}
+    - {values: [1, 2, 3, 4, 5, 6], loop: 2, marks: {S F: 4}, hit: [4], note: "4 steps later fast laps slow → cycle"}
+    - {values: [1, 2, 3, 4, 5, 6], loop: 2, marks: {H S: 2}, hit: [2], note: "phase 2: H from head, S from 5 → meet at 3"}
+template:
+  python: |
+    slow = fast = head
+    while fast and fast.next:
+        slow = slow.next
+        fast = fast.next.next
+        if slow is fast:            # cycle
+            break
+    # no cycle → slow is the middle (2nd one if even)
+
+    # cycle entry (phase 2), after they meet
+    p = head
+    while p is not slow:
+        p = p.next
+        slow = slow.next
+    # p is the entry
+  ruby: |
+    slow = fast = head
+    while fast && fast.next
+      slow = slow.next
+      fast = fast.next.next
+      break if slow.equal?(fast)    # cycle
+    end
+    # no cycle → slow is the middle (2nd one if even)
+
+    # cycle entry (phase 2), after they meet
+    p = head
+    until p.equal?(slow)
+      p = p.next
+      slow = slow.next
+    end
+    # p is the entry
+pitfalls:
+  - Guard `fast and fast.next` before the double step. Checking only `fast` crashes on even-length lists.
+  - Compare nodes by identity (`is` / `equal?`), not by value. Lists can repeat values.
+  - "Middle: starting both at `head` gives the 2nd middle for even n. Start `fast = head.next` for the 1st (what you want when splitting a list for merge sort or a palindrome check)."
+  - "Why phase 2 works: tail length a, meeting point b into a cycle of length c. Fast walked twice as far, so 2(a + b) = a + b + kc, so a = kc − b. Walking a steps from the head and from the meeting point lands both on the entry."
+  - "Works for any x → f(x) on a finite set: array as linked list (i → nums[i]), happy number (n → sum of squared digits). Pigeonhole guarantees the cycle."
+
+problems:
+  - id: linked-list-cycle
+    title: Linked List Cycle
+    difficulty: Easy
+    variant: canonical
+    statement: Return true if the linked list starting at `head` contains a cycle. Use O(1) extra space.
+    example: "head = [3, 2, 0, -4], tail links to index 1  →  true"
+    hint: Two runners on a circular track at different speeds — what has to happen eventually?
+    insight: Inside the cycle fast gains exactly one node per step, so it can't jump over slow — the gap shrinks to 0.
+    complexity: O(n) time · O(1) space
+    fn: has_cycle
+    tests:
+      - {args: [{list: [3, 2, 0, -4], pos: 1}], out: true, note: "example"}
+      - {args: [{list: [1, 2], pos: 0}], out: true, note: "cycle through the head"}
+      - {args: [{list: [1], pos: 0}], out: true, note: "self-loop"}
+      - {args: [{list: [1, 2, 3, 4]}], out: false, note: "even length: fast.next hits nil"}
+      - {args: [{list: [1, 2, 3]}], out: false, note: "odd length: fast hits nil"}
+      - {args: [{list: []}], out: false, note: "empty list"}
+    solution:
+      python: |
+        def has_cycle(head):
+            slow = fast = head
+            while fast and fast.next:
+                slow = slow.next
+                fast = fast.next.next
+                if slow is fast:
+                    return True
+            return False
+      ruby: |
+        def has_cycle(head)
+          slow = fast = head
+          while fast && fast.next
+            slow = slow.next
+            fast = fast.next.next
+            return true if slow.equal?(fast)
+          end
+          false
+        end
+
+  - id: find-duplicate
+    title: Find the Duplicate Number
+    difficulty: Medium
+    variant: array as a linked list
+    statement: "`nums` holds n + 1 integers, each in [1, n]. Exactly one value repeats (possibly more than twice). Return it without modifying `nums`, in O(1) extra space."
+    example: "nums = [1, 3, 4, 2, 2]  →  2"
+    hint: Follow i → nums[i] starting at index 0. What shape does that path make, and where on it is the repeated value?
+    insight: Treat `nums[i]` as the next pointer of node i. Two indices point to the duplicate, so it's exactly where the tail joins the cycle — Floyd's phase 2 finds it.
+    complexity: O(n) time · O(1) space
+    fn: find_duplicate
+    tests:
+      - {args: [[1, 3, 4, 2, 2]], out: 2, note: "example"}
+      - {args: [[3, 1, 3, 4, 2]], out: 3, note: "duplicate isn't adjacent"}
+      - {args: [[1, 1]], out: 1, note: "n = 1"}
+      - {args: [[2, 2, 2, 2, 2]], out: 2, note: "repeats more than twice"}
+      - {args: [[2, 5, 9, 6, 9, 3, 8, 9, 7, 1]], out: 9, note: "long tail before the cycle"}
+    solution:
+      python: |
+        def find_duplicate(nums):
+            slow = fast = 0                 # index 0 is the head: no value points to it
+            while True:
+                slow = nums[slow]
+                fast = nums[nums[fast]]
+                if slow == fast:
+                    break
+            h = 0
+            while h != slow:                # phase 2: meet at the cycle entry
+                h = nums[h]
+                slow = nums[slow]
+            return h
+      ruby: |
+        def find_duplicate(nums)
+          slow = fast = 0                 # index 0 is the head: no value points to it
+          loop do
+            slow = nums[slow]
+            fast = nums[nums[fast]]
+            break if slow == fast
+          end
+          h = 0
+          h, slow = nums[h], nums[slow] while h != slow   # phase 2: meet at the cycle entry
+          h
+        end
